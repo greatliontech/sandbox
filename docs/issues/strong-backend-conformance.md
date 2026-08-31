@@ -1,6 +1,6 @@
 # The code does not yet conform to the contract
 
-Lands: user decision
+Lands: strong-backend plan chunk 5 (row selection and tier derivation close the remaining gaps)
 
 docs/specs/sandbox.md pins the contract ahead of the code. The known
 nonconformities, so none is silent:
