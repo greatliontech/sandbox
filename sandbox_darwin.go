@@ -19,8 +19,10 @@ var errNotImplemented = errors.New("sandbox: darwin backend not implemented " +
 //     paths, and the transport socket) applied via sandbox-exec.
 //   - setrlimit for resource caps (RLIMIT_AS / CPU / NOFILE / NPROC); no
 //     cgroup-equivalent, so memory control is coarse.
-//   - A process group killed on host exit (escapable by double-fork — weaker
-//     than Linux/Windows cleanup).
+//   - A process group killed on context cancellation (escapable by
+//     setsid). darwin has no parent-death tie, so a caller killed with
+//     SIGKILL leaves the process running — weaker than Linux/Windows
+//     cleanup, and stated in the contract.
 //
 // sandbox-exec is deprecated and undocumented; the backend must probe its
 // availability at runtime and degrade Tier to Minimal (rlimit + pgroup only)

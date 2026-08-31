@@ -24,13 +24,16 @@ import (
 type Isolation int
 
 const (
-	// None: the process runs with no sandbox (bare exec).
+	// None: the floor MinTier can state — accept any row. No backend
+	// reports it; sandbox never bare-execs.
 	None Isolation = iota
-	// Minimal: resource limits and lifecycle cleanup, but no security boundary.
+	// Minimal: kernel-enforced resource bounds with their accounting
+	// reported, but no security boundary.
 	Minimal
-	// OS: a capability/policy security boundary (AppContainer, Seatbelt).
+	// OS: an OS-policy security boundary (Landlock, Seatbelt,
+	// AppContainer).
 	OS
-	// Strong: a kernel- or VM-enforced boundary (Linux namespaces; a micro-VM).
+	// Strong: a kernel-enforced boundary (Linux namespaces).
 	Strong
 )
 

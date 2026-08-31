@@ -1,14 +1,19 @@
 # sandbox
 
 A pure-Go, cross-platform library that launches **one process in an OS-enforced
-sandbox**. Built for [ociplug](https://github.com/greatliontech/ociplug).
+sandbox**. Built for [pb](https://github.com/greatliontech/pb) and
+[ociplug](https://github.com/greatliontech/ociplug). The full contract —
+identity, tier derivation, and the per-platform mechanism ladder — is
+[docs/specs/sandbox.md](docs/specs/sandbox.md).
 
 It is deliberately **create-only**: it always creates a fresh isolated
 environment and execs one process into it — it never joins a running one. That
 single restriction is what keeps it **100% pure Go** everywhere: the
 single-threaded `setns` constraint that forces cgo in full container runtimes
 (`runc`, and our own [`container`](https://github.com/greatliontech/container))
-applies only to *joining* namespaces, never to *creating* them at clone time.
+applies only to *joining* namespaces, never to *creating* them at clone time
+(container additionally routes its create path through C by choice in cgo
+builds).
 
 > For the full container-runtime ambition (image lifecycle, `exec`-into-running,
 > OCI compliance) see `greatliontech/container`. `sandbox` is a narrower, simpler
@@ -22,10 +27,10 @@ weaker guarantee than it asked for (`Spec.MinTier`).
 
 | Tier | Meaning |
 |---|---|
-| `Strong` | kernel/VM-enforced (Linux namespaces; a micro-VM) |
-| `OS` | capability/policy boundary (AppContainer, Seatbelt) |
-| `Minimal` | resource limits + cleanup, no security boundary |
-| `None` | bare exec |
+| `Strong` | kernel-enforced (Linux namespaces) |
+| `OS` | OS-policy boundary (Landlock, Seatbelt, AppContainer) |
+| `Minimal` | kernel-enforced resource bounds, accounting reported; no security boundary |
+| `None` | floor only — `MinTier: None` accepts any row; no backend reports it |
 
 ```go
 sb, _ := sandbox.New(sandbox.Spec{
@@ -40,7 +45,7 @@ fmt.Println(es.Code, sb.Tier())
 
 ## Backends
 
-| GOOS | Mechanism | Tier | Status |
+| GOOS | Mechanism | Target tier | Status |
 |---|---|---|---|
 | linux | create-only namespaces (`SysProcAttr` clone) + uid/gid map + rlimits | `Strong` | **spike**: namespace core proven; rootfs/mounts, seccomp, caps, cgroups pending |
 | windows | AppContainer + Job Object (`KILL_ON_JOB_CLOSE`) | `OS` | skeleton |
