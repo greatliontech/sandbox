@@ -12,6 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/greatliontech/sandbox/internal/nslinux"
 )
 
 // Internal re-exec protocol.
@@ -26,9 +30,6 @@ const (
 	envInitFD = "_SANDBOX_INITFD"
 )
 
-// RLIMIT_NPROC is not exported by the standard syscall package on Linux.
-const rlimitNPROC = 6
-
 func init() {
 	if os.Getenv(envInit) == "1" {
 		runInit() // never returns
@@ -37,18 +38,13 @@ func init() {
 
 // initConfig is the JSON payload handed to the re-exec'd init process.
 type initConfig struct {
-	Hostname string       `json:"hostname,omitempty"`
-	Root     string       `json:"root,omitempty"`
-	WorkDir  string       `json:"workdir,omitempty"`
-	Rlimits  []rlimitSpec `json:"rlimits,omitempty"`
-	Cmd      string       `json:"cmd"`
-	Args     []string     `json:"args,omitempty"`
-	Env      []string     `json:"env,omitempty"`
-}
-
-type rlimitSpec struct {
-	Resource int    `json:"resource"`
-	Value    uint64 `json:"value"`
+	Hostname string           `json:"hostname,omitempty"`
+	Root     string           `json:"root,omitempty"`
+	WorkDir  string           `json:"workdir,omitempty"`
+	Rlimits  []nslinux.Rlimit `json:"rlimits,omitempty"`
+	Cmd      string           `json:"cmd"`
+	Args     []string         `json:"args,omitempty"`
+	Env      []string         `json:"env,omitempty"`
 }
 
 type linuxSandbox struct {
@@ -184,19 +180,19 @@ func cloneFlags(network bool) uintptr {
 	return flags
 }
 
-func buildRlimits(l Limits) []rlimitSpec {
-	var out []rlimitSpec
+func buildRlimits(l Limits) []nslinux.Rlimit {
+	var out []nslinux.Rlimit
 	if l.MemoryBytes > 0 {
-		out = append(out, rlimitSpec{Resource: syscall.RLIMIT_AS, Value: l.MemoryBytes})
+		out = append(out, nslinux.Rlimit{Resource: unix.RLIMIT_AS, Cur: l.MemoryBytes, Max: l.MemoryBytes})
 	}
 	if l.CPUSeconds > 0 {
-		out = append(out, rlimitSpec{Resource: syscall.RLIMIT_CPU, Value: l.CPUSeconds})
+		out = append(out, nslinux.Rlimit{Resource: unix.RLIMIT_CPU, Cur: l.CPUSeconds, Max: l.CPUSeconds})
 	}
 	if l.MaxFiles > 0 {
-		out = append(out, rlimitSpec{Resource: syscall.RLIMIT_NOFILE, Value: l.MaxFiles})
+		out = append(out, nslinux.Rlimit{Resource: unix.RLIMIT_NOFILE, Cur: l.MaxFiles, Max: l.MaxFiles})
 	}
 	if l.MaxProcs > 0 {
-		out = append(out, rlimitSpec{Resource: rlimitNPROC, Value: l.MaxProcs})
+		out = append(out, nslinux.Rlimit{Resource: unix.RLIMIT_NPROC, Cur: l.MaxProcs, Max: l.MaxProcs})
 	}
 	return out
 }
@@ -239,11 +235,8 @@ func doInit() error {
 			return fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)
 		}
 	}
-	for _, rl := range cfg.Rlimits {
-		lim := syscall.Rlimit{Cur: rl.Value, Max: rl.Value}
-		if err := syscall.Setrlimit(rl.Resource, &lim); err != nil {
-			return fmt.Errorf("setrlimit %d: %w", rl.Resource, err)
-		}
+	if err := nslinux.SetRlimits(cfg.Rlimits); err != nil {
+		return err
 	}
 
 	env := cfg.Env

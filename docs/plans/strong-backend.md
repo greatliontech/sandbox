@@ -5,7 +5,7 @@ layer seeded from container@866eb725dc6be9acb1ac36fd66ce8152280e71aa,
 the Strong world and hardening, bounds with reported accounting, and
 row selection with derived tiers.
 
-- [ ] 1. Mechanism verbs (`internal/nslinux`): mount verbs (bind,
+- [x] 1. Mechanism verbs (`internal/nslinux`): mount verbs (bind,
       pivot, read-only remount repeating locked flags), hardening
       verbs (capability drop, seccomp, no_new_privs, rlimits), cgroup
       verbs (availability, delegated-subtree discovery, create with

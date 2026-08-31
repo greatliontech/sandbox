@@ -8,3 +8,4 @@ issue file deleted — git holds history.
 |---|---|---|
 | [linux-mechanism-replica](linux-mechanism-replica.md) | the internal Linux mechanism layer is an independently-maintained replica of container's create path; kernel-rule fixes apply to both | first tagged release delivering the spec's Strong row whole |
 | [strong-backend-conformance](strong-backend-conformance.md) | the code predates the contract: tier asserted, MinTier gate dead, Root/seccomp/caps/cgroups unimplemented, bounds unreported | strong-backend plan chunk 5 |
+| [linux-os-row](linux-os-row.md) | the spec's Linux OS row (Landlock + seccomp network denial) has no implementation home | strong-backend plan close-out |

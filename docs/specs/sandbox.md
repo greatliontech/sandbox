@@ -72,8 +72,11 @@ independent by design.
   exposure is exactly what a caller accepts by admitting such rows
   through `MinTier`.
 - **Bounded means bounded.** `Limits` map to the strongest native
-  accounting the selected row admits (cgroups where a delegated subtree
-  accepts placement; rlimits; Job Objects). Which accounting enforced
+  accounting the selected row admits (cgroups where a delegated
+  subtree accepts both placement and the controllers the limits
+  need — a subtree can accept a child yet refuse controller
+  delegation, and a cgroup that cannot enforce the stated limits is
+  no accounting at all; rlimits; Job Objects). Which accounting enforced
   the bounds is a reported fact of the run, so a bound-exceeded death
   is attributable.
 - **The wall clock belongs to the caller.** `Start`'s context governs
@@ -112,8 +115,9 @@ The ladder is normative: a backend selects the highest row its host's
 probed facts satisfy, delivers that row's mechanism set whole, and
 reports that row's tier — never a blend of rows. One named exception
 to whole-row delivery: a row's bounds *accounting* is host-selected —
-on Linux a delegated cgroup subtree where placement is available and
-rlimits otherwise, a Job Object on windows — because the security
+on Linux a delegated cgroup subtree where placement and controller
+delegation are available and rlimits otherwise, a Job Object on
+windows — because the security
 boundary is what the tier grades; the accounting that enforced the
 bounds is a reported fact of the run, so coarser bounds are
 attributable, never silent. A `Minimal` selection accordingly
