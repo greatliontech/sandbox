@@ -120,8 +120,10 @@ type Spec struct {
 	// written: nothing is created in it, not even transiently.
 	Root string
 
-	// Network grants the process host network access. When false (default) the
-	// process is network-isolated as strongly as the platform allows.
+	// Network grants the process the host's network. When false (default)
+	// the process has no network: on rows with namespaces a fresh, empty
+	// network namespace (a loopback, down), and on the others whatever
+	// the row's mechanism set states (docs/specs/sandbox.md, the ladder).
 	Network bool
 
 	// PathGrants are host paths exposed into the sandbox.

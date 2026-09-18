@@ -121,7 +121,7 @@ independent by design.
 
 | Platform + host condition | Mechanism set (applied whole) | Tier |
 |---|---|---|
-| linux, unprivileged user namespaces available | namespaces (user, mount, pid, uts, ipc; net unless granted), pivoted read-only root repeating locked mount flags, capability drop, seccomp, `no_new_privs`, cgroup-or-rlimit bounds | `Strong` |
+| linux, unprivileged user namespaces available | namespaces (user, mount, pid, uts, ipc; net unless granted), pivoted read-only root repeating locked mount flags, capability drop, seccomp holding for every syscall ABI the kernel exposes (a foreign-ABI call is killed, never let through unfiltered), `no_new_privs`, cgroup-or-rlimit bounds | `Strong` |
 | linux, user namespaces unavailable, Landlock available | Landlock filesystem allowlist, seccomp network denial (Landlock ABI 4's TCP restrictions are supplementary, never the sole arm — UDP and raw sockets stay open without seccomp), `no_new_privs`, rlimit bounds; static entrypoints only | `OS` |
 | darwin, Seatbelt available | Seatbelt profile (filesystem allowlist, network denial), rlimit bounds | `OS` |
 | windows, AppContainer available | AppContainer boundary, Job Object bounds | `OS` |

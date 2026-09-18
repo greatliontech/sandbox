@@ -16,7 +16,7 @@ row selection with derived tiers.
       remount, `PathGrants` and the rendezvous directory as binds,
       entrypoint from the tree; live namespace tests (write probe,
       world-view probe) with a skip guard for restricted hosts.
-- [ ] 3. Strong hardening: capability drop, seccomp, no_new_privs,
+- [x] 3. Strong hardening: capability drop, seccomp, no_new_privs,
       network-namespace denial with the `Network` grant; live probes
       (dial, capability read).
 - [ ] 4. Bounds: cgroup placement via the delegated subtree and

@@ -7,13 +7,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/elastic/go-seccomp-bpf/arch"
 )
 
 // worldTree is the static probe binary built once into a bare tree
@@ -716,5 +720,242 @@ func TestEntrypointResolvesInTree(t *testing.T) {
 	}
 	if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "exec /dangling is not in the tree") {
 		t.Fatalf("dangling entrypoint: %v", err)
+	}
+}
+
+// The Strong row's hardening, observed from inside a Root world: every
+// capability set and the bounding set are empty even though the
+// process is the namespace's mapped root, no_new_privs is set, and
+// the syscalls the row denies fail with EPERM — the mount table, the
+// namespace, its identity, and the observation primitives.
+func TestStrongHardening(t *testing.T) {
+	requireTree(t)
+	var out bytes.Buffer
+	sb, err := New(Spec{Exec: "/world", Root: worldTree, Stdout: &out, Stderr: &out})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	if es, err := sb.Wait(); err != nil || es.Code != 0 {
+		t.Fatalf("Wait: %v %+v %s", err, es, out.String())
+	}
+	f := facts(out.String())
+	if f["caps"] != "e0/0,p0/0,i0/0" {
+		t.Errorf("capability sets = %s, want all empty", f["caps"])
+	}
+	if f["bounding"] != "0" {
+		t.Errorf("bounding set holds %s capabilities, want 0", f["bounding"])
+	}
+	if f["nnp"] != "1 err=false" {
+		t.Errorf("no_new_privs = %s, want 1", f["nnp"])
+	}
+	// Two kinds of witness: syscalls only the filter refuses (no
+	// capability governs them, so their EPERM is the filter's alone)
+	// and syscalls the capability drop already refuses, where the
+	// filter is defense in depth.
+	for _, sc := range []string{"unshare", "keyctl", "io_uring_setup", "perf_event_open", "process_vm_readv", "request_key", "clock_adjtime"} {
+		if f[sc] != "operation not permitted" {
+			t.Errorf("%s = %q, want EPERM from the filter", sc, f[sc])
+		}
+	}
+	for _, sc := range []string{"sethostname", "mount", "ptrace"} {
+		if f[sc] != "operation not permitted" {
+			t.Errorf("%s = %q, want EPERM (capability drop, filter behind it)", sc, f[sc])
+		}
+	}
+}
+
+// A payload built for a foreign machine is refused before anything
+// runs: the row runs the native ABI only, and the entrypoint's ELF
+// header says so up front.
+func TestForeignABIRefused(t *testing.T) {
+	requireTree(t)
+	foreign := map[string]string{"amd64": "386", "arm64": "arm"}[runtime.GOARCH]
+	if foreign == "" {
+		t.Skipf("no foreign 32-bit ABI to exercise on %s", runtime.GOARCH)
+	}
+	tree := worldFixture(t)
+	build := exec.Command("go", "build", "-o", filepath.Join(tree, "world32"), "testdata/world/main.go")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOARCH="+foreign)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Skipf("cannot build the %s probe here: %v\n%s", foreign, err, out)
+	}
+	for name, spec := range map[string]Spec{
+		"under a root": {Exec: "/world32", Root: tree},
+		"host path":    {Exec: filepath.Join(tree, "world32")},
+	} {
+		sb, err := New(spec)
+		if err != nil {
+			t.Fatalf("%s: New: %v", name, err)
+		}
+		err = sb.Start(context.Background())
+		if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "built for") {
+			t.Fatalf("%s: foreign-machine entrypoint: %v, want ErrUndeliverable naming the machine", name, err)
+		}
+	}
+}
+
+// An entrypoint the parent cannot read — execute-only, as a shared
+// tree owned elsewhere can be — still starts: execve needs no read
+// permission, and the machine check refuses only what it read.
+func TestExecOnlyEntrypointStarts(t *testing.T) {
+	requireTree(t)
+	if os.Geteuid() == 0 {
+		t.Skip("root reads through permission bits")
+	}
+	tree := worldFixture(t)
+	if err := os.Chmod(filepath.Join(tree, "world"), 0o111); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	sb, err := New(Spec{Exec: "/world", Root: tree, Stdout: &out, Stderr: &out})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	if es, err := sb.Wait(); err != nil || es.Code != 0 {
+		t.Fatalf("exec-only entrypoint: %v %+v %s", err, es, out.String())
+	}
+}
+
+// A native payload that switches ABI at run time — one int 0x80 call
+// from a 64-bit program — is killed at that call by the arch guard,
+// after running fine through the native ABI.
+func TestForeignABICallKilled(t *testing.T) {
+	requireTree(t)
+	if runtime.GOARCH != "amd64" {
+		t.Skip("the ABI-switching stub is amd64 assembly")
+	}
+	tree := worldFixture(t)
+	build := exec.Command("go", "build", "-o", filepath.Join(tree, "abiswitch"), "./testdata/abiswitch")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building the ABI-switching stub: %v\n%s", err, out)
+	}
+	var out bytes.Buffer
+	sb, err := New(Spec{Exec: "/abiswitch", Root: tree, Stdout: &out, Stderr: &out})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	es, err := sb.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !strings.Contains(out.String(), "alive") || !es.Signaled || es.Signal != syscall.SIGSYS {
+		t.Fatalf("ABI switch ended %+v with output %q, want the native run then death by SIGSYS", es, out.String())
+	}
+}
+
+// Every name the deny list spells exists on at least one supported
+// architecture; the native policy assembles; and a table without a
+// name simply omits it (the i386 table lacks kexec_file_load, the
+// 64-bit tables lack the time64 spellings).
+func TestPolicyNamesResolve(t *testing.T) {
+	tables := []*arch.Info{arch.X86_64, arch.AARCH64, arch.I386, arch.ARM}
+	for _, group := range strongDenied {
+		for _, name := range group {
+			found := false
+			for _, tb := range tables {
+				if _, ok := tb.SyscallNames[name]; ok {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("%s is not a syscall on any supported architecture", name)
+			}
+		}
+	}
+	native, err := arch.GetInfo("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := strongSeccompPolicy(native)
+	if _, err := pol.Assemble(); err != nil {
+		t.Fatalf("native policy does not assemble: %v", err)
+	}
+	for _, tb := range tables {
+		pol := strongSeccompPolicy(tb)
+		for _, g := range pol.Syscalls {
+			for _, n := range g.Names {
+				if _, ok := tb.SyscallNames[n]; !ok {
+					t.Errorf("%s policy names %s, which %s lacks", tb.Name, n, tb.Name)
+				}
+			}
+		}
+	}
+	i386 := strongSeccompPolicy(arch.I386)
+	for _, g := range i386.Syscalls {
+		for _, n := range g.Names {
+			if n == "kexec_file_load" {
+				t.Error("kexec_file_load kept in the i386 policy, where it does not exist")
+			}
+		}
+	}
+}
+
+// Hardening does not depend on a Root: the host-view world is just as
+// capability-free and filtered.
+func TestHardeningWithoutRoot(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh available")
+	}
+	var out bytes.Buffer
+	sb, err := New(Spec{
+		Exec:   "/bin/sh",
+		Args:   []string{"-c", "grep -E '^(CapEff|CapBnd|NoNewPrivs):' /proc/self/status | tr -d '\\t' | tr '\\n' ' '"},
+		Stdout: &out,
+		Stderr: &out,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	if es, err := sb.Wait(); err != nil || es.Code != 0 {
+		t.Fatalf("Wait: %v %+v %s", err, es, out.String())
+	}
+	// The capability and no_new_privs lines are the load-bearing
+	// witnesses; a "Seccomp:2" line would be inherited from any filter
+	// the host already runs the tests under, so it proves nothing here.
+	got := out.String()
+	for _, want := range []string{"CapEff:0000000000000000", "CapBnd:0000000000000000", "NoNewPrivs:1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status lacks %s: %q", want, got)
+		}
+	}
+}
+
+// Network is denied unless granted: the default world holds a
+// loopback and nothing else and cannot dial out; a granted world
+// shares the host's interfaces. Both halves need a host with an
+// interface beyond loopback — on one without, neither assertion could
+// tell a fresh namespace from the host's, so both skip.
+func TestNetworkGrant(t *testing.T) {
+	requireTree(t)
+	host, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(host) < 2 {
+		t.Skip("the host has no interface beyond loopback; a fresh namespace would look like the host")
+	}
+	run := func(network bool) map[string]string {
+		var out bytes.Buffer
+		sb, err := New(Spec{Exec: "/world", Root: worldTree, Network: network, Stdout: &out, Stderr: &out})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		startOrSkip(t, sb)
+		if es, err := sb.Wait(); err != nil || es.Code != 0 {
+			t.Fatalf("Wait: %v %+v %s", err, es, out.String())
+		}
+		return facts(out.String())
+	}
+	denied := run(false)
+	if denied["ifaces"] != "lo" || denied["dial-err"] != "true" {
+		t.Errorf("denied network: interfaces %q, dial-err %s; want lo alone and a failed dial", denied["ifaces"], denied["dial-err"])
+	}
+	if got := run(true)["ifaces"]; got == "lo" || got == "" {
+		t.Errorf("granted network sees interfaces %q, want the host's", got)
 	}
 }

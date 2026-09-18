@@ -59,23 +59,6 @@ func lastCap() (int, error) {
 	return 63, nil
 }
 
-// NoNewPrivs sets PR_SET_NO_NEW_PRIVS on the calling thread: no
-// execve from here on can grant privileges (setuid/setgid bits and
-// file capabilities become inert). The bit is per-thread, so like
-// DropAllCapabilities the verb locks the goroutine to its OS thread
-// and never unlocks — it is meaningful only on the path to an
-// immediate exec, which stamps the bit into the process image.
-// Irreversible. Kernel >= 3.5. LoadSeccomp sets the same bit as part
-// of filter installation (and TSYNC propagates it to every thread);
-// this verb serves paths that harden without a filter.
-func NoNewPrivs() error {
-	runtime.LockOSThread() // no unlock: exec follows
-	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return fmt.Errorf("no_new_privs: %w", err)
-	}
-	return nil
-}
-
 // Rlimit is one POSIX resource limit to apply. The JSON tags pin the
 // wire keys for callers that serialize limits across a re-exec, so a
 // field rename cannot silently change their protocol.

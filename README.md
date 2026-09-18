@@ -47,7 +47,7 @@ fmt.Println(es.Code, sb.Tier())
 
 | GOOS | Mechanism | Target tier | Status |
 |---|---|---|---|
-| linux | create-only namespaces (`SysProcAttr` clone) + uid/gid map + pivoted read-only root with path grants + rlimits | `Strong` | namespace core and the Root world delivered; seccomp, caps, cgroups pending |
+| linux | create-only namespaces (`SysProcAttr` clone) + uid/gid map + pivoted read-only root with path grants + capability drop + seccomp (a native-ABI policy behind an arch guard) + no_new_privs + rlimits | `Strong` | namespace core, the Root world, and hardening delivered; cgroups pending |
 | windows | AppContainer + Job Object (`KILL_ON_JOB_CLOSE`) | `OS` | skeleton |
 | darwin | `sandbox-exec` SBPL profile + `setrlimit` | `OS` | skeleton |
 | other | — | — | `ErrUnsupported` |
@@ -57,9 +57,8 @@ the Linux backend) is a future tier, not yet wired.
 
 ## Roadmap
 
-1. **Linux**: seccomp; capability drop; cgroup v2 limits via
-   `SysProcAttr.UseCgroupFD` (rootfs pivot and bind-mounted path grants
-   landed).
+1. **Linux**: cgroup v2 limits via `SysProcAttr.UseCgroupFD` (rootfs
+   pivot, bind-mounted path grants, capability drop, and seccomp landed).
 2. **Windows**: AppContainer profile + Job Object; named-pipe transport plumbing.
 3. **macOS**: SBPL generation + `sandbox-exec`; runtime availability probe that
    degrades `Tier()` to `Minimal` when Seatbelt is unavailable.

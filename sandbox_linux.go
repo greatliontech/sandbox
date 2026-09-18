@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"context"
+	"debug/elf"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,10 +12,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 
+	"github.com/elastic/go-seccomp-bpf/arch"
 	"golang.org/x/sys/unix"
 
 	"github.com/greatliontech/sandbox/internal/nslinux"
@@ -264,6 +267,13 @@ func resolveWorld(spec Spec) (root string, binds []bind, err error) {
 	if spec.WorkDir != "" && !filepath.IsAbs(spec.WorkDir) {
 		return "", nil, fmt.Errorf("%w: workdir %q is not an absolute path", ErrUndeliverable, spec.WorkDir)
 	}
+	if spec.Root == "" {
+		// The host's own entrypoint: the same machine rule applies to
+		// it as to one in a tree.
+		if err := checkNativeELF(spec.Exec); err != nil {
+			return "", nil, fmt.Errorf("%w: exec %s: %v", ErrUndeliverable, spec.Exec, err)
+		}
+	}
 	if spec.Root != "" {
 		root, err = filepath.EvalSymlinks(spec.Root)
 		if err != nil {
@@ -276,13 +286,18 @@ func resolveWorld(spec Spec) (root string, binds []bind, err error) {
 		if !fi.IsDir() {
 			return "", nil, fmt.Errorf("%w: root %s is not a directory", ErrUndeliverable, spec.Root)
 		}
-		if fi, err := statInTree(root, spec.Exec); err != nil {
+		fi, resolved, err := statInTree(root, spec.Exec)
+		if err != nil {
 			return "", nil, fmt.Errorf("%w: exec %s is not in the tree: %v", ErrUndeliverable, spec.Exec, err)
-		} else if fi.IsDir() {
+		}
+		if fi.IsDir() {
 			return "", nil, fmt.Errorf("%w: exec %s is a directory in the tree", ErrUndeliverable, spec.Exec)
 		}
+		if err := checkNativeELF(filepath.Join(root, resolved)); err != nil {
+			return "", nil, fmt.Errorf("%w: exec %s: %v", ErrUndeliverable, spec.Exec, err)
+		}
 		if spec.WorkDir != "" {
-			if fi, err := statInTree(root, spec.WorkDir); err != nil {
+			if fi, _, err := statInTree(root, spec.WorkDir); err != nil {
 				return "", nil, fmt.Errorf("%w: workdir %s is not in the tree: %v", ErrUndeliverable, spec.WorkDir, err)
 			} else if !fi.IsDir() {
 				return "", nil, fmt.Errorf("%w: workdir %s is not a directory in the tree", ErrUndeliverable, spec.WorkDir)
@@ -368,7 +383,7 @@ func kind(dir bool) string {
 // will see it: symlinks are chased inside the tree, an absolute
 // target re-rooted at the tree and ".." clamped at it, with the
 // kernel's own bound on chained links. root must be canonical.
-func statInTree(root, p string) (os.FileInfo, error) {
+func statInTree(root, p string) (os.FileInfo, string, error) {
 	const maxLinks = 40
 	links := 0
 	// rest holds the components still to walk; cur is the tree-absolute
@@ -390,25 +405,25 @@ func statInTree(root, p string) (os.FileInfo, error) {
 		next := filepath.Join(cur, seg)
 		fi, err := os.Lstat(filepath.Join(root, next))
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if fi.Mode()&os.ModeSymlink == 0 {
 			if len(rest) == 0 {
-				return fi, nil
+				return fi, next, nil
 			}
 			if !fi.IsDir() {
-				return nil, &os.PathError{Op: "stat", Path: p, Err: syscall.ENOTDIR}
+				return nil, "", &os.PathError{Op: "stat", Path: p, Err: syscall.ENOTDIR}
 			}
 			cur = next
 			continue
 		}
 		links++
 		if links > maxLinks {
-			return nil, &os.PathError{Op: "stat", Path: p, Err: syscall.ELOOP}
+			return nil, "", &os.PathError{Op: "stat", Path: p, Err: syscall.ELOOP}
 		}
 		target, err := os.Readlink(filepath.Join(root, next))
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		// The link's target is cleaned only of its spelling (trailing
 		// slashes); its own ".." components are walked like any other.
@@ -418,7 +433,33 @@ func statInTree(root, p string) (os.FileInfo, error) {
 		}
 		rest = append(targetSegs, rest...)
 	}
-	return os.Lstat(filepath.Join(root, cur))
+	fi, err := os.Lstat(filepath.Join(root, cur))
+	return fi, cur, err
+}
+
+// checkNativeELF refuses an entrypoint built for a foreign machine:
+// the Strong row runs the native syscall ABI only, and its guard
+// kills a foreign-ABI call at the first system call, so such a
+// payload could not run at all — a stated intent this row cannot
+// deliver, known before exec. It refuses only on a machine it
+// actually read: a file that is not an ELF image (a script) or one
+// that cannot be read (execute-only, or unreadable in a shared tree —
+// execve needs no read permission) passes, and the arch guard is the
+// backstop for what the check could not see.
+func checkNativeELF(path string) error {
+	f, err := elf.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	want, ok := map[string]elf.Machine{"amd64": elf.EM_X86_64, "arm64": elf.EM_AARCH64, "386": elf.EM_386, "arm": elf.EM_ARM}[runtime.GOARCH]
+	if !ok {
+		return fmt.Errorf("the native ABI on %s is unknown to this row", runtime.GOARCH)
+	}
+	if f.Machine != want {
+		return fmt.Errorf("built for %s; this row runs %s only", f.Machine, want)
+	}
+	return nil
 }
 
 func (s *linuxSandbox) Wait() (ExitStatus, error) {
@@ -568,6 +609,26 @@ func composeInit() (*initConfig, error) {
 		}
 	}
 	if err := nslinux.SetRlimits(cfg.Rlimits); err != nil {
+		return nil, err
+	}
+	// Hardening, last and in this order (docs/specs/sandbox.md, Strong
+	// row): every capability set emptied so the payload holds none
+	// even as the namespace's mapped root — after the mounts, which
+	// needed CAP_SYS_ADMIN — then the arch guard and the native-ABI
+	// filter, which deny from the moment they load and set
+	// no_new_privs. Each verb pins the goroutine to its thread, and
+	// exec follows on it.
+	if err := nslinux.DropAllCapabilities(); err != nil {
+		return nil, err
+	}
+	native, err := arch.GetInfo("")
+	if err != nil {
+		return nil, fmt.Errorf("seccomp: %w", err)
+	}
+	if err := nslinux.LoadArchGuard(native); err != nil {
+		return nil, err
+	}
+	if err := nslinux.LoadSeccomp(strongSeccompPolicy(native)); err != nil {
 		return nil, err
 	}
 	if cfg.Env == nil {
