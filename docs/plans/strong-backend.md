@@ -12,7 +12,7 @@ row selection with derived tiers.
       clone-into fd, resource writes, kill), each fail-loud with its
       kernel preconditions documented; unit tests for every verb
       testable without namespaces.
-- [ ] 2. The Strong world: `Spec.Root` pivoted with the read-only
+- [x] 2. The Strong world: `Spec.Root` pivoted with the read-only
       remount, `PathGrants` and the rendezvous directory as binds,
       entrypoint from the tree; live namespace tests (write probe,
       world-view probe) with a skip guard for restricted hosts.
@@ -25,5 +25,6 @@ row selection with derived tiers.
       cleanup; live memory-bound test.
 - [ ] 5. Row selection and honest reporting: host probes, the
       highest-satisfied-row rule, tier derived from the applied row,
-      `MinTier` failing closed before exec, `ErrUndeliverable`
-      distinct from `ErrWeakerThanRequired`; conformance close-out.
+      `MinTier` failing closed before exec, `ErrUndeliverable` (in
+      place since the Strong world) covering every refusal the rows
+      add; conformance close-out.

@@ -11,16 +11,19 @@ nonconformities, so none is silent:
 - The `MinTier` gate compares against a constant maximum, so it can
   never refuse: "fails closed before exec" currently fails open, and
   no host probes exist to select a row.
-- `Spec.Root` is refused as unimplemented (the one conforming arm:
-  fail-loud, never approximate).
+- `Spec.Root` is delivered on the Strong row (pivoted read-only,
+  grants and rendezvous bound, entrypoint from the tree) with
+  composition failures refusing `Start`; rows without mount
+  namespaces have no `Root` handling yet.
 - Bounds are rlimits only, and no surface reports which accounting
   enforced them ("a reported fact of the run" has no reporter; `Stats`
   is empty).
 - `Spec.Hostname`'s doc says "where the platform supports it" — the
   best-effort arm the delivery contract forbids; a row that cannot
   present a stated hostname must refuse.
-- No `ErrUndeliverable` sentinel exists, so an undeliverable intent
-  and a tier refusal are indistinguishable to callers.
+- `ErrUndeliverable` exists and covers the world's refusals (a Root
+  that is no directory, grants without a target); the row-selection
+  refusals still route through plain errors until chunk 5.
 - Cleanup reaches the direct child only, on both triggers
   (`CommandContext` kill, `Pdeathsig`); the contract's
   cancellation-time tree, cgroup, and group kills, and any kernel-side

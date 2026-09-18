@@ -70,7 +70,24 @@ independent by design.
   wrong world, and a payload that dereferences image-absolute paths *at
   runtime* observes different resolution than under an at-`/` row. That
   exposure is exactly what a caller accepts by admitting such rows
-  through `MinTier`.
+  through `MinTier`. Grants and the rendezvous directory land on
+  entries the caller placed in the tree at their own paths — an
+  absent or wrong-kind target, or one reached through a symlink at
+  any component, is an undeliverable intent, never an omission; so is
+  a grant overlapping another grant or the rendezvous directory, two
+  intents over one path having no single delivery — and a read-only
+  grant is read-only throughout, submounts included. The tree itself
+  is never written, not even transiently: a shared, read-only tree is
+  a valid `Root`. The environment is caller-supplied state: under a
+  `Root` an unstated environment is empty, never the host's.
+- **Re-exec is part of the mechanism.** A pure-Go backend creating
+  namespaces at clone time runs the calling binary as the sandbox's
+  init: it re-execs itself with an internal marker and takes over
+  inside the fresh namespaces. Every package init of the calling
+  binary runs in that child before the takeover; a consumer's init
+  must be free of side effects that the marker environment would make
+  wrong, and an init child that dies before exec is reported by
+  `Start` as such — never as the payload's own exit.
 - **Bounded means bounded.** `Limits` map to the strongest native
   accounting the selected row admits (cgroups where a delegated
   subtree accepts both placement and the controllers the limits

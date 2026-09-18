@@ -3,6 +3,7 @@
 package nslinux
 
 import (
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -47,5 +48,41 @@ func TestLockedMountFlagsFailsLoudOnStatfsError(t *testing.T) {
 	// confusing kernel EPERM, so the verb refuses instead.
 	if _, err := lockedMountFlags("/nonexistent/nslinux-test"); err == nil {
 		t.Error("want error when statfs fails")
+	}
+}
+
+// mountSubtree lists the topmost mount at path and its descendants by
+// parent id, shallowest first, decoding mountinfo's octal escapes;
+// mounts an earlier bind at the same path shadows, and mounts beside
+// the subtree, are left out.
+func TestMountSubtree(t *testing.T) {
+	info := []byte(strings.Join([]string{
+		"22 1 0:21 / /proc rw - proc proc rw",
+		"40 1 0:30 / /dev rw - devtmpfs devtmpfs rw",
+		"41 40 0:31 / /dev/shm rw - tmpfs tmpfs rw",
+		"43 1 0:33 / /devices rw - tmpfs tmpfs rw",
+		"50 1 0:30 / /dev rw - devtmpfs devtmpfs rw",
+		"51 50 0:32 / /dev/pts rw - devpts devpts rw",
+		"52 50 0:34 / /dev/with\\040space rw - tmpfs tmpfs rw",
+		"53 52 0:35 / /dev/with\\040space/deep rw - tmpfs tmpfs rw",
+	}, "\n"))
+	got := mountSubtree(info, "/dev/")
+	want := []string{"/dev", "/dev/pts", "/dev/with space", "/dev/with space/deep"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("mountSubtree = %v, want %v", got, want)
+	}
+	if got := mountSubtree(info, "/nowhere"); len(got) != 0 {
+		t.Fatalf("mountSubtree(/nowhere) = %v", got)
+	}
+}
+
+// A listing with no mount at path refuses instead of covering nothing.
+func TestReadOnlySubtreeRefusesUnlistedPath(t *testing.T) {
+	info := []byte("40 1 0:30 / /dev rw - devtmpfs devtmpfs rw\n")
+	if got, err := readOnlySubtree(info, "/dev"); err != nil || len(got) != 1 {
+		t.Fatalf("listed path: %v %v", got, err)
+	}
+	if _, err := readOnlySubtree(info, "/link-to-dev"); err == nil || !strings.Contains(err.Error(), "not listed") {
+		t.Fatalf("unlisted path: %v", err)
 	}
 }

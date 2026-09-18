@@ -11,6 +11,14 @@
 // strongest mechanism it can and reports the isolation tier actually achieved
 // via Sandbox.Tier, so a caller is never silently handed a weaker guarantee
 // than it asked for (see Spec.MinTier).
+//
+// Re-exec: pure-Go namespace creation runs the calling binary itself
+// as the sandbox's init — Start re-execs /proc/self/exe with an
+// internal marker in the environment, and this package's init takes
+// over inside the fresh namespaces. Every package init of the calling
+// binary runs there first, in that child, before the takeover. A
+// consumer's init must therefore be free of side effects the marker
+// environment would make wrong (see docs/specs/sandbox.md, Re-exec).
 package sandbox
 
 import (
@@ -63,7 +71,15 @@ const (
 	ReadWrite
 )
 
-// PathGrant exposes a host path inside the sandbox at the given access level.
+// PathGrant exposes a host path inside the sandbox, at the same
+// absolute path, at the given access level; a read-only grant is
+// read-only throughout, submounts included. Under a stated Root the
+// path must already exist in the tree as the same kind of entry
+// (directory or file), reached through no symlink at any component —
+// the tree is the caller's to shape, and a grant with nowhere to land
+// is an undeliverable intent (ErrUndeliverable), never a silent
+// omission. Grants may not overlap one another or RuntimeDir: two
+// intents over one path have no single delivery.
 type PathGrant struct {
 	Path   string
 	Access Access
@@ -82,15 +98,26 @@ type Limits struct {
 
 // Spec describes a sandbox to create.
 type Spec struct {
-	// Exec is the absolute path of the binary to run inside the sandbox.
+	// Exec is the absolute path of the binary to run inside the sandbox
+	// — under a Root, a tree-absolute path resolved inside the tree.
 	Exec string
 	Args []string
-	Env  []string // nil inherits the host environment (minus internal vars)
+	// Env is the process environment. nil inherits the host's (minus
+	// internal variables) when no Root is stated; under a Root the
+	// world is exactly the tree and the grants, and nil means an empty
+	// environment — nothing of the host leaks in unstated.
+	Env []string
 
 	// WorkDir is the working directory for the process (inside the sandbox).
 	WorkDir string
 
-	// Root, if set, becomes the sandbox's root filesystem.
+	// Root, if set, bounds the process's world to exactly this tree,
+	// the PathGrants, and RuntimeDir — presented at "/" on rows with
+	// mount namespaces, read-only except where a grant says otherwise
+	// (docs/specs/sandbox.md, "Root is world-restriction"). Exec,
+	// WorkDir, grant paths, and RuntimeDir are then tree-absolute, and
+	// the entrypoint comes from the tree. The tree itself is never
+	// written: nothing is created in it, not even transiently.
 	Root string
 
 	// Network grants the process host network access. When false (default) the
@@ -104,8 +131,10 @@ type Spec struct {
 	Limits Limits
 
 	// RuntimeDir is a host directory the transport socket/pipe lives in; it is
-	// made reachable from inside the sandbox so the host and the process can
-	// rendezvous across the boundary.
+	// made reachable, read-write, from inside the sandbox at the same path so
+	// the host and the process can rendezvous across the boundary. Under a
+	// stated Root the path must exist in the tree as a directory, like a
+	// PathGrant.
 	RuntimeDir string
 
 	// Hostname sets the sandbox UTS hostname (where the platform supports it).
@@ -123,6 +152,13 @@ type Spec struct {
 // ErrWeakerThanRequired is returned by Start when the achievable isolation is
 // below Spec.MinTier.
 var ErrWeakerThanRequired = errors.New("sandbox: platform cannot meet required isolation tier")
+
+// ErrUndeliverable is returned by Start when a stated intent cannot be
+// delivered on this host at all — a grant with no target in the tree,
+// a Root that is not a directory — as distinct from
+// ErrWeakerThanRequired: "this host cannot do what you asked" rather
+// than "this host cannot do it strongly enough".
+var ErrUndeliverable = errors.New("sandbox: intent cannot be delivered on this host")
 
 // ExitStatus reports how the sandboxed process terminated.
 type ExitStatus struct {
