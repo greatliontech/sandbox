@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # The Strong row needs unprivileged user namespaces; Ubuntu 24.04
+      # restricts them through AppArmor for unconfined programs, which
+      # the live tests would otherwise skip past. A host without the
+      # knob has no such restriction.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || echo "no AppArmor user-namespace restriction on this host"
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1 -timeout=20m
+      # The cgroup arms — placement, the vacated delegated cgroup, the
+      # counters, swap closed to the run — run only under a delegated
+      # subtree, and this leg demands them rather than letting them
+      # skip: a runner that cannot delegate fails here, loudly.
+      - name: Live cgroup arms under a delegated scope
+        run: systemd-run --user --scope -q -p Delegate=yes env SANDBOX_TEST_REQUIRE_CGROUPS=1 go test ./... -count=1 -race -timeout=20m
