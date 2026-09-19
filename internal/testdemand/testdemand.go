@@ -22,13 +22,10 @@ import (
 // returns.
 func Live(t testing.TB, variable, unavailable string) {
 	t.Helper()
-	if unavailable == "" {
-		return
+	Degrade(t, variable, unavailable)
+	if unavailable != "" {
+		t.Skipf("%s", unavailable)
 	}
-	if os.Getenv(variable) != "" {
-		t.Fatalf("%s is set and %s", variable, unavailable)
-	}
-	t.Skipf("%s", unavailable)
 }
 
 // Degrade is Live's counterpart for an arm that runs either way: it
@@ -57,31 +54,33 @@ type Recorder struct {
 	Errors      []string // Error and Errorf messages, in order
 	Logs        []string // Log and Logf messages, in order
 	Ran         bool     // whether f ran to its end
+	failed      bool     // a message-free Fail or FailNow
+	skipped     bool     // a message-free SkipNow
 	cleanups    []func()
 }
 
 func (r *Recorder) Helper()       {}
 func (r *Recorder) Name() string  { return "observed" }
 func (r *Recorder) Failed() bool  { return r.FailureText != "" || len(r.Errors) > 0 }
-func (r *Recorder) Skipped() bool { return r.SkipText != "" }
+func (r *Recorder) Skipped() bool { return r.skipped || r.SkipText != "" }
 
 func (r *Recorder) Fatalf(format string, args ...any) {
 	r.FailureText = fmt.Sprintf(format, args...)
 	runtime.Goexit()
 }
 func (r *Recorder) Fatal(args ...any) { r.Fatalf("%s", fmt.Sprintln(args...)) }
-func (r *Recorder) FailNow()          { r.Fatalf("FailNow") }
+func (r *Recorder) FailNow()          { r.failed = true; runtime.Goexit() }
 func (r *Recorder) Skipf(format string, args ...any) {
 	r.SkipText = fmt.Sprintf(format, args...)
 	runtime.Goexit()
 }
 func (r *Recorder) Skip(args ...any) { r.Skipf("%s", fmt.Sprintln(args...)) }
-func (r *Recorder) SkipNow()         { r.Skipf("SkipNow") }
+func (r *Recorder) SkipNow()         { r.skipped = true; runtime.Goexit() }
 func (r *Recorder) Errorf(format string, args ...any) {
 	r.Errors = append(r.Errors, fmt.Sprintf(format, args...))
 }
 func (r *Recorder) Error(args ...any) { r.Errors = append(r.Errors, fmt.Sprintln(args...)) }
-func (r *Recorder) Fail()             { r.Errors = append(r.Errors, "Fail") }
+func (r *Recorder) Fail()             { r.failed = true }
 func (r *Recorder) Logf(format string, args ...any) {
 	r.Logs = append(r.Logs, fmt.Sprintf(format, args...))
 }
