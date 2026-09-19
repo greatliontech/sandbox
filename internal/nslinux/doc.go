@@ -10,8 +10,16 @@
 // are documented per verb; the package assumes the cgroup v2 unified
 // hierarchy throughout.
 //
-// The layer is an independently maintained replica of
-// greatliontech/container's create path; the replication decision and
-// its standing cost (kernel-rule fixes land in both copies) are
-// recorded in docs/issues/linux-mechanism-replica.md.
+// The layer began as a replica of greatliontech/container's create
+// path (its nsenter, cgroups, security and seccomp files and the
+// CLONE_INTO_CGROUP wiring) and is owned independently: the copies
+// diverge by design — this one derives its shape from the sandbox
+// contract (verbs that fail loud, no device or mask composition, a
+// tier derived from what applied) while container keeps an OCI
+// runtime's — but the kernel rules beneath them must not. Any
+// kernel-rule fix found in either copy (locked mount flags on a
+// read-only remount, cgroup placement under a delegated ancestry,
+// the no-internal-process rule, CLONE_INTO_CGROUP semantics, and
+// their kin) is applied to both; a contract-level rule (this layer
+// closing swap under a memory bound) is each copy's own.
 package nslinux

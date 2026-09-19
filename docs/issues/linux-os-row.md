@@ -8,8 +8,8 @@ restrictions supplementary, never the sole arm), `no_new_privs`,
 rlimit bounds, static entrypoints only — for hosts without
 unprivileged user namespaces. The Strong row is delivered whole,
 and no artifact tracks the OS row's implementation;
-docs/issues/linux-mechanism-replica.md mentions "a Landlock rung
-later" as rationale, not as a tracked deferral. This issue is that
+the mechanism layer's package doc names the Landlock rung as a
+difference by contract, not as a tracked deferral This issue is that
 deferral: until it lands, a Linux host without unprivileged user
 namespaces refuses instead of degrading to the OS tier the spec
 offers.
