@@ -47,7 +47,7 @@ fmt.Println(es.Code, sb.Tier())
 
 | GOOS | Mechanism | Target tier | Status |
 |---|---|---|---|
-| linux | create-only namespaces (`SysProcAttr` clone) + uid/gid map + pivoted read-only root with path grants + capability drop + seccomp (a native-ABI policy behind an arch guard) + no_new_privs + cgroup-or-rlimit bounds with reported accounting | `Strong` | delivered; a host without user namespaces reaches the `Minimal` row — bounds only, refusing every intent needing a boundary (`Root`, `Hostname`, a denied network, read-only grants) and a spec with no limits, `MinTier` gating it |
+| linux | create-only namespaces (`SysProcAttr` clone) + uid/gid map + pivoted read-only root with path grants + capability drop + seccomp (a native-ABI policy behind an arch guard) + no_new_privs + cgroup-or-rlimit bounds with reported accounting | `Strong` | delivered; a host without user namespaces reaches the `OS` row where it has Landlock — the world allowlisted at its host paths, the network denied at the socket, static entrypoints only — and the `Minimal` row otherwise: bounds only, refusing every intent needing a boundary (`Root`, `Hostname`, a denied network, read-only grants) and a spec with no limits, `MinTier` gating both |
 | windows | AppContainer + Job Object (`KILL_ON_JOB_CLOSE`) | `OS` | skeleton |
 | darwin | `sandbox-exec` SBPL profile + `setrlimit` | `OS` | skeleton |
 | other | — | — | `ErrUnsupported` |
@@ -57,20 +57,19 @@ the Linux backend) is a future tier, not yet wired.
 
 ## Roadmap
 
-1. **Linux**: the `OS` row — Landlock filesystem allowlist and seccomp
-   network denial — for hosts without user namespaces.
-2. **Windows**: AppContainer profile + Job Object; named-pipe transport plumbing.
-3. **macOS**: SBPL generation + `sandbox-exec`; runtime availability probe that
+1. **Windows**: AppContainer profile + Job Object; named-pipe transport plumbing.
+2. **macOS**: SBPL generation + `sandbox-exec`; runtime availability probe that
    degrades `Tier()` to `Minimal` when Seatbelt is unavailable.
-4. Resource-usage `Stats` per backend.
+3. Resource-usage `Stats` per backend.
 
 ## Spike
 
 ```
 go run ./cmd/spike      # runs /bin/sh in fresh PID/UTS/NET/IPC/user namespaces
 go test ./...           # asserts the isolation; the Strong row's arms skip where user
-                        # namespaces are unavailable, the cgroup arms where placement is:
-                        # SANDBOX_TEST_REQUIRE_USERNS=1 and SANDBOX_TEST_REQUIRE_CGROUPS=1
-                        # make either a failure instead, as continuous integration runs
+                        # namespaces are unavailable, the OS row's where Landlock is not,
+                        # the cgroup arms where placement is: SANDBOX_TEST_REQUIRE_USERNS=1,
+                        # SANDBOX_TEST_REQUIRE_LANDLOCK=1 and SANDBOX_TEST_REQUIRE_CGROUPS=1
+                        # make each a failure instead, as continuous integration runs
                         # them under systemd-run --user --scope -p Delegate=yes
 ```

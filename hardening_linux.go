@@ -5,6 +5,7 @@ package sandbox
 import (
 	seccomp "github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
+	"golang.org/x/sys/unix"
 )
 
 // strongSeccompPolicy is the Strong row's syscall filter for the
@@ -52,6 +53,56 @@ func strongSeccompPolicy(native *arch.Info) seccomp.Policy {
 		}
 	}
 	return seccomp.Policy{DefaultAction: seccomp.ActionAllow, Syscalls: groups}
+}
+
+// osSeccompPolicy is the OS row's syscall filter for the native ABI
+// (the arch guard kills the foreign one, as on the Strong row): the
+// Strong row's denials — a host that refused namespaces refuses
+// unshare and mount to an unprivileged process anyway, and the
+// filter says so on every host — and, where the network is not
+// granted, the network denied at the socket: a socket of any family
+// but the local one is refused with EAFNOSUPPORT, the local family
+// staying open for the rendezvous. An ABI that also multiplexes the
+// socket calls through socketcall (i386) carries the family in
+// memory there, where no filter reads it: that route's socket and
+// socketpair calls are refused whole, and the local family is
+// reached by the direct calls, which the table has as well.
+// Landlock's TCP rights, where the kernel has them, are applied
+// beside this, never in its place: UDP and raw sockets are outside
+// them (docs/specs/sandbox.md, the ladder).
+func osSeccompPolicy(native *arch.Info, network bool) seccomp.Policy {
+	policy := strongSeccompPolicy(native)
+	if network {
+		return policy
+	}
+	// The action's low sixteen bits carry the errno the caller sees.
+	refused := seccomp.ActionErrno | seccomp.Action(unix.EAFNOSUPPORT)
+	var names []seccomp.NameWithConditions
+	for _, name := range []string{"socket", "socketpair"} {
+		if _, ok := native.SyscallNames[name]; !ok {
+			continue
+		}
+		names = append(names, seccomp.NameWithConditions{
+			Name:       name,
+			Conditions: seccomp.ArgumentConditions{{Argument: 0, Operation: seccomp.NotEqual, Value: unix.AF_UNIX}},
+		})
+	}
+	if len(names) > 0 {
+		policy.Syscalls = append(policy.Syscalls, seccomp.SyscallGroup{Action: refused, NamesWithCondtions: names})
+	}
+	if _, ok := native.SyscallNames["socketcall"]; ok {
+		// socketcall's first argument is the call: SYS_SOCKET (1) and
+		// SYS_SOCKETPAIR (8) of linux/net.h.
+		const sysSocket, sysSocketpair = 1, 8
+		policy.Syscalls = append(policy.Syscalls, seccomp.SyscallGroup{
+			Action: refused,
+			NamesWithCondtions: []seccomp.NameWithConditions{
+				{Name: "socketcall", Conditions: seccomp.ArgumentConditions{{Argument: 0, Operation: seccomp.Equal, Value: sysSocket}}},
+				{Name: "socketcall", Conditions: seccomp.ArgumentConditions{{Argument: 0, Operation: seccomp.Equal, Value: sysSocketpair}}},
+			},
+		})
+	}
+	return policy
 }
 
 // strongDenied is the Strong row's deny list by family, spelled once

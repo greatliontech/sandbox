@@ -73,13 +73,18 @@ independent by design.
   image's own libraries — is refused there rather than run against a
   wrong world, and a payload that dereferences image-absolute paths *at
   runtime* observes different resolution than under an at-`/` row. That
-  exposure is exactly what a caller accepts by admitting such rows
-  through `MinTier`. A row with no filesystem-restriction mechanism at
-  all (`Minimal`) cannot bound the world to anything and refuses a
-  stated `Root` (`ErrUndeliverable`): the tier grades exposure, and an
-  intent nothing delivers is a refusal, never an omission. Grants and
-  the rendezvous directory land on
-  entries the caller placed in the tree at their own paths — an
+  exposure is what a caller accepts by admitting such rows through
+  `MinTier`, together with the IPC a row without namespaces leaves
+  open to processes of the same user: unix sockets reached by path
+  always; abstract unix sockets and signals where the kernel does
+  not scope them to the domain (Landlock ABI 6 does, and the row
+  applies the scoping where it is there). A row with no
+  filesystem-restriction mechanism at all (`Minimal`) cannot bound
+  the world to anything and refuses a stated `Root`
+  (`ErrUndeliverable`): the tier grades exposure, and an intent
+  nothing delivers is a refusal, never an omission. Grants and the
+  rendezvous directory land on entries the caller placed in the tree
+  at their own paths — an
   absent or wrong-kind target, or one reached through a symlink at
   any component, is an undeliverable intent, never an omission; so is
   a grant overlapping another grant or the rendezvous directory, two
@@ -134,7 +139,7 @@ independent by design.
 | Platform + host condition | Mechanism set (applied whole) | Tier |
 |---|---|---|
 | linux, unprivileged user namespaces available | namespaces (user, mount, pid, uts, ipc; net unless granted), pivoted read-only root repeating locked mount flags, capability drop, seccomp holding for every syscall ABI the kernel exposes (a foreign-ABI call is killed, never let through unfiltered), `no_new_privs`, cgroup-or-rlimit bounds | `Strong` |
-| linux, user namespaces unavailable, Landlock available | Landlock filesystem allowlist, seccomp network denial (Landlock ABI 4's TCP restrictions are supplementary, never the sole arm — UDP and raw sockets stay open without seccomp), `no_new_privs`, rlimit bounds; static entrypoints only | `OS` |
+| linux, user namespaces unavailable, Landlock available | Landlock filesystem allowlist over the world at its host paths (the caller's whole world where no `Root` is stated), seccomp network denial at the socket (Landlock ABI 4's TCP restrictions are supplementary, never the sole arm — UDP and raw sockets stay open without seccomp; an ABI that also multiplexes the socket calls through `socketcall` refuses that route whole, the local family reached by the direct calls), Landlock's IPC scoping where the kernel has it (ABI 6), `no_new_privs`, cgroup-or-rlimit bounds; static entrypoints only under a `Root` — an ELF the kernel loads whole, native, with no interpreter; a script, a dynamically linked executable, or a file the check cannot read is refused | `OS` |
 | darwin, Seatbelt available | Seatbelt profile (filesystem allowlist, network denial), rlimit bounds | `OS` |
 | windows, AppContainer available | AppContainer boundary, Job Object bounds | `OS` |
 | any platform where no security boundary is available but resource bounds are | resource bounds (rlimits, Job Object) | `Minimal` |

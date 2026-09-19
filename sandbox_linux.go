@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 
+	seccomp "github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
 	"golang.org/x/sys/unix"
 
@@ -76,9 +77,15 @@ type initConfig struct {
 	LateRlimits []nslinux.Rlimit `json:"late_rlimits,omitempty"`
 	PidsMaxFile string           `json:"pids_max_file,omitempty"`
 	PidsMax     uint64           `json:"pids_max,omitempty"`
-	Cmd         string           `json:"cmd"`
-	Args        []string         `json:"args,omitempty"`
-	Env         []string         `json:"env"`
+	// Landlock is the OS row's allowlist over the world at its host
+	// paths, its rights those of ABI LandlockABI; DenyNetwork is that
+	// row's network denial.
+	Landlock    []nslinux.LandlockRule `json:"landlock,omitempty"`
+	LandlockABI int                    `json:"landlock_abi,omitempty"`
+	DenyNetwork bool                   `json:"deny_network,omitempty"`
+	Cmd         string                 `json:"cmd"`
+	Args        []string               `json:"args,omitempty"`
+	Env         []string               `json:"env"`
 }
 
 // bind is one path exposed into the world: the host source, the
@@ -132,7 +139,7 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	if r.tier < s.spec.MinTier {
 		return &TierError{Reached: r.tier, Required: s.spec.MinTier, Lacking: below}
 	}
-	w, err := resolveWorld(s.spec, r)
+	w, err := resolveWorld(s.spec, r, facts.landlockABI)
 	if err != nil {
 		return err
 	}
@@ -169,6 +176,9 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 		Rlimits:     b.rlimits,
 		LateRlimits: b.late,
 		PidsMax:     b.pidsMax,
+		Landlock:    w.landlock,
+		LandlockABI: facts.landlockABI,
+		DenyNetwork: r.tier == OS && !s.spec.Network,
 		Cmd:         w.cmd,
 		Args:        s.spec.Args,
 		Env:         env,
@@ -337,13 +347,15 @@ func hostEnv() []string {
 const hostNameMax = 64
 
 // world is the resolved shape of a run: the tree to pivot to (the
-// Strong row only), the binds to place there, and the entrypoint and
+// Strong row only), the binds to place there, the OS row's allowlist
+// over the same world at its host paths, and the entrypoint and
 // working directory as the init sees them.
 type world struct {
-	root    string
-	binds   []bind
-	cmd     string
-	workDir string
+	root     string
+	binds    []bind
+	landlock []nslinux.LandlockRule
+	cmd      string
+	workDir  string
 }
 
 // resolveWorld checks, before anything is cloned, that every stated
@@ -364,9 +376,22 @@ type world struct {
 // remount must find its own bind there. Grants may not overlap one
 // another or the rendezvous directory.
 //
+// The OS row has no mount namespace, so it cannot present the tree
+// at "/" (docs/specs/sandbox.md, "Root is world-restriction"): the
+// world is the same tree, grants and rendezvous directory at their
+// host paths, allowlisted for what each may do — the tree readable
+// and executable, a read-only grant the same, a read-write grant
+// and the rendezvous directory writable too — and nothing else; the
+// entrypoint and the working directory are their host paths inside
+// the tree, and the entrypoint must load without the image-absolute
+// layout: an ELF the kernel loads whole, native, with no interpreter
+// (checkELF). Without a Root the allowlist is the caller's
+// whole world, the row having refused a read-only grant there.
+//
 // The row's own refusals come first (row.refuses). A failure is
-// ErrUndeliverable: the host cannot do what was asked.
-func resolveWorld(spec Spec, r row) (world, error) {
+// ErrUndeliverable: the host cannot do what was asked. landlockABI
+// is the ABI the OS row's rights are spelled for.
+func resolveWorld(spec Spec, r row, landlockABI int) (world, error) {
 	undeliverable := func(format string, a ...any) (world, error) {
 		return world{}, fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
 	}
@@ -382,11 +407,15 @@ func resolveWorld(spec Spec, r row) (world, error) {
 	if err := r.refuses(spec); err != nil {
 		return world{}, err
 	}
-	// The native-ABI rule is the Strong row's: its guard kills a
-	// foreign-ABI call, so a foreign entrypoint could not run there.
+	// The native-ABI rule is the Strong and OS rows': their guard
+	// kills a foreign-ABI call, so a foreign entrypoint could not run
+	// there; under a Root the OS row loads static entrypoints only.
 	checkEntry := func(string) error { return nil }
-	if r.tier == Strong {
-		checkEntry = checkNativeELF
+	switch r.tier {
+	case Strong:
+		checkEntry = func(p string) error { return checkELF(p, false) }
+	case OS:
+		checkEntry = func(p string) error { return checkELF(p, spec.Root != "") }
 	}
 	w := world{cmd: spec.Exec, workDir: spec.WorkDir}
 	var root string
@@ -418,6 +447,13 @@ func resolveWorld(spec Spec, r row) (world, error) {
 			return undeliverable("exec %s: %v", spec.Exec, err)
 		}
 		w.root = root
+		if r.tier == OS {
+			// The tree at its host path: the entrypoint inside it, and
+			// the working directory too — the tree's root where none is
+			// stated, as the pivoted row's "/" is, never the caller's.
+			w.cmd = filepath.Join(root, resolved)
+			w.workDir = root
+		}
 		if spec.WorkDir != "" {
 			fi, _, err := statInTree(root, spec.WorkDir)
 			if err != nil {
@@ -425,6 +461,40 @@ func resolveWorld(spec Spec, r row) (world, error) {
 			}
 			if !fi.IsDir() {
 				return undeliverable("workdir %s is not a directory in the tree", spec.WorkDir)
+			}
+			if r.tier == OS {
+				w.workDir = filepath.Join(root, spec.WorkDir)
+			}
+		}
+	}
+	// A grant whose host path lies within the tree, or holds it — the
+	// host's root over the tree's included — would make the tree
+	// writable through the grant, which "never written" forbids;
+	// judged on the host paths before anything else is asked of them.
+	if root != "" {
+		type stated struct{ path, what string }
+		var paths []stated
+		for _, g := range spec.PathGrants {
+			paths = append(paths, stated{g.Path, "grant"})
+		}
+		if spec.RuntimeDir != "" {
+			paths = append(paths, stated{spec.RuntimeDir, "runtime dir"})
+		}
+		for _, p := range paths {
+			if !filepath.IsAbs(p.path) || filepath.Clean(p.path) != p.path {
+				continue // resolveGrant refuses it by name
+			}
+			host, err := filepath.EvalSymlinks(p.path)
+			if err != nil {
+				continue // resolveGrant refuses it by name
+			}
+			switch {
+			case host == root:
+				return undeliverable("%s %s is the tree %s", p.what, p.path, spec.Root)
+			case within(host, root):
+				return undeliverable("%s %s lies within the tree %s", p.what, p.path, spec.Root)
+			case within(root, host):
+				return undeliverable("%s %s holds the tree %s", p.what, p.path, spec.Root)
 			}
 		}
 	}
@@ -446,12 +516,8 @@ func resolveWorld(spec Spec, r row) (world, error) {
 	}
 	// Overlap is judged on the canonical targets, where two stated
 	// spellings of one directory — or a symlink into another grant's
-	// subtree — meet. A grant of the root itself would bind the host
-	// over the tree, which no Root world can mean.
+	// subtree — meet.
 	for i, a := range binds {
-		if root != "" && a.Target == root {
-			return undeliverable("grant %s is the root of the world", a.Source)
-		}
 		for _, b := range binds[i+1:] {
 			if a.Target == b.Target || strings.HasPrefix(a.Target, b.Target+"/") || strings.HasPrefix(b.Target, a.Target+"/") {
 				return undeliverable("grants %s and %s overlap", a.Source, b.Source)
@@ -460,11 +526,48 @@ func resolveWorld(spec Spec, r row) (world, error) {
 	}
 	// A row without a mount namespace binds nothing: its read-write
 	// grants and rendezvous directory are the host paths they already
-	// are, and it has already refused every read-only grant.
-	if r.tier == Strong {
+	// are. The OS row allowlists them there instead.
+	switch r.tier {
+	case Strong:
 		w.binds = binds
+	case OS:
+		w.landlock = landlockRules(root, binds, landlockABI)
 	}
 	return w, nil
+}
+
+// landlockRules is the OS row's allowlist over the resolved world:
+// the tree, where there is one, readable and executable throughout;
+// each grant at its host path, readable and executable, and with
+// every right the ABI handles unless read-only; the rendezvous
+// directory with every right. Without a tree, the world is the
+// caller's whole, "/" with every right.
+func landlockRules(root string, binds []bind, abi int) []nslinux.LandlockRule {
+	readExec := nslinux.LandlockRead() | nslinux.LandlockExecute()
+	everything := nslinux.LandlockFS(abi)
+	var rules []nslinux.LandlockRule
+	if root == "" {
+		rules = append(rules, nslinux.LandlockRule{Path: "/", Access: everything})
+	} else {
+		rules = append(rules, nslinux.LandlockRule{Path: root, Access: readExec})
+	}
+	for _, b := range binds {
+		access := readExec
+		if !b.ReadOnly {
+			access = everything
+		}
+		rules = append(rules, nslinux.LandlockRule{Path: b.Source, Access: access})
+	}
+	return rules
+}
+
+// within reports whether the canonical path p lies strictly beneath
+// the canonical directory dir — every path but "/" lies beneath "/".
+func within(p, dir string) bool {
+	if dir == "/" {
+		return p != "/"
+	}
+	return strings.HasPrefix(p, dir+"/")
 }
 
 // resolveGrant validates one stated path and computes its bind.
@@ -568,21 +671,38 @@ func statInTree(root, p string) (os.FileInfo, string, error) {
 	return fi, cur, err
 }
 
-// checkNativeELF refuses an entrypoint built for a foreign machine:
-// the Strong row runs the native syscall ABI only, and its guard
-// kills a foreign-ABI call at the first system call, so such a
-// payload could not run at all — a stated intent this row cannot
+// checkELF refuses an entrypoint built for a foreign machine: the
+// Strong and OS rows run the native syscall ABI only, and their
+// guard kills a foreign-ABI call at the first system call, so such a
+// payload could not run at all — a stated intent the row cannot
 // deliver, known before exec. It refuses only on a machine it
 // actually read: a file that is not an ELF image (a script) or one
 // that cannot be read (execute-only, or unreadable in a shared tree —
 // execve needs no read permission) passes, and the arch guard is the
-// backstop for what the check could not see.
-func checkNativeELF(path string) error {
+// backstop for what the check could not see. With static set — the
+// OS row under a Root — the entrypoint must load without the
+// image-absolute layout that row does not present: a file that is
+// not an ELF image (a script names an interpreter the host would
+// resolve), one that cannot be read, or one asking an interpreter (a
+// dynamic executable, whose loader and libraries live at
+// image-absolute paths) is refused, the check being the only thing
+// between the payload and a wrong world.
+func checkELF(path string, static bool) error {
 	f, err := elf.Open(path)
 	if err != nil {
+		if static {
+			return fmt.Errorf("cannot be read as an ELF image (%v); this row loads static ELF entrypoints from the tree only", err)
+		}
 		return nil
 	}
 	defer f.Close()
+	if static {
+		for _, p := range f.Progs {
+			if p.Type == elf.PT_INTERP {
+				return errors.New("dynamically linked: this row loads static entrypoints from the tree only, having no image-absolute layout to load against")
+			}
+		}
+	}
 	want, ok := map[string]elf.Machine{"amd64": elf.EM_X86_64, "arm64": elf.EM_AARCH64, "386": elf.EM_386, "arm": elf.EM_ARM}[runtime.GOARCH]
 	if !ok {
 		return fmt.Errorf("the native ABI on %s is unknown to this row", runtime.GOARCH)
@@ -797,10 +917,12 @@ func composeInit() (*initConfig, error) {
 			return nil, fmt.Errorf("process bound: %w", err)
 		}
 	}
-	var strong bool
+	var strong, osRow bool
 	switch cfg.Row {
 	case Strong.String():
 		strong = true
+	case OS.String():
+		osRow = true
 	case Minimal.String():
 	default:
 		// The parent names the row it selected; a name this init
@@ -825,25 +947,30 @@ func composeInit() (*initConfig, error) {
 	if err := nslinux.SetRlimits(cfg.Rlimits); err != nil {
 		return nil, intentError{err}
 	}
+	if osRow {
+		// The OS row's allowlist over the world, which sets
+		// no_new_privs, ahead of the filters.
+		if err := nslinux.RestrictLandlock(cfg.LandlockABI, cfg.Landlock, cfg.DenyNetwork); err != nil {
+			// A rule's path gone since the parent resolved it is the
+			// intent with nowhere to land, not the mechanism failing.
+			if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) {
+				return nil, intentError{err}
+			}
+			return nil, err
+		}
+		if err := harden(func(native *arch.Info) seccomp.Policy { return osSeccompPolicy(native, !cfg.DenyNetwork) }); err != nil {
+			return nil, err
+		}
+	}
 	if strong {
 		// Hardening, last and in this order (docs/specs/sandbox.md,
 		// Strong row): every capability set emptied so the payload
 		// holds none even as the namespace's mapped root — after the
-		// mounts, which needed CAP_SYS_ADMIN — then the arch guard and
-		// the native-ABI filter, which deny from the moment they load
-		// and set no_new_privs. Each verb pins the goroutine to its
-		// thread, and exec follows on it.
+		// mounts, which needed CAP_SYS_ADMIN — then the filters.
 		if err := nslinux.DropAllCapabilities(); err != nil {
 			return nil, err
 		}
-		native, err := arch.GetInfo("")
-		if err != nil {
-			return nil, fmt.Errorf("seccomp: %w", err)
-		}
-		if err := nslinux.LoadArchGuard(native); err != nil {
-			return nil, err
-		}
-		if err := nslinux.LoadSeccomp(strongSeccompPolicy(native)); err != nil {
+		if err := harden(strongSeccompPolicy); err != nil {
 			return nil, err
 		}
 	}
@@ -862,6 +989,20 @@ func composeInit() (*initConfig, error) {
 		cfg.Env = []string{}
 	}
 	return &cfg, nil
+}
+
+// harden loads the arch guard and then the native-ABI filter policy
+// gives, which deny from the moment they load and set no_new_privs.
+// Each verb pins the goroutine to its thread, and exec follows on it.
+func harden(policy func(*arch.Info) seccomp.Policy) error {
+	native, err := arch.GetInfo("")
+	if err != nil {
+		return fmt.Errorf("seccomp: %w", err)
+	}
+	if err := nslinux.LoadArchGuard(native); err != nil {
+		return err
+	}
+	return nslinux.LoadSeccomp(policy(native))
 }
 
 // composeWorld delivers the Strong row's world inside the fresh mount

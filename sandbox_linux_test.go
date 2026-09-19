@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"debug/elf"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	seccomp "github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
 	"github.com/greatliontech/sandbox/internal/nslinux"
 	"github.com/greatliontech/sandbox/internal/testdemand"
@@ -39,6 +41,16 @@ var (
 
 const probeEnv = "SANDBOX_TEST_USERNS_PROBE"
 
+// The Landlock TCP witness: the test binary re-execed under
+// landlockTCPEnv ("deny" or "allow") restricts itself with the TCP
+// rights handled or not and execs the world probe at
+// landlockTCPWorld to connect to landlockTCPAddr.
+const (
+	landlockTCPEnv   = "SANDBOX_TEST_LANDLOCK_TCP"
+	landlockTCPWorld = "SANDBOX_TEST_LANDLOCK_WORLD"
+	landlockTCPAddr  = "SANDBOX_TEST_LANDLOCK_ADDR"
+)
+
 // TestMain builds the world probe once (CGO_ENABLED=0, so the tree
 // needs no libraries) into a tree shaped for the Root tests: the
 // probe at /world, a marker file, and the directories the exact
@@ -49,6 +61,9 @@ const probeEnv = "SANDBOX_TEST_USERNS_PROBE"
 func TestMain(m *testing.M) {
 	if os.Getenv(probeEnv) == "1" {
 		os.Exit(0)
+	}
+	if mode := os.Getenv(landlockTCPEnv); mode != "" {
+		landlockTCPChild(mode)
 	}
 	dir, err := os.MkdirTemp("", "sandbox-tree-*")
 	if err != nil {
@@ -387,7 +402,7 @@ func TestRootRefusesUndeliverable(t *testing.T) {
 		"runtime dir over a grant": {Spec{Exec: "/world", Root: tree, PathGrants: []PathGrant{{Path: outer, Access: ReadOnly}}, RuntimeDir: outer}, "overlap"},
 		"runtime dir missing":      {Spec{Exec: "/world", Root: tree, RuntimeDir: t.TempDir()}, "runtime dir"},
 		"grants overlap no root":   {Spec{Exec: "/bin/sh", PathGrants: []PathGrant{{Path: outer}, {Path: inner}}}, "overlap"},
-		"grant of the root itself": {Spec{Exec: "/world", Root: tree, PathGrants: []PathGrant{{Path: "/"}}}, "is the root of the world"},
+		"grant of the root itself": {Spec{Exec: "/world", Root: tree, PathGrants: []PathGrant{{Path: "/"}}}, "grant / holds the tree"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -899,11 +914,27 @@ func TestPolicyNamesResolve(t *testing.T) {
 		t.Fatalf("native policy does not assemble: %v", err)
 	}
 	for _, tb := range tables {
-		pol := strongSeccompPolicy(tb)
-		for _, g := range pol.Syscalls {
-			for _, n := range g.Names {
-				if _, ok := tb.SyscallNames[n]; !ok {
-					t.Errorf("%s policy names %s, which %s lacks", tb.Name, n, tb.Name)
+		for _, pol := range []seccomp.Policy{strongSeccompPolicy(tb), osSeccompPolicy(tb, false), osSeccompPolicy(tb, true)} {
+			for _, g := range pol.Syscalls {
+				if len(g.Names)+len(g.NamesWithCondtions) == 0 {
+					t.Errorf("%s policy carries an empty group", tb.Name)
+				}
+				for _, n := range g.NamesWithCondtions {
+					if _, ok := tb.SyscallNames[n.Name]; !ok {
+						t.Errorf("%s policy names %s, which %s lacks", tb.Name, n.Name, tb.Name)
+					}
+				}
+				for _, n := range g.Names {
+					if _, ok := tb.SyscallNames[n]; !ok {
+						t.Errorf("%s policy names %s, which %s lacks", tb.Name, n, tb.Name)
+					}
+				}
+			}
+			// The assembler resolves the running architecture itself,
+			// so only the native table's policies assemble here.
+			if tb.ID == native.ID {
+				if _, err := pol.Assemble(); err != nil {
+					t.Errorf("%s policy does not assemble: %v", tb.Name, err)
 				}
 			}
 		}
@@ -915,6 +946,22 @@ func TestPolicyNamesResolve(t *testing.T) {
 				t.Error("kexec_file_load kept in the i386 policy, where it does not exist")
 			}
 		}
+	}
+	// An ABI multiplexing the socket calls through socketcall refuses
+	// the socket and socketpair calls whole, by call number.
+	var calls []uint64
+	for _, g := range osSeccompPolicy(arch.I386, false).Syscalls {
+		for _, n := range g.NamesWithCondtions {
+			if n.Name == "socketcall" && len(n.Conditions) == 1 && n.Conditions[0].Operation == seccomp.Equal {
+				calls = append(calls, n.Conditions[0].Value)
+			}
+		}
+	}
+	if fmt.Sprint(calls) != "[1 8]" {
+		t.Errorf("i386 network denial refuses socketcall calls %v, want [1 8] (socket, socketpair)", calls)
+	}
+	if got := osSeccompPolicy(arch.X86_64, false).Syscalls; len(got) != len(strongSeccompPolicy(arch.X86_64).Syscalls)+1 {
+		t.Errorf("x86_64 network denial adds %d groups to the Strong policy, want 1", len(got)-len(strongSeccompPolicy(arch.X86_64).Syscalls))
 	}
 }
 
@@ -1492,9 +1539,10 @@ func withHost(t *testing.T, f hostFacts) {
 // Row selection picks the highest row whose facts hold for the
 // spec's network intent and names what fails for the rows passed
 // over: the network namespace matters only to a spec denying the
-// network.
+// network, and a host refusing namespaces reaches the OS row where
+// Landlock and the seccomp kill hold, Minimal otherwise.
 func TestSelectRow(t *testing.T) {
-	ns, net, sk := errors.New("namespaces: EPERM"), errors.New("network namespace: EINVAL"), errors.New("seccomp kill-process action: ENOSYS")
+	ns, net, sk, ll := errors.New("namespaces: EPERM"), errors.New("network namespace: EINVAL"), errors.New("seccomp kill-process action: ENOSYS"), errors.New("landlock: ENOSYS")
 	cases := []struct {
 		facts   hostFacts
 		network bool
@@ -1502,11 +1550,14 @@ func TestSelectRow(t *testing.T) {
 		below   []string
 	}{
 		{hostFacts{}, false, strongRow, nil},
-		{hostFacts{netns: net}, false, minimalRow, []string{net.Error()}},
+		{hostFacts{netns: net}, false, osRow, []string{net.Error()}},
+		{hostFacts{netns: net, landlock: ll}, false, minimalRow, []string{net.Error(), ll.Error()}},
 		{hostFacts{netns: net}, true, strongRow, nil},
-		{hostFacts{namespaces: ns, netns: net}, true, minimalRow, []string{ns.Error()}},
+		{hostFacts{namespaces: ns, netns: net}, true, osRow, []string{ns.Error()}},
+		{hostFacts{namespaces: ns, netns: net, landlock: ll}, true, minimalRow, []string{ns.Error(), ll.Error()}},
 		{hostFacts{seccompKill: sk}, true, minimalRow, []string{sk.Error()}},
 		{hostFacts{namespaces: ns, netns: net, seccompKill: sk}, false, minimalRow, []string{ns.Error(), sk.Error()}},
+		{hostFacts{namespaces: ns, netns: net, seccompKill: sk, landlock: ll}, false, minimalRow, []string{ns.Error(), sk.Error(), ll.Error()}},
 	}
 	for _, c := range cases {
 		got, below := selectRow(c.facts, c.network)
@@ -1521,7 +1572,7 @@ func TestSelectRow(t *testing.T) {
 // what the host lacks; Tier stays None. The same host admits the
 // demand it can meet.
 func TestMinTierRefusesBeforeExec(t *testing.T) {
-	withHost(t, hostFacts{namespaces: errors.New("clone: operation not permitted (forced)")})
+	withHost(t, hostFacts{namespaces: errors.New("clone: operation not permitted (forced)"), landlock: errors.New("landlock: forced")})
 	for _, min := range []Isolation{Strong, OS} {
 		sb, err := New(Spec{Exec: "/bin/true", Network: true, Limits: Limits{CPUSeconds: 60}, MinTier: min})
 		if err != nil {
@@ -1588,7 +1639,7 @@ func TestTierDerived(t *testing.T) {
 // hardening, and the bounds with their accounting reported.
 func TestMinimalRow(t *testing.T) {
 	requireTree(t)
-	withHost(t, hostFacts{namespaces: errors.New("forced")})
+	withHost(t, hostFacts{namespaces: errors.New("forced"), landlock: errors.New("landlock: forced")})
 	var out bytes.Buffer
 	sb, err := New(Spec{Exec: filepath.Join(worldTree, "world"), Network: true, Limits: Limits{CPUSeconds: 60}, Stdout: &out, Stderr: os.Stderr})
 	if err != nil {
@@ -1645,7 +1696,7 @@ func TestMinimalRow(t *testing.T) {
 // anything runs. The same intents run on the Strong row.
 func TestMinimalRefusesUndeliverable(t *testing.T) {
 	requireTree(t)
-	withHost(t, hostFacts{namespaces: errors.New("forced")})
+	withHost(t, hostFacts{namespaces: errors.New("forced"), landlock: errors.New("landlock: forced")})
 	tree := worldFixture(t, "grant-ro")
 	world := filepath.Join(tree, "world")
 	limits := Limits{CPUSeconds: 60}
@@ -1690,8 +1741,20 @@ func TestMinimalRefusesUndeliverable(t *testing.T) {
 // Cancellation on the Minimal row kills the run's process group, so a
 // child the payload spawned dies with it.
 func TestMinimalCancelKillsGroup(t *testing.T) {
+	withHost(t, hostFacts{namespaces: errors.New("forced"), landlock: errors.New("landlock: forced")})
+	cancelKillsGroup(t, Minimal)
+}
+
+// The OS row's kill tie is the process group's too, having no pid
+// namespace.
+func TestOSRowCancelKillsGroup(t *testing.T) {
+	osHost(t)
+	cancelKillsGroup(t, OS)
+}
+
+func cancelKillsGroup(t *testing.T, tier Isolation) {
+	t.Helper()
 	requireTree(t)
-	withHost(t, hostFacts{namespaces: errors.New("forced")})
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -1708,6 +1771,9 @@ func TestMinimalCancelKillsGroup(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	w.Close()
+	if sb.Tier() != tier {
+		t.Fatalf("Tier = %v, want %v", sb.Tier(), tier)
+	}
 	line, err := bufio.NewReader(r).ReadString('\n')
 	if err != nil || !strings.HasPrefix(line, "child=") {
 		t.Fatalf("payload announced %q, %v", line, err)
@@ -2035,5 +2101,548 @@ func TestNewRefusesUnknownMinTier(t *testing.T) {
 		if _, err := New(Spec{Exec: "/bin/true", Network: true, Limits: Limits{CPUSeconds: 60}, MinTier: min}); err == nil || !strings.Contains(err.Error(), "names no tier") {
 			t.Errorf("MinTier %d: %v", min, err)
 		}
+	}
+}
+
+// osHost pins the facts of a host that refuses namespaces and has
+// this kernel's Landlock, so the OS row is exercised here; the arm
+// skips where the kernel has no Landlock, unless
+// SANDBOX_TEST_REQUIRE_LANDLOCK demands it.
+func osHost(t *testing.T) {
+	t.Helper()
+	abi, err := nslinux.LandlockABI()
+	unavailable := ""
+	if err != nil {
+		unavailable = "Landlock is unavailable here: " + err.Error()
+	}
+	testdemand.Live(t, "SANDBOX_TEST_REQUIRE_LANDLOCK", unavailable)
+	withHost(t, hostFacts{namespaces: errors.New("forced"), landlockABI: abi})
+}
+
+// The OS row's world under a Root: the tree, the grants and the
+// rendezvous directory at their host paths, the tree readable and
+// never written, the read-only grant readable and not writable, the
+// read-write grant and the rendezvous directory writable, and
+// nothing else — the host's /proc is denied, not absent; the working
+// directory is the tree's; the environment is empty when unstated;
+// the network is denied at the socket for every family but the
+// local one; no_new_privs is set and the Strong row's filter
+// denials hold; the tier is OS.
+func TestOSRowWorld(t *testing.T) {
+	osHost(t)
+	roHost := t.TempDir()
+	rwHost := t.TempDir()
+	runHost := t.TempDir()
+	if err := os.WriteFile(filepath.Join(roHost, "marker"), []byte("granted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tree := worldFixture(t, roHost, rwHost, runHost)
+	before := snapshot(t, tree)
+
+	var out, errOut bytes.Buffer
+	sb, err := New(Spec{
+		Exec:       "/world",
+		Args:       []string{roHost, rwHost, runHost, tree},
+		Root:       tree,
+		WorkDir:    "/etc",
+		PathGrants: []PathGrant{{Path: roHost, Access: ReadOnly}, {Path: rwHost, Access: ReadWrite}},
+		RuntimeDir: runHost,
+		Stdout:     &out,
+		Stderr:     &errOut,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if sb.Tier() != OS {
+		t.Fatalf("Tier = %v, want os", sb.Tier())
+	}
+	es, err := sb.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if es.Code != 0 {
+		t.Fatalf("exit code = %d, stderr: %s", es.Code, errOut.String())
+	}
+	f := facts(out.String())
+	for k, want := range map[string]string{
+		"cwd":            filepath.Join(tree, "etc"),
+		"env":            "0",
+		"tree-read":      `"tree" err=false`,
+		"tree-write-err": "true",
+		"ro-read":        `"granted"`,
+		"ro-read-err":    "false",
+		"ro-write-err":   "true",
+		"rw-write-err":   "false",
+		"run-write-err":  "false",
+		"proc-read":      syscall.EACCES.Error(),
+		"socket-inet":    syscall.EAFNOSUPPORT.Error(),
+		"socket-unix":    "ok",
+		"dial-err":       "true",
+		"nnp":            "1 err=false",
+		"unshare":        syscall.EPERM.Error(),
+		"keyctl":         syscall.EPERM.Error(),
+		"io_uring_setup": syscall.EPERM.Error(),
+	} {
+		if f[k] != want {
+			t.Errorf("%s = %q, want %q", k, f[k], want)
+		}
+	}
+	if f["pid"] == "1" || f["pid"] == "" {
+		t.Errorf("pid = %q: the OS row has no pid namespace", f["pid"])
+	}
+	if _, err := os.Stat(filepath.Join(rwHost, "probe")); err != nil {
+		t.Errorf("read-write grant's write did not reach the host: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runHost, "sock")); err != nil {
+		t.Errorf("rendezvous write did not reach the host: %v", err)
+	}
+	if after := snapshot(t, tree); after != before {
+		t.Errorf("the tree was written:\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
+// Without a Root the OS row's allowlist is the caller's whole world:
+// the host's root and /proc are readable, the environment is
+// inherited, the network is granted where stated and denied at the
+// socket where not; the tier is OS.
+func TestOSRowWithoutRoot(t *testing.T) {
+	osHost(t)
+	for _, network := range []bool{false, true} {
+		var out bytes.Buffer
+		sb, err := New(Spec{Exec: filepath.Join(worldTree, "world"), Network: network, Stdout: &out, Stderr: os.Stderr})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		if err := sb.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if sb.Tier() != OS {
+			t.Fatalf("Tier = %v, want os", sb.Tier())
+		}
+		if es, err := sb.Wait(); err != nil || es.Code != 0 {
+			t.Fatalf("Wait: %+v %v\n%s", es, err, out.String())
+		}
+		f := facts(out.String())
+		if f["proc-read"] != "ok" || f["root"] == "" || f["env"] == "0" {
+			t.Errorf("network=%v: the world is not the host's: proc-read=%q root=%q env=%q", network, f["proc-read"], f["root"], f["env"])
+		}
+		wantInet := syscall.EAFNOSUPPORT.Error()
+		if network {
+			wantInet = "ok"
+		}
+		if f["socket-inet"] != wantInet || f["socket-unix"] != "ok" {
+			t.Errorf("network=%v: socket-inet=%q socket-unix=%q", network, f["socket-inet"], f["socket-unix"])
+		}
+		if f["nnp"] != "1 err=false" || f["unshare"] != syscall.EPERM.Error() {
+			t.Errorf("network=%v: hardening: nnp=%q unshare=%q", network, f["nnp"], f["unshare"])
+		}
+	}
+}
+
+// The OS row refuses before anything runs what it cannot deliver: a
+// hostname, which it has no namespace to present; a read-only grant
+// without a Root, which its allowlist of the whole world cannot make
+// so; and, under a Root, an entrypoint the kernel could not load
+// without the image-absolute layout — a script, a dynamically linked
+// executable — or one built for a foreign machine. A read-only grant
+// under a Root runs.
+func TestOSRowRefusesUndeliverable(t *testing.T) {
+	osHost(t)
+	roHost := t.TempDir()
+	tree := worldFixture(t, roHost, "grant-ro", "bin")
+	if err := os.WriteFile(filepath.Join(tree, "bin", "script"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dynamic := filepath.Join(tree, "bin", "dynamic")
+	if err := buildDynamic(dynamic); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		spec Spec
+		want string
+	}{
+		{"hostname", Spec{Exec: filepath.Join(tree, "world"), Network: true, Hostname: "x"}, "presents no hostname"},
+		{"read-only grant without a root", Spec{Exec: filepath.Join(tree, "world"), Network: true, PathGrants: []PathGrant{{Path: filepath.Join(tree, "grant-ro"), Access: ReadOnly}}}, "read-only without a Root"},
+		{"script", Spec{Exec: "/bin/script", Root: tree}, "static ELF entrypoints from the tree only"},
+		{"dynamic", Spec{Exec: "/bin/dynamic", Root: tree}, "dynamically linked"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sb, err := New(c.spec)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			err = sb.Start(context.Background())
+			if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("Start = %v, want ErrUndeliverable naming %q", err, c.want)
+			}
+			if sb.Tier() != None {
+				t.Errorf("Tier = %v after a refusal", sb.Tier())
+			}
+		})
+	}
+	sb, err := New(Spec{Exec: "/world", Root: tree, PathGrants: []PathGrant{{Path: roHost, Access: ReadOnly}}, Stdout: io.Discard, Stderr: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("a read-only grant under a Root: %v", err)
+	}
+	if es, err := sb.Wait(); err != nil || es.Code != 0 {
+		t.Fatalf("Wait: %+v %v", es, err)
+	}
+}
+
+// buildDynamic writes a dynamically linked executable at path: the
+// smallest one the toolchain here produces, a C program where a C
+// compiler is present, else this test binary's own dynamic loader
+// exercised through a copy of a system binary that names one.
+func buildDynamic(path string) error {
+	f, err := elf.Open("/bin/sh")
+	if err != nil {
+		return fmt.Errorf("no dynamic executable at /bin/sh to copy: %w", err)
+	}
+	interp := false
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_INTERP {
+			interp = true
+		}
+	}
+	f.Close()
+	if !interp {
+		return errors.New("/bin/sh is statically linked here; no dynamic executable to copy")
+	}
+	b, err := os.ReadFile("/bin/sh")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o755)
+}
+
+// The static-entrypoint check reads the ELF: a static executable
+// passes, an interpreter-loaded one and a non-ELF file are refused,
+// each naming why; the native check alone passes what it cannot
+// read.
+func TestCheckStaticELF(t *testing.T) {
+	requireTree(t)
+	if err := checkELF(filepath.Join(t.TempDir(), "absent"), false); err != nil {
+		t.Errorf("the native check refused what it cannot read: %v", err)
+	}
+	if err := checkELF(filepath.Join(t.TempDir(), "absent"), true); err == nil || !strings.Contains(err.Error(), "cannot be read") {
+		t.Errorf("the static check on an unreadable entrypoint: %v", err)
+	}
+	if err := checkELF(filepath.Join(worldTree, "world"), true); err != nil {
+		t.Errorf("the static world probe refused: %v", err)
+	}
+	script := filepath.Join(t.TempDir(), "script")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkELF(script, true); err == nil || !strings.Contains(err.Error(), "static ELF entrypoints") {
+		t.Errorf("a script: %v", err)
+	}
+	dynamic := filepath.Join(t.TempDir(), "dynamic")
+	if err := buildDynamic(dynamic); err != nil {
+		t.Skip(err)
+	}
+	if err := checkELF(dynamic, true); err == nil || !strings.Contains(err.Error(), "dynamically linked") {
+		t.Errorf("a dynamic executable: %v", err)
+	}
+}
+
+// The OS row's allowlist over a resolved world: the tree readable
+// and executable, a read-only grant the same, a read-write grant and
+// the rendezvous directory with every right; without a tree, "/"
+// with every right.
+func TestLandlockRules(t *testing.T) {
+	readExec := nslinux.LandlockRead() | nslinux.LandlockExecute()
+	everything := nslinux.LandlockFS(3)
+	binds := []bind{{Source: "/ro", Target: "/tree/ro", ReadOnly: true}, {Source: "/rw", Target: "/tree/rw"}}
+	got := landlockRules("/tree", binds, 3)
+	want := []nslinux.LandlockRule{{Path: "/tree", Access: readExec}, {Path: "/ro", Access: readExec}, {Path: "/rw", Access: everything}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("rules under a root = %v, want %v", got, want)
+	}
+	got = landlockRules("", binds[1:], 3)
+	want = []nslinux.LandlockRule{{Path: "/", Access: everything}, {Path: "/rw", Access: everything}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("rules without a root = %v, want %v", got, want)
+	}
+}
+
+// landlockTCPChild restricts this process under a Landlock ruleset
+// allowing every filesystem right, with the TCP rights denied where
+// mode is "deny", and execs the world probe to connect: Landlock
+// restricts the calling thread, and the exec carries it.
+func landlockTCPChild(mode string) {
+	abi, err := nslinux.LandlockABI()
+	if err != nil {
+		fmt.Println("child:", err)
+		os.Exit(1)
+	}
+	rules := []nslinux.LandlockRule{{Path: "/", Access: nslinux.LandlockFS(abi)}}
+	if err := nslinux.RestrictLandlock(abi, rules, mode == "deny"); err != nil {
+		fmt.Println("child:", err)
+		os.Exit(1)
+	}
+	world := os.Getenv(landlockTCPWorld)
+	err = syscall.Exec(world, []string{world, "connect", os.Getenv(landlockTCPAddr)}, os.Environ())
+	fmt.Println("child: exec:", err)
+	os.Exit(1)
+}
+
+// Landlock's TCP rights are the OS row's supplementary network arm,
+// applied beside the socket filter where the kernel handles them
+// (ABI 4): a process restricted with them denied cannot connect a
+// TCP socket, and one restricted without them can. The arm skips
+// where the kernel's ABI has no TCP rights, unless
+// SANDBOX_TEST_REQUIRE_LANDLOCK demands it.
+func TestLandlockDeniesTCP(t *testing.T) {
+	requireTree(t)
+	abi, err := nslinux.LandlockABI()
+	unavailable := ""
+	if err != nil {
+		unavailable = "Landlock is unavailable here: " + err.Error()
+	} else if abi < 4 {
+		unavailable = fmt.Sprintf("Landlock ABI %d here has no TCP rights (ABI 4)", abi)
+	}
+	testdemand.Live(t, "SANDBOX_TEST_REQUIRE_LANDLOCK", unavailable)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	for mode, want := range map[string]string{"deny": syscall.EACCES.Error(), "allow": "ok"} {
+		cmd := exec.Command(os.Args[0], "-test.run=^$")
+		cmd.Env = append(os.Environ(), landlockTCPEnv+"="+mode, landlockTCPWorld+"="+filepath.Join(worldTree, "world"), landlockTCPAddr+"="+ln.Addr().String())
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: %v\n%s", mode, err, out)
+		}
+		if got := facts(string(out))["connect"]; got != want {
+			t.Errorf("%s: connect = %q, want %q", mode, got, want)
+		}
+	}
+}
+
+// A grant that is a file, under a Root on the OS row: the rule on it
+// carries the file's rights alone, so a read-only file reads and
+// does not write, a read-write file writes, and the row applies —
+// the kernel refuses a directory-only right on a file, which the
+// verb drops.
+func TestOSRowFileGrants(t *testing.T) {
+	osHost(t)
+	roHost := filepath.Join(t.TempDir(), "ro-file")
+	rwHost := filepath.Join(t.TempDir(), "rw-file")
+	for _, p := range []string{roHost, rwHost} {
+		if err := os.WriteFile(p, []byte("granted"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tree := worldFixture(t)
+	for _, p := range []string{roHost, rwHost} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(tree, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(tree, p), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out, errOut bytes.Buffer
+	sb, err := New(Spec{
+		Exec:       "/world",
+		Args:       []string{roHost, rwHost},
+		Root:       tree,
+		PathGrants: []PathGrant{{Path: roHost, Access: ReadOnly}, {Path: rwHost, Access: ReadWrite}},
+		Stdout:     &out,
+		Stderr:     &errOut,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if es, err := sb.Wait(); err != nil || es.Code != 0 {
+		t.Fatalf("Wait: %+v %v\n%s", es, err, errOut.String())
+	}
+	f := facts(out.String())
+	for k, want := range map[string]string{
+		"cwd":          tree, // the tree's root where no working directory is stated
+		"ro-read":      `"granted"`,
+		"ro-read-err":  "false",
+		"ro-write-err": "true",
+		"rw-write-err": "false",
+	} {
+		if f[k] != want {
+			t.Errorf("%s = %q, want %q", k, f[k], want)
+		}
+	}
+	if b, _ := os.ReadFile(rwHost); string(b) != "x" {
+		t.Errorf("the read-write file reads %q after the write", b)
+	}
+}
+
+// The OS row's bounds are the host's accounting, reported: a stated
+// limit runs under rlimits or a delegated cgroup, never unaccounted;
+// the CPU-time and open-files bounds are rlimits on every row.
+func TestOSRowBounds(t *testing.T) {
+	osHost(t)
+	var out bytes.Buffer
+	sb, err := New(Spec{Exec: filepath.Join(worldTree, "world"), Network: true, Limits: Limits{CPUSeconds: 60, MaxFiles: 64}, Stdout: &out, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if es, err := sb.Wait(); err != nil || es.Code != 0 {
+		t.Fatalf("Wait: %+v %v\n%s", es, err, out.String())
+	}
+	if sb.Tier() != OS {
+		t.Fatalf("Tier = %v, want os", sb.Tier())
+	}
+	st, err := sb.Stats()
+	if err != nil || (st.Accounting != AccountingRlimits && st.Accounting != AccountingCgroups) {
+		t.Fatalf("Stats = %+v, %v: the bounds ran unaccounted", st, err)
+	}
+}
+
+// A host reaching the OS row refuses a Strong demand before exec,
+// the refusal naming the row reached and the namespaces it lacks,
+// and admits an OS demand.
+func TestMinTierOnAnOSHost(t *testing.T) {
+	osHost(t)
+	sb, err := New(Spec{Exec: filepath.Join(worldTree, "world"), Network: true, MinTier: Strong})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	err = sb.Start(context.Background())
+	var te *TierError
+	if !errors.As(err, &te) || te.Reached != OS || te.Required != Strong || len(te.Lacking) != 1 || !strings.Contains(te.Lacking[0], "forced") {
+		t.Fatalf("Start = %v (%+v), want a tier refusal naming the OS row and the namespaces", err, te)
+	}
+	if sb.Tier() != None {
+		t.Fatalf("Tier = %v after a refusal", sb.Tier())
+	}
+	sb, err = New(Spec{Exec: filepath.Join(worldTree, "world"), Network: true, MinTier: OS, Stdout: io.Discard})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start on the admitted row: %v", err)
+	}
+	if es, err := sb.Wait(); err != nil || es.Code != 0 || sb.Tier() != OS {
+		t.Fatalf("Wait: %+v %v, tier %v", es, err, sb.Tier())
+	}
+}
+
+// A grant whose host path lies within the tree, or holds it, is
+// refused under a Root on every row: the tree would be written
+// through the grant.
+func TestGrantWithinTreeRefused(t *testing.T) {
+	tree := worldFixture(t)
+	inside := filepath.Join(tree, "grant-rw")
+	parent := filepath.Dir(tree)
+	if err := os.MkdirAll(filepath.Join(tree, parent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(tree, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []struct {
+		name string
+		host hostFacts
+	}{
+		{"strong", hostFacts{}},
+		{"os", hostFacts{namespaces: errors.New("forced"), landlockABI: 3}},
+	} {
+		withHost(t, r.host)
+		for _, c := range []struct{ root, grant, want string }{
+			{tree, inside, "grant " + inside + " lies within the tree"},
+			{tree, parent, "grant " + parent + " holds the tree"},
+			{"/", "/tmp", "grant /tmp lies within the tree /"},
+			{tree, "/", "grant / holds the tree"},
+			{"/", "/", "grant / is the tree /"},
+			{tree, link, "grant " + link + " is the tree"}, // a symlink onto the tree
+		} {
+			exec := "/world"
+			if c.root == "/" {
+				exec = filepath.Join(worldTree, "world") // static, and in that tree
+			}
+			sb, err := New(Spec{Exec: exec, Root: c.root, PathGrants: []PathGrant{{Path: c.grant, Access: ReadWrite}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = sb.Start(context.Background())
+			if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), c.want) {
+				t.Errorf("%s row, root %s, grant %s: Start = %v, want ErrUndeliverable naming %q", r.name, c.root, c.grant, err, c.want)
+			}
+		}
+		// The rendezvous directory is judged the same way, by its
+		// own name; one absent on the host keeps its own refusal.
+		sb, err := New(Spec{Exec: "/world", Root: tree, RuntimeDir: inside})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "runtime dir "+inside+" lies within the tree") {
+			t.Errorf("%s row, rendezvous within the tree: %v", r.name, err)
+		}
+		sb, err = New(Spec{Exec: "/world", Root: tree, RuntimeDir: "/nonexistent-rendezvous"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "runtime dir /nonexistent-rendezvous:") {
+			t.Errorf("%s row, absent rendezvous: %v", r.name, err)
+		}
+	}
+}
+
+// The OS row's IPC with the host: where the kernel scopes it
+// (Landlock ABI 6), a signal to the caller and a connection to an
+// abstract unix socket the caller listens on are refused; below that
+// ABI both reach the host, the exposure the spec names.
+func TestOSRowScopesIPC(t *testing.T) {
+	osHost(t)
+	abi, _ := nslinux.LandlockABI()
+	name := fmt.Sprintf("sandbox-test-%d", os.Getpid())
+	ln, err := net.Listen("unix", "@"+name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	tree := worldFixture(t)
+	var out, errOut bytes.Buffer
+	sb, err := New(Spec{Exec: "/world", Args: []string{"", "", "", "", name}, Root: tree, Stdout: &out, Stderr: &errOut})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if es, err := sb.Wait(); err != nil || es.Code != 0 {
+		t.Fatalf("Wait: %+v %v\n%s", es, err, errOut.String())
+	}
+	f := facts(out.String())
+	want := "ok"
+	if nslinux.LandlockScopesIPC(abi) {
+		want = syscall.EPERM.Error()
+	}
+	if f["signal-parent"] != want || f["abstract-connect"] != want {
+		t.Errorf("ABI %d: signal-parent=%q abstract-connect=%q, want %q", abi, f["signal-parent"], f["abstract-connect"], want)
 	}
 }

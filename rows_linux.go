@@ -17,17 +17,18 @@ import (
 
 // row is one rung of the ladder (docs/specs/sandbox.md, "Mechanism
 // ladder") this backend delivers on Linux. The Strong row is the
-// namespaced world with its hardening; the Minimal row is bounds
-// alone, in the caller's own namespaces, graded for nothing else. The
-// OS row (Landlock) has no implementation here and is never selected
-// (docs/issues/linux-os-row.md): a row with no mechanism to apply is
-// not a row this host satisfies.
+// namespaced world with its hardening; the OS row, for a host that
+// refuses namespaces, is a Landlock allowlist over the world at its
+// host paths, the network denied by seccomp, no_new_privs, and
+// static entrypoints only; the Minimal row is bounds alone, in the
+// caller's own namespaces, graded for nothing else.
 type row struct {
 	tier Isolation
 }
 
 var (
 	strongRow  = row{tier: Strong}
+	osRow      = row{tier: OS}
 	minimalRow = row{tier: Minimal}
 )
 
@@ -38,18 +39,34 @@ var (
 func (r row) groupKill() bool { return r.tier != Strong }
 
 // refuses names the intent in spec the row cannot deliver, if any.
-// The Minimal row's mechanism set is bounds alone: it refuses every
-// intent only a security boundary delivers — a Root, which nothing
-// would bound the world to; a hostname; a denied network; a read-only
-// grant — and a Spec stating no limits, which would leave that row
-// nothing to apply (docs/specs/sandbox.md, the ladder: sandbox never
-// bare-execs).
+// The OS row has no namespaces: it presents no hostname, and without
+// a Root its allowlist is the caller's whole world, so a read-only
+// grant there has no rule that could make it so — Landlock allows,
+// never denies. The Minimal row's mechanism set is bounds alone: it
+// refuses every intent only a security boundary delivers — a Root,
+// which nothing would bound the world to; a hostname; a denied
+// network; a read-only grant — and a Spec stating no limits, which
+// would leave that row nothing to apply (docs/specs/sandbox.md, the
+// ladder: sandbox never bare-execs).
 func (r row) refuses(spec Spec) error {
-	if r.tier != Minimal {
-		return nil
-	}
 	undeliverable := func(what string) error {
 		return fmt.Errorf("%w: the %s row %s", ErrUndeliverable, r.tier, what)
+	}
+	if r.tier == OS {
+		if spec.Hostname != "" {
+			return undeliverable("presents no hostname")
+		}
+		if spec.Root == "" {
+			for _, g := range spec.PathGrants {
+				if g.Access == ReadOnly {
+					return undeliverable(fmt.Sprintf("cannot make grant %s read-only without a Root: its allowlist is then the whole world", g.Path))
+				}
+			}
+		}
+		return nil
+	}
+	if r.tier != Minimal {
+		return nil
 	}
 	switch {
 	case spec.Root != "":
@@ -80,14 +97,19 @@ type hostFacts struct {
 	// only for a spec that does not grant the network.
 	netns error
 	// seccompKill: seccomp filters exist and the kill-process action
-	// is known, so the row's arch guard kills as documented.
+	// is known, so a row's arch guard kills as documented.
 	seccompKill error
+	// landlock: the kernel exposes Landlock, at ABI landlockABI.
+	landlock    error
+	landlockABI int
 }
 
 // selectRow picks the highest row whose facts hold for a spec that
-// grants the network or not, and names, where the Strong row is
-// passed over, what fails. The Minimal row always holds on Linux:
-// rlimits are always there.
+// grants the network or not, and names, where a row is passed over,
+// what fails for it, in probe order. The Strong row needs the
+// namespaces and the seccomp kill; the OS row needs Landlock and the
+// seccomp kill; the Minimal row always holds on Linux: rlimits are
+// always there.
 func selectRow(f hostFacts, network bool) (row, []string) {
 	var below []string
 	if f.namespaces != nil {
@@ -102,6 +124,12 @@ func selectRow(f hostFacts, network bool) (row, []string) {
 	}
 	if len(below) == 0 {
 		return strongRow, nil
+	}
+	if f.landlock != nil {
+		below = append(below, f.landlock.Error())
+	}
+	if f.landlock == nil && f.seccompKill == nil {
+		return osRow, below
 	}
 	return minimalRow, below
 }
@@ -166,7 +194,7 @@ var namespaceRefusals = []syscall.Errno{syscall.EPERM, syscall.ENOSPC, syscall.E
 // row's namespaces, the network namespace included; where that is
 // refused, the same clone without the network namespace, since a
 // kernel built without network namespaces refuses that flag alone;
-// and the seccomp kill-process action.
+// the seccomp kill-process action; and the Landlock ABI.
 func probeHost(ctx context.Context) (hostFacts, error) {
 	var f hostFacts
 	refused, err := probeReexec(ctx, sysProcAttr(strongRow, false), namespaceRefusals...)
@@ -184,6 +212,7 @@ func probeHost(ctx context.Context) (hostFacts, error) {
 		}
 	}
 	f.seccompKill = nslinux.KillProcessAvailable()
+	f.landlockABI, f.landlock = nslinux.LandlockABI()
 	return f, nil
 }
 
