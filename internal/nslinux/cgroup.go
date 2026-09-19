@@ -25,6 +25,7 @@ type Hierarchy struct {
 	Root           string // cgroup2 mount point
 	ProcMounts     string // mount table, normally /proc/mounts
 	ProcSelfCgroup string // own membership, normally /proc/self/cgroup
+	ProcSwaps      string // the swap table, normally /proc/swaps; empty means that
 }
 
 // DefaultHierarchy returns the live kernel interface paths.
@@ -33,7 +34,23 @@ func DefaultHierarchy() *Hierarchy {
 		Root:           "/sys/fs/cgroup",
 		ProcMounts:     "/proc/mounts",
 		ProcSelfCgroup: "/proc/self/cgroup",
+		ProcSwaps:      "/proc/swaps",
 	}
+}
+
+// SwapPossible reports whether this kernel can hold swap at all: the
+// swap table (/proc/swaps) exists exactly on kernels built with swap
+// support, whether or not any swap is active now — a fact that does
+// not change under a running caller, unlike the swap in use. A table
+// that cannot be examined for any reason but absence is read as
+// possible.
+func (h *Hierarchy) SwapPossible() bool {
+	p := h.ProcSwaps
+	if p == "" {
+		p = "/proc/swaps"
+	}
+	_, err := os.Stat(p)
+	return !errors.Is(err, fs.ErrNotExist)
 }
 
 // root returns Root in canonical form, so path comparison and the
@@ -289,10 +306,33 @@ func (c *Cgroup) OpenFD() (*os.File, error) {
 	return f, nil
 }
 
-// SetMemoryMax writes the hard memory limit (memory.max, in bytes).
-// Fails when the memory controller is not enabled for this cgroup.
+// ErrSwapUnaccounted marks a memory limit the kernel cannot extend
+// over swap: the cgroup has no memory.swap.max, which a kernel keeps
+// only when it accounts swap (CONFIG_MEMCG_SWAP, swapaccount not
+// off). On a kernel that can hold swap at all, such a cgroup bounds
+// memory but not the swap the process may spill into, now or once
+// swap is turned on — no whole bound at all; on a kernel built
+// without swap there is nothing to close.
+var ErrSwapUnaccounted = errors.New("the kernel accounts no swap for this cgroup")
+
+// SetMemoryMax writes the hard memory limit (memory.max, in bytes)
+// and closes swap to the cgroup (memory.swap.max 0): a bound on
+// memory that left swap open would let a process past it onto the
+// disk, so the limit is the whole of what the cgroup may hold. Fails
+// when the memory controller is not enabled for this cgroup, and
+// with ErrSwapUnaccounted when the kernel keeps no swap knob for it —
+// the caller decides by whether the kernel can hold swap at all.
 func (c *Cgroup) SetMemoryMax(bytes uint64) error {
-	return c.setResource("memory.max", strconv.FormatUint(bytes, 10))
+	if err := c.setResource("memory.max", strconv.FormatUint(bytes, 10)); err != nil {
+		return err
+	}
+	if err := c.setResource("memory.swap.max", "0"); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %w", ErrSwapUnaccounted, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // SetPidsMax writes the process-count limit (pids.max). Fails when

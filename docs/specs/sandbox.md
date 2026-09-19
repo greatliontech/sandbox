@@ -97,9 +97,13 @@ independent by design.
   subtree accepts both placement and the controllers the limits
   need — a subtree can accept a child yet refuse controller
   delegation, and a cgroup that cannot enforce the stated limits is
-  no accounting at all; rlimits; Job Objects). Which accounting enforced
-  the bounds is a reported fact of the run, so a bound-exceeded death
-  is attributable.
+  no accounting at all; rlimits; Job Objects). A memory bound is the
+  whole of what the process may hold: under cgroups swap is closed to
+  the run, never a second allowance past the bound — and a kernel
+  that accounts no swap yet can hold it cannot close it, so such a
+  host accounts the memory bound by rlimits instead. Which accounting
+  enforced the bounds is a reported fact of the run, so a
+  bound-exceeded death is attributable.
 - **The wall clock belongs to the caller.** `Start`'s context governs
   the process lifetime; sandbox adds no timeout of its own.
 - **No orphans, to the strongest tie the host affords.** Two triggers,

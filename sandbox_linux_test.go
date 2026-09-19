@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -1826,5 +1827,144 @@ func TestHostEnvStripsMarkers(t *testing.T) {
 	}
 	if !slices.Contains(env, "SANDBOX_TEST_KEEP=1") {
 		t.Fatal("the host environment was not inherited")
+	}
+}
+
+// The memory bound closes swap to the run: the cgroup's
+// memory.swap.max reads 0 while it runs; where the kernel keeps no
+// such knob yet can hold swap, the run is accounted by rlimits
+// instead, never by a cgroup that bounds memory alone.
+func TestMemoryBoundClosesSwap(t *testing.T) {
+	requireTree(t)
+	if !requireCgroups(t) {
+		t.Skip("cgroup placement unavailable here")
+	}
+	sb, err := New(Spec{Exec: "/world", Args: []string{"sleep"}, Root: worldTree, Limits: Limits{MemoryBytes: 64 << 20}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startOrSkip(t, sb)
+	defer sb.Destroy()
+	st, err := sb.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Accounting == AccountingRlimits {
+		// Only a kernel accounting no swap while able to hold some
+		// turns a placeable run onto rlimits.
+		probe, err := nslinux.DefaultHierarchy().Create(cgroupName("swapprobe"), []string{"memory"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer probe.Delete()
+		if _, err := os.Stat(filepath.Join(probe.Dir, "memory.swap.max")); !errors.Is(err, os.ErrNotExist) || !nslinux.DefaultHierarchy().SwapPossible() {
+			t.Fatalf("accounted by rlimits with a swap knob (%v) or no swap support", err)
+		}
+		return
+	}
+	dir := sb.(*linuxSandbox).bounds.cgroup.Dir
+	swap, err := os.ReadFile(filepath.Join(dir, "memory.swap.max"))
+	if err != nil || strings.TrimSpace(string(swap)) != "0" {
+		t.Fatalf("memory.swap.max = %q, %v; want 0", swap, err)
+	}
+	max, _ := os.ReadFile(filepath.Join(dir, "memory.max"))
+	if strings.TrimSpace(string(max)) != "67108864" {
+		t.Fatalf("memory.max = %q", max)
+	}
+}
+
+// A memory limit the kernel cannot extend over swap keeps the cgroup
+// where the kernel can hold no swap and falls to rlimits where it
+// can; any other failure of the limit is a failure.
+func TestSwapUnbounded(t *testing.T) {
+	possible := func() bool { return true }
+	impossible := func() bool { return false }
+	unaccounted := fmt.Errorf("%w: enoent", nslinux.ErrSwapUnaccounted)
+	cases := []struct {
+		name string
+		err  error
+		swap func() bool
+		want bool
+		fail string
+	}{
+		{"bounded", nil, possible, false, ""},
+		{"no knob, swap possible", unaccounted, possible, true, ""},
+		{"no knob, no swap support", unaccounted, impossible, false, ""},
+		{"other failure", errors.New("EACCES"), impossible, false, "EACCES"},
+	}
+	for _, c := range cases {
+		got, err := swapUnbounded(c.err, c.swap)
+		if c.fail != "" {
+			if err == nil || !strings.Contains(err.Error(), c.fail) {
+				t.Errorf("%s: %v %v", c.name, got, err)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("%s: %v %v, want %v", c.name, got, err, c.want)
+		}
+	}
+}
+
+// Where the kernel accounts no swap, a placeable run keeps its cgroup
+// on a kernel without swap support and falls to rlimits — the cgroup
+// released — on one that can hold swap.
+func TestSelectBoundsWithoutSwapAccounting(t *testing.T) {
+	if !requireCgroups(t) {
+		t.Skip("cgroup placement unavailable here")
+	}
+	prev := setMemoryMax
+	setMemoryMax = func(c *nslinux.Cgroup, bytes uint64) error {
+		if err := prev(c, bytes); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: forced", nslinux.ErrSwapUnaccounted)
+	}
+	t.Cleanup(func() { setMemoryMax = prev })
+	swaps := func(present bool) *nslinux.Hierarchy {
+		p := filepath.Join(t.TempDir(), "swaps")
+		if present {
+			if err := os.WriteFile(p, []byte("Filename\tType\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		h := nslinux.DefaultHierarchy()
+		h.ProcSwaps = p
+		return h
+	}
+	b, err := selectBounds(context.Background(), Limits{MemoryBytes: 64 << 20}, swaps(true))
+	if err != nil || b.accounting != AccountingRlimits || b.cgroup != nil {
+		t.Fatalf("swap possible: %+v %v, want rlimits and no cgroup", b, err)
+	}
+	if leaked := runCgroups(t); len(leaked) > 0 {
+		t.Fatalf("the cgroup outlived the fallback: %v", leaked)
+	}
+	b, err = selectBounds(context.Background(), Limits{MemoryBytes: 64 << 20}, swaps(false))
+	if err != nil || b.accounting != AccountingCgroups || b.cgroup == nil {
+		t.Fatalf("no swap support: %+v %v, want cgroups", b, err)
+	}
+	b.cgroup.Delete()
+	// A cgroup the fallback cannot release — a member holds it — is
+	// reported, never left behind in silence.
+	var held *exec.Cmd
+	setMemoryMax = func(c *nslinux.Cgroup, bytes uint64) error {
+		held = exec.Command("/bin/sleep", "60")
+		held.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := held.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(c.Dir, "cgroup.procs"), []byte(strconv.Itoa(held.Process.Pid)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return fmt.Errorf("%w: forced", nslinux.ErrSwapUnaccounted)
+	}
+	_, err = selectBounds(context.Background(), Limits{MemoryBytes: 64 << 20}, swaps(true))
+	held.Process.Kill()
+	held.Wait()
+	for _, dir := range runCgroups(t) {
+		os.Remove(dir)
+	}
+	if err == nil || !strings.Contains(err.Error(), "releasing the cgroup left unused") {
+		t.Fatalf("a held cgroup on the fallback: %v", err)
 	}
 }

@@ -4,6 +4,7 @@ package nslinux
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -297,14 +298,63 @@ func cgroupFixture(t *testing.T, files map[string]string) *Cgroup {
 	return &Cgroup{Dir: dir}
 }
 
+// The memory limit lands in memory.max and swap is closed in
+// memory.swap.max; a kernel without a swap knob is left as it is.
 func TestSetMemoryMaxWritesLimit(t *testing.T) {
-	cg := cgroupFixture(t, map[string]string{"memory.max": "max\n"})
+	cg := cgroupFixture(t, map[string]string{"memory.max": "max\n", "memory.swap.max": "max\n"})
 	if err := cg.SetMemoryMax(1 << 20); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(filepath.Join(cg.Dir, "memory.max"))
 	if got := string(data); got != "1048576" {
 		t.Errorf("memory.max = %q, want 1048576", got)
+	}
+	data, _ = os.ReadFile(filepath.Join(cg.Dir, "memory.swap.max"))
+	if got := string(data); got != "0" {
+		t.Errorf("memory.swap.max = %q, want 0", got)
+	}
+	// No swap knob is a named refusal the caller judges; any other
+	// failure of the swap write is a failure.
+	noKnob := cgroupFixture(t, map[string]string{"memory.max": "max\n"})
+	if err := noKnob.SetMemoryMax(1 << 20); !errors.Is(err, ErrSwapUnaccounted) {
+		t.Fatalf("without a swap knob: %v, want ErrSwapUnaccounted", err)
+	}
+	if _, err := os.Stat(filepath.Join(noKnob.Dir, "memory.swap.max")); !errors.Is(err, fs.ErrNotExist) {
+		t.Error("write must not create memory.swap.max")
+	}
+	broken := cgroupFixture(t, map[string]string{"memory.max": "max\n"})
+	if err := os.Mkdir(filepath.Join(broken.Dir, "memory.swap.max"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := broken.SetMemoryMax(1 << 20); err == nil || errors.Is(err, ErrSwapUnaccounted) {
+		t.Fatalf("an unwritable swap knob: %v, want a failure that is not ErrSwapUnaccounted", err)
+	}
+}
+
+// SwapPossible is the swap table's presence: present, or unreadable
+// for any reason but absence, means the kernel can hold swap; an
+// empty path means the live table.
+func TestSwapPossible(t *testing.T) {
+	dir := t.TempDir()
+	present := filepath.Join(dir, "swaps")
+	if err := os.WriteFile(present, []byte("Filename\tType\tSize\tUsed\tPriority\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !(&Hierarchy{ProcSwaps: present}).SwapPossible() {
+		t.Fatal("a present swap table read as impossible")
+	}
+	if (&Hierarchy{ProcSwaps: filepath.Join(dir, "absent")}).SwapPossible() {
+		t.Fatal("an absent swap table read as possible")
+	}
+	if err := os.Mkdir(filepath.Join(dir, "noperm"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getuid() != 0 && !(&Hierarchy{ProcSwaps: filepath.Join(dir, "noperm", "swaps")}).SwapPossible() {
+		t.Fatal("an unexaminable swap table read as impossible")
+	}
+	_, err := os.Stat("/proc/swaps")
+	if (&Hierarchy{}).SwapPossible() != !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal("an empty path is not the live table")
 	}
 }
 

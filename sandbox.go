@@ -101,7 +101,11 @@ type PathGrant struct {
 // cannot enforce refuses Start.
 type Limits struct {
 	// MemoryBytes caps memory: memory.max of the sandbox's own cgroup
-	// under cgroups — the payload is killed at the bound; RLIMIT_AS
+	// under cgroups, with swap closed to it (memory.swap.max 0) so the
+	// cap is the whole of what the process holds — the payload is
+	// killed at the bound; a kernel accounting no swap yet able to
+	// hold it cannot close it and the run is accounted by rlimits
+	// instead; RLIMIT_AS
 	// under rlimits, which caps address space rather than use — a
 	// runtime that reserves more address space than the cap (a Go
 	// binary reserves well over 64 MiB) is refused at its very start,

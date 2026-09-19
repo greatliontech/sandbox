@@ -93,9 +93,23 @@ func selectBounds(ctx context.Context, l Limits, hierarchy *nslinux.Hierarchy) (
 		return bounds{}, fmt.Errorf("sandbox: cgroup accounting: %w", err)
 	}
 	if l.MemoryBytes > 0 {
-		if err := cg.SetMemoryMax(l.MemoryBytes); err != nil {
+		err := setMemoryMax(cg, l.MemoryBytes)
+		unbounded, err := swapUnbounded(err, hierarchy.SwapPossible)
+		if err != nil {
 			_ = cg.Delete()
 			return bounds{}, fmt.Errorf("sandbox: cgroup accounting: %w", err)
+		}
+		if unbounded {
+			// The cgroup bounds memory but not the swap the process
+			// could spill into: no whole bound, so no cgroup accounting
+			// for this run — RLIMIT_AS caps the address space, swap
+			// included. The cgroup this run will not use is released
+			// here, and its release is the one on this path that a
+			// run would otherwise never report.
+			if derr := cg.Delete(); derr != nil {
+				return bounds{}, fmt.Errorf("sandbox: cgroup accounting: releasing the cgroup left unused: %w", derr)
+			}
+			return fallback()
 		}
 	}
 	b.pidsMax = l.MaxProcs
@@ -116,6 +130,28 @@ func cgroupName(prefix string) string {
 	var b [6]byte
 	rand.Read(b[:])
 	return fmt.Sprintf("%s-%d-%x", prefix, os.Getpid(), b)
+}
+
+// setMemoryMax is the memory limit's verb; the one test that needs a
+// kernel accounting no swap points it at one, since no host here can
+// be made into one.
+var setMemoryMax = (*nslinux.Cgroup).SetMemoryMax
+
+// swapUnbounded reads a memory limit's outcome: a kernel that
+// accounts no swap for the cgroup leaves the memory bound whole only
+// where it can hold no swap at all (swapPossible false) — a fact
+// that does not change under the run — and leaves it open otherwise,
+// the process free to spill past the bound into whatever swap is or
+// becomes live, in which case the cgroup is no accounting for the
+// memory limit. Any other failure is a failure.
+func swapUnbounded(err error, swapPossible func() bool) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	if !errors.Is(err, nslinux.ErrSwapUnaccounted) {
+		return false, err
+	}
+	return swapPossible(), nil
 }
 
 // placements holds, per hierarchy, whether this host places a child
