@@ -1,6 +1,6 @@
 # The Linux OS row has no implementation home
 
-Lands: user decision
+Lands: rows plan chunk 1
 
 docs/specs/sandbox.md's ladder names a Linux `OS` row — Landlock
 filesystem allowlist, seccomp network denial (Landlock ABI 4's TCP
