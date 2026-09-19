@@ -34,20 +34,23 @@ import (
 // the outcome of composition back and is close-on-exec: the init
 // writes one sentinel byte immediately before exec, then either the
 // exec closes the pipe or its failure is written after the sentinel;
-// a composition failure is written before any sentinel; and an init
-// that dies earlier — a consumer package init exiting under the
-// marker, a kill — leaves the pipe empty. Start reads the three
-// shapes apart, so a world that cannot be delivered refuses Start
-// with the reason and a payload that never ran is never reported as
-// one that did.
+// a failure before exec is written before any sentinel, marked as an
+// intent the host would not deliver or as the row's own mechanism
+// failing to apply; and an init that dies earlier — a consumer
+// package init exiting under the marker, a kill — leaves the pipe
+// empty. Start reads the shapes apart, so a world that cannot be
+// delivered refuses Start with the reason, a row that failed to
+// apply is reported as that and never re-selected, and a payload
+// that never ran is never reported as one that did.
 const (
 	envInit     = "_SANDBOX_INIT"
 	envInitFD   = "_SANDBOX_INITFD"
 	envStatusFD = "_SANDBOX_STATUSFD"
 	envProbe    = "_SANDBOX_PROBE" // the re-exec is a host probe: exit at once
 
-	statusExecing = "\x00" // the init is about to exec the target
-	statusFailed  = "E"    // followed by the reason
+	statusExecing     = "\x00" // the init is about to exec the target
+	statusFailed      = "E"    // an intent the host would not deliver; the reason follows
+	statusApplyFailed = "A"    // the row's mechanism failed to apply; the reason follows
 )
 
 func init() {
@@ -62,6 +65,7 @@ func init() {
 // validation, the bind, and the mountinfo listing (which records
 // canonical mount points) agree on one string.
 type initConfig struct {
+	Row      string           `json:"row"`
 	Hostname string           `json:"hostname,omitempty"`
 	Root     string           `json:"root,omitempty"`
 	WorkDir  string           `json:"workdir,omitempty"`
@@ -88,6 +92,7 @@ type bind struct {
 
 type linuxSandbox struct {
 	spec   Spec
+	row    row // the row that ran; meaningful once cmd is set
 	cmd    *exec.Cmd
 	bounds bounds
 	final  *Stats // the accounting read at Wait, before the cgroup went
@@ -101,21 +106,33 @@ func newSandbox(spec Spec) (Sandbox, error) {
 	if spec.Exec == "" {
 		return nil, errors.New("sandbox: Spec.Exec is required")
 	}
-	// The create-only Linux backend is always kernel-enforced (Strong); refuse
-	// up front if the caller demanded something we structurally cannot exceed.
-	if spec.MinTier > Strong {
-		return nil, ErrWeakerThanRequired
-	}
 	return &linuxSandbox{spec: spec}, nil
 }
 
-func (s *linuxSandbox) Tier() Isolation { return Strong }
+// Tier is the tier of the row that ran: the row is set only when
+// Start has succeeded, so until then the zero row's tier, None, says
+// nothing has applied, and from then on all-or-nothing application
+// makes the selected row's tier the tier of what fully applied
+// (docs/specs/sandbox.md, "Tier is derived").
+func (s *linuxSandbox) Tier() Isolation { return s.row.tier }
 
+// Start selects the row this host's facts satisfy, refuses below
+// MinTier before anything is cloned, resolves the world and the
+// bounds, and runs the init; it returns once the init has execed the
+// target, or with why it did not.
 func (s *linuxSandbox) Start(ctx context.Context) error {
 	if s.cmd != nil {
 		return errors.New("sandbox: already started")
 	}
-	root, binds, err := resolveWorld(s.spec)
+	facts, err := hostFactsFor(ctx)
+	if err != nil {
+		return err
+	}
+	r, below := selectRow(facts, s.spec.Network)
+	if r.tier < s.spec.MinTier {
+		return fmt.Errorf("%w: this host reaches the %s row (%s); %s required", ErrWeakerThanRequired, r.name, strings.Join(below, "; "), s.spec.MinTier)
+	}
+	w, err := resolveWorld(s.spec, r)
 	if err != nil {
 		return err
 	}
@@ -140,18 +157,19 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 			// A restricted world carries nothing of the host unstated.
 			env = []string{}
 		} else {
-			env = os.Environ()
+			env = hostEnv()
 		}
 	}
 	cfg := initConfig{
+		Row:         r.name,
 		Hostname:    s.spec.Hostname,
-		Root:        root,
-		WorkDir:     s.spec.WorkDir,
-		Binds:       binds,
+		Root:        w.root,
+		WorkDir:     w.workDir,
+		Binds:       w.binds,
 		Rlimits:     b.rlimits,
 		LateRlimits: b.late,
 		PidsMax:     b.pidsMax,
-		Cmd:         s.spec.Exec,
+		Cmd:         w.cmd,
 		Args:        s.spec.Args,
 		Env:         env,
 	}
@@ -171,19 +189,8 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	}
 
 	cmd := exec.CommandContext(ctx, "/proc/self/exe")
-	// Cancellation kills by the strongest tie the row holds
-	// (docs/specs/sandbox.md, "No orphans"): the cgroup's kill where
-	// the run was placed in one — atomic over the subtree, unescapable
-	// — and the pid namespace's init otherwise, whose death takes the
-	// namespace with it.
-	cmd.Cancel = func() error {
-		if b.cgroup != nil {
-			if err := b.cgroup.Kill(); err != nil {
-				return errors.Join(err, cmd.Process.Kill())
-			}
-		}
-		return cmd.Process.Kill()
-	}
+	// Cancellation kills by the strongest tie the run holds (killRun).
+	cmd.Cancel = func() error { return killRun(r, b, cmd.Process) }
 	cmd.Stdin = s.spec.Stdin
 	cmd.Stdout = s.spec.Stdout
 	cmd.Stderr = s.spec.Stderr
@@ -193,14 +200,7 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 		envInitFD+"=3",
 		envStatusFD+"=4",
 	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags:  cloneFlags(s.spec.Network),
-		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
-		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
-		// GidMappingsEnableSetgroups defaults false → Go writes "deny" to
-		// /proc/<pid>/setgroups, required for an unprivileged gid_map.
-		Pdeathsig: syscall.SIGKILL, // child dies if the host process dies
-	}
+	cmd.SysProcAttr = sysProcAttr(r, s.spec.Network)
 	// Born bounded: the child is cloned straight into its cgroup, so
 	// no instruction of it runs unaccounted and nothing migrates
 	// later (rootless placement could not migrate across the
@@ -259,25 +259,35 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	outcome, reason := classifyStatus(status)
 	if outcome == initExeced {
 		s.cmd = cmd
+		s.row = r
 		return nil
 	}
 	// Every other shape means the init has exited: reap it so Start's
 	// failure is the whole story.
 	waitErr := cmd.Wait()
+	return fail(startFailure(r, outcome, reason, status, ctx.Err(), waitErr))
+}
+
+// startFailure is Start's report of an init that did not reach exec,
+// by the status pipe's shape: an intent the host would not deliver
+// is ErrUndeliverable; a row whose mechanism failed to apply is
+// reported as that, under neither refusal sentinel — the row is
+// never re-selected; nothing written is a death before composing —
+// a consumer package init exiting under the re-exec marker, a kill,
+// or the caller's context ending — and the payload never ran.
+func startFailure(r row, outcome initOutcome, reason string, status []byte, ctxErr, waitErr error) error {
 	switch outcome {
 	case initRefused:
-		return fail(fmt.Errorf("%w: %s", ErrUndeliverable, reason))
+		return fmt.Errorf("%w: %s", ErrUndeliverable, reason)
+	case initApplyFailed:
+		return fmt.Errorf("sandbox: the %s row failed to apply on this host: %s", r.name, reason)
 	case initDied:
-		// Nothing was written: the init died before composing — a
-		// consumer package init exiting under the re-exec marker, a
-		// kill, or the caller's context ending — and the payload
-		// never ran.
-		if ctx.Err() != nil {
-			return fail(fmt.Errorf("sandbox: the init was ended before exec: %w", ctx.Err()))
+		if ctxErr != nil {
+			return fmt.Errorf("sandbox: the init was ended before exec: %w", ctxErr)
 		}
-		return fail(fmt.Errorf("sandbox: the init died before exec (%v): a package init of this binary must not act under %s", waitErr, envInit))
+		return fmt.Errorf("sandbox: the init died before exec (%v): a package init of this binary must not act under %s", waitErr, envInit)
 	}
-	return fail(fmt.Errorf("sandbox: unreadable init status %q", status))
+	return fmt.Errorf("sandbox: unreadable init status %q", status)
 }
 
 // initOutcome is what the status pipe's content says happened in the
@@ -285,14 +295,15 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 type initOutcome int
 
 const (
-	initDied    initOutcome = iota // nothing written: died before composing
-	initRefused                    // composition or exec refused, with a reason
-	initExeced                     // the sentinel alone: the target is running
-	initGarbled                    // a shape the protocol never writes
+	initDied        initOutcome = iota // nothing written: died before composing
+	initRefused                        // an intent refused before or at exec, with a reason
+	initApplyFailed                    // the row's mechanism failed to apply, with a reason
+	initExeced                         // the sentinel alone: the target is running
+	initGarbled                        // a shape the protocol never writes
 )
 
 // classifyStatus reads the status pipe's content into an outcome and,
-// for a refusal, its reason.
+// for a failure, its reason.
 func classifyStatus(status []byte) (initOutcome, string) {
 	st := string(status)
 	switch {
@@ -302,16 +313,43 @@ func classifyStatus(status []byte) (initOutcome, string) {
 		return initExeced, ""
 	case strings.HasPrefix(st, statusFailed):
 		return initRefused, strings.TrimSpace(strings.TrimPrefix(st, statusFailed))
+	case strings.HasPrefix(st, statusApplyFailed):
+		return initApplyFailed, strings.TrimSpace(strings.TrimPrefix(st, statusApplyFailed))
 	case strings.HasPrefix(st, statusExecing+statusFailed):
 		return initRefused, strings.TrimSpace(strings.TrimPrefix(st, statusExecing+statusFailed))
 	}
 	return initGarbled, ""
 }
 
+// hostEnv is the caller's environment without this package's re-exec
+// markers, which name descriptors only the init child holds.
+func hostEnv() []string {
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "_SANDBOX_") {
+			env = append(env, kv)
+		}
+	}
+	return env
+}
+
+// hostNameMax is the kernel's hostname length (__NEW_UTS_LEN).
+const hostNameMax = 64
+
+// world is the resolved shape of a run: the tree to pivot to (the
+// Strong row only), the binds to place there, and the entrypoint and
+// working directory as the init sees them.
+type world struct {
+	root    string
+	binds   []bind
+	cmd     string
+	workDir string
+}
+
 // resolveWorld checks, before anything is cloned, that every stated
-// intent has somewhere to land, and resolves the world to canonical
-// paths — the one place the grant-to-target mapping is computed.
-// Under a Root: the Root is a directory, canonicalized; the
+// intent has somewhere to land on row r, and resolves the world to
+// canonical paths — the one place the grant-to-target mapping is
+// computed. Under a Root: the Root is a directory, canonicalized; the
 // entrypoint and the working directory resolve inside the tree as a
 // file and a directory, symlinks chased exactly as the pivoted
 // process will chase them (absolute targets re-rooted at the tree,
@@ -324,56 +362,77 @@ func classifyStatus(status []byte) (initOutcome, string) {
 // the host, and their targets are the canonical host paths — the
 // mount table records canonical mount points, and a read-only
 // remount must find its own bind there. Grants may not overlap one
-// another or the rendezvous directory. A failure is ErrUndeliverable:
-// the host cannot do what was asked.
-func resolveWorld(spec Spec) (root string, binds []bind, err error) {
+// another or the rendezvous directory.
+//
+// The row's own refusals come first (row.refuses). A failure is
+// ErrUndeliverable: the host cannot do what was asked.
+func resolveWorld(spec Spec, r row) (world, error) {
+	undeliverable := func(format string, a ...any) (world, error) {
+		return world{}, fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
+	}
 	if !filepath.IsAbs(spec.Exec) {
-		return "", nil, fmt.Errorf("%w: exec %q is not an absolute path", ErrUndeliverable, spec.Exec)
+		return undeliverable("exec %q is not an absolute path", spec.Exec)
 	}
 	if spec.WorkDir != "" && !filepath.IsAbs(spec.WorkDir) {
-		return "", nil, fmt.Errorf("%w: workdir %q is not an absolute path", ErrUndeliverable, spec.WorkDir)
+		return undeliverable("workdir %q is not an absolute path", spec.WorkDir)
 	}
+	if len(spec.Hostname) > hostNameMax {
+		return undeliverable("hostname %q is longer than %d bytes", spec.Hostname, hostNameMax)
+	}
+	if err := r.refuses(spec); err != nil {
+		return world{}, err
+	}
+	// The native-ABI rule is the Strong row's: its guard kills a
+	// foreign-ABI call, so a foreign entrypoint could not run there.
+	checkEntry := func(string) error { return nil }
+	if r.tier == Strong {
+		checkEntry = checkNativeELF
+	}
+	w := world{cmd: spec.Exec, workDir: spec.WorkDir}
+	var root string
 	if spec.Root == "" {
-		// The host's own entrypoint: the same machine rule applies to
-		// it as to one in a tree.
-		if err := checkNativeELF(spec.Exec); err != nil {
-			return "", nil, fmt.Errorf("%w: exec %s: %v", ErrUndeliverable, spec.Exec, err)
+		if err := checkEntry(spec.Exec); err != nil {
+			return undeliverable("exec %s: %v", spec.Exec, err)
 		}
-	}
-	if spec.Root != "" {
+	} else {
+		var err error
 		root, err = filepath.EvalSymlinks(spec.Root)
 		if err != nil {
-			return "", nil, fmt.Errorf("%w: root %s: %v", ErrUndeliverable, spec.Root, err)
+			return undeliverable("root %s: %v", spec.Root, err)
 		}
 		fi, err := os.Stat(root)
 		if err != nil {
-			return "", nil, fmt.Errorf("%w: root %s: %v", ErrUndeliverable, spec.Root, err)
+			return undeliverable("root %s: %v", spec.Root, err)
 		}
 		if !fi.IsDir() {
-			return "", nil, fmt.Errorf("%w: root %s is not a directory", ErrUndeliverable, spec.Root)
+			return undeliverable("root %s is not a directory", spec.Root)
 		}
 		fi, resolved, err := statInTree(root, spec.Exec)
 		if err != nil {
-			return "", nil, fmt.Errorf("%w: exec %s is not in the tree: %v", ErrUndeliverable, spec.Exec, err)
+			return undeliverable("exec %s is not in the tree: %v", spec.Exec, err)
 		}
 		if fi.IsDir() {
-			return "", nil, fmt.Errorf("%w: exec %s is a directory in the tree", ErrUndeliverable, spec.Exec)
+			return undeliverable("exec %s is a directory in the tree", spec.Exec)
 		}
-		if err := checkNativeELF(filepath.Join(root, resolved)); err != nil {
-			return "", nil, fmt.Errorf("%w: exec %s: %v", ErrUndeliverable, spec.Exec, err)
+		if err := checkEntry(filepath.Join(root, resolved)); err != nil {
+			return undeliverable("exec %s: %v", spec.Exec, err)
 		}
+		w.root = root
 		if spec.WorkDir != "" {
-			if fi, _, err := statInTree(root, spec.WorkDir); err != nil {
-				return "", nil, fmt.Errorf("%w: workdir %s is not in the tree: %v", ErrUndeliverable, spec.WorkDir, err)
-			} else if !fi.IsDir() {
-				return "", nil, fmt.Errorf("%w: workdir %s is not a directory in the tree", ErrUndeliverable, spec.WorkDir)
+			fi, _, err := statInTree(root, spec.WorkDir)
+			if err != nil {
+				return undeliverable("workdir %s is not in the tree: %v", spec.WorkDir, err)
+			}
+			if !fi.IsDir() {
+				return undeliverable("workdir %s is not a directory in the tree", spec.WorkDir)
 			}
 		}
 	}
+	var binds []bind
 	for _, g := range spec.PathGrants {
 		b, err := resolveGrant(root, g.Path, "grant")
 		if err != nil {
-			return "", nil, err
+			return world{}, err
 		}
 		b.ReadOnly = g.Access == ReadOnly
 		binds = append(binds, b)
@@ -381,7 +440,7 @@ func resolveWorld(spec Spec) (root string, binds []bind, err error) {
 	if spec.RuntimeDir != "" {
 		b, err := resolveGrant(root, spec.RuntimeDir, "runtime dir")
 		if err != nil {
-			return "", nil, err
+			return world{}, err
 		}
 		binds = append(binds, b)
 	}
@@ -391,15 +450,21 @@ func resolveWorld(spec Spec) (root string, binds []bind, err error) {
 	// over the tree, which no Root world can mean.
 	for i, a := range binds {
 		if root != "" && a.Target == root {
-			return "", nil, fmt.Errorf("%w: grant %s is the root of the world", ErrUndeliverable, a.Source)
+			return undeliverable("grant %s is the root of the world", a.Source)
 		}
 		for _, b := range binds[i+1:] {
 			if a.Target == b.Target || strings.HasPrefix(a.Target, b.Target+"/") || strings.HasPrefix(b.Target, a.Target+"/") {
-				return "", nil, fmt.Errorf("%w: grants %s and %s overlap", ErrUndeliverable, a.Source, b.Source)
+				return undeliverable("grants %s and %s overlap", a.Source, b.Source)
 			}
 		}
 	}
-	return root, binds, nil
+	// A row without a mount namespace binds nothing: its read-write
+	// grants and rendezvous directory are the host paths they already
+	// are, and it has already refused every read-only grant.
+	if r.tier == Strong {
+		w.binds = binds
+	}
+	return w, nil
 }
 
 // resolveGrant validates one stated path and computes its bind.
@@ -608,10 +673,7 @@ func (s *linuxSandbox) Destroy() error {
 		return nil
 	}
 	if !s.waited {
-		if s.bounds.cgroup != nil {
-			_ = s.bounds.cgroup.Kill()
-		}
-		_ = s.cmd.Process.Kill()
+		_ = killRun(s.row, s.bounds, s.cmd.Process)
 		if _, err := s.Wait(); err != nil {
 			return err
 		}
@@ -658,7 +720,12 @@ func runInit() {
 	}
 	cfg, err := composeInit()
 	if err != nil {
-		report(statusFailed + err.Error())
+		var intent intentError
+		if errors.As(err, &intent) {
+			report(statusFailed + err.Error())
+		} else {
+			report(statusApplyFailed + err.Error())
+		}
 		os.Exit(127)
 	}
 	if status != nil {
@@ -690,8 +757,20 @@ func statusPipe() *os.File {
 	return os.NewFile(uintptr(fd), "sandbox-status")
 }
 
-// composeInit reads the config and composes the world, returning the
-// config the exec needs.
+// intentError marks an init failure that is the caller's intent
+// failing on this host — a stated working directory the process
+// cannot enter, a bound the host will not set — rather than the
+// row's mechanism failing to apply; the parent reports the two apart
+// (startFailure).
+type intentError struct{ err error }
+
+func (e intentError) Error() string { return e.err.Error() }
+func (e intentError) Unwrap() error { return e.err }
+
+// composeInit reads the config and composes the row's world,
+// returning the config the exec needs. The Strong row sets the
+// hostname, composes the world, and hardens; the Minimal row enters
+// the working directory and applies the bounds, nothing else.
 func composeInit() (*initConfig, error) {
 	fdStr := os.Getenv(envInitFD)
 	fd, err := strconv.Atoi(fdStr)
@@ -718,41 +797,55 @@ func composeInit() (*initConfig, error) {
 			return nil, fmt.Errorf("process bound: %w", err)
 		}
 	}
-	if cfg.Hostname != "" {
-		if err := syscall.Sethostname([]byte(cfg.Hostname)); err != nil {
-			return nil, fmt.Errorf("sethostname: %w", err)
-		}
+	var strong bool
+	switch cfg.Row {
+	case strongRow.name:
+		strong = true
+	case minimalRow.name:
+	default:
+		// The parent names the row it selected; a name this init
+		// does not know is a protocol fault, never a row to run.
+		return nil, fmt.Errorf("unknown row %q", cfg.Row)
 	}
-	if err := composeWorld(cfg); err != nil {
-		return nil, err
+	if strong {
+		if cfg.Hostname != "" {
+			if err := syscall.Sethostname([]byte(cfg.Hostname)); err != nil {
+				return nil, fmt.Errorf("sethostname: %w", err)
+			}
+		}
+		if err := composeWorld(cfg); err != nil {
+			return nil, err
+		}
 	}
 	if cfg.WorkDir != "" {
 		if err := syscall.Chdir(cfg.WorkDir); err != nil {
-			return nil, fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)
+			return nil, intentError{fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)}
 		}
 	}
 	if err := nslinux.SetRlimits(cfg.Rlimits); err != nil {
-		return nil, err
+		return nil, intentError{err}
 	}
-	// Hardening, last and in this order (docs/specs/sandbox.md, Strong
-	// row): every capability set emptied so the payload holds none
-	// even as the namespace's mapped root — after the mounts, which
-	// needed CAP_SYS_ADMIN — then the arch guard and the native-ABI
-	// filter, which deny from the moment they load and set
-	// no_new_privs. Each verb pins the goroutine to its thread, and
-	// exec follows on it.
-	if err := nslinux.DropAllCapabilities(); err != nil {
-		return nil, err
-	}
-	native, err := arch.GetInfo("")
-	if err != nil {
-		return nil, fmt.Errorf("seccomp: %w", err)
-	}
-	if err := nslinux.LoadArchGuard(native); err != nil {
-		return nil, err
-	}
-	if err := nslinux.LoadSeccomp(strongSeccompPolicy(native)); err != nil {
-		return nil, err
+	if strong {
+		// Hardening, last and in this order (docs/specs/sandbox.md,
+		// Strong row): every capability set emptied so the payload
+		// holds none even as the namespace's mapped root — after the
+		// mounts, which needed CAP_SYS_ADMIN — then the arch guard and
+		// the native-ABI filter, which deny from the moment they load
+		// and set no_new_privs. Each verb pins the goroutine to its
+		// thread, and exec follows on it.
+		if err := nslinux.DropAllCapabilities(); err != nil {
+			return nil, err
+		}
+		native, err := arch.GetInfo("")
+		if err != nil {
+			return nil, fmt.Errorf("seccomp: %w", err)
+		}
+		if err := nslinux.LoadArchGuard(native); err != nil {
+			return nil, err
+		}
+		if err := nslinux.LoadSeccomp(strongSeccompPolicy(native)); err != nil {
+			return nil, err
+		}
 	}
 	// The process-count bound, last: from here to exec nothing forks
 	// or spawns a thread.
@@ -763,7 +856,7 @@ func composeInit() (*initConfig, error) {
 		pidsMax.Close()
 	}
 	if err := nslinux.SetRlimits(cfg.LateRlimits); err != nil {
-		return nil, err
+		return nil, intentError{err}
 	}
 	if cfg.Env == nil {
 		cfg.Env = []string{}
@@ -791,6 +884,12 @@ func composeWorld(cfg initConfig) error {
 	if cfg.Root != "" {
 		for _, b := range cfg.Binds {
 			if err := nslinux.BindMount(b.Source, b.Target); err != nil {
+				// A source or target gone since the parent resolved
+				// it is the intent with nowhere to land, not the
+				// mechanism failing.
+				if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) {
+					return intentError{err}
+				}
 				return err
 			}
 		}

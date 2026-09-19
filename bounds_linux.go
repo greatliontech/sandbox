@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -106,24 +104,6 @@ func selectBounds(ctx context.Context, l Limits, hierarchy *nslinux.Hierarchy) (
 	return b, nil
 }
 
-// placements holds, per hierarchy, the once-per-process answer to
-// whether this host places a child into a cgroup at clone: a
-// directory on the caller's ancestry accepts a cgroup with the
-// controllers the bounds need, and the kernel clones into it
-// (CLONE_INTO_CGROUP, kernel 5.7). Host facts for a process's
-// lifetime; a host that changes underneath a running caller is not
-// modelled. A probe the caller's context ended is not an answer and
-// is not remembered.
-var placements struct {
-	mu   sync.Mutex
-	byRt map[string]placementResult
-}
-
-type placementResult struct {
-	ok  bool
-	err error
-}
-
 // cgroupName names one cgroup this package creates — a run's, or a
 // placement probe's — uniquely across processes: a random suffix
 // beside the pid, so a predecessor killed at this pid with a cgroup
@@ -138,31 +118,23 @@ func cgroupName(prefix string) string {
 	return fmt.Sprintf("%s-%d-%x", prefix, os.Getpid(), b)
 }
 
+// placements holds, per hierarchy, whether this host places a child
+// into a cgroup at clone: a directory on the caller's ancestry
+// accepts a cgroup with the controllers the bounds need, and the
+// kernel clones into it (CLONE_INTO_CGROUP, kernel 5.7).
+var placements probeCache[bool]
+
 // placementSupported probes placement once per hierarchy: a probe
 // cgroup, and a clone of this binary into it that exits at once under
 // the probe marker (runInit). The probe runs under the caller's
 // context — the wall clock is the caller's on every leg of Start —
 // and the probe's controller enablement in an ancestor is permanent,
-// as any Create's is. Callers racing for the first probe wait on its
-// lock, bounded by the prober's own deadline; a probe that exits at
-// once makes that wait unobservable, and only a consumer init that
-// breaches the re-exec contract stretches it.
+// as any Create's is. A probe child that exits at once makes the
+// wait behind the cache's lock unobservable; only a consumer init
+// that breaches the re-exec contract stretches it.
 func placementSupported(ctx context.Context, hierarchy *nslinux.Hierarchy) (bool, error) {
-	placements.mu.Lock()
-	defer placements.mu.Unlock()
-	if placements.byRt == nil {
-		placements.byRt = map[string]placementResult{}
-	}
 	key := hierarchy.Root + "\x00" + hierarchy.ProcMounts + "\x00" + hierarchy.ProcSelfCgroup
-	if r, ok := placements.byRt[key]; ok {
-		return r.ok, r.err
-	}
-	ok, err := probePlacement(ctx, hierarchy)
-	if ctx.Err() != nil {
-		return false, ctx.Err()
-	}
-	placements.byRt[key] = placementResult{ok: ok, err: err}
-	return ok, err
+	return placements.get(ctx, key, func(ctx context.Context) (bool, error) { return probePlacement(ctx, hierarchy) })
 }
 
 func probePlacement(ctx context.Context, hierarchy *nslinux.Hierarchy) (bool, error) {
@@ -183,26 +155,13 @@ func probePlacement(ctx context.Context, hierarchy *nslinux.Hierarchy) (bool, er
 		return false, err
 	}
 	defer fd.Close()
-	cmd := exec.CommandContext(ctx, "/proc/self/exe")
-	cmd.Env = append(os.Environ(), envInit+"=1", envProbe+"=1")
-	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(fd.Fd())}
-	err = cmd.Run()
-	if err == nil {
-		return true, nil
+	refused, err := probeReexec(ctx, &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(fd.Fd())}, syscall.ENOSYS, syscall.EOPNOTSUPP, syscall.EINVAL)
+	if err != nil {
+		return false, fmt.Errorf("placement probe: %w", err)
 	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) && (errno == syscall.ENOSYS || errno == syscall.EOPNOTSUPP || errno == syscall.EINVAL) {
-		// The kernel cannot clone into a cgroup: no placement here.
-		return false, nil
-	}
-	var exit *exec.ExitError
-	if errors.As(err, &exit) {
-		// The probe child is this binary under the re-exec marker; a
-		// package init acting there is the same contract breach as in
-		// the init proper (docs/specs/sandbox.md, Re-exec).
-		return false, fmt.Errorf("placement probe: the re-exec'd init died (%v): a package init of this binary must not act under %s", err, envInit)
-	}
-	return false, fmt.Errorf("placement probe: %w", err)
+	// A refusal means the kernel cannot clone into a cgroup: no
+	// placement here.
+	return refused == nil, nil
 }
 
 // stats reads the run's accounting facts from the cgroup, or reports

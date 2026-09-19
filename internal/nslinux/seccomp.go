@@ -65,3 +65,20 @@ func installFilter(prog []unix.SockFilter) error {
 	}
 	return nil
 }
+
+// KillProcessAvailable reports whether seccomp filters with the
+// kill-process action are available here, or why not: seccomp(2)'s
+// SECCOMP_GET_ACTION_AVAIL (kernel 4.14, the release that added
+// SECCOMP_RET_KILL_PROCESS) answers 0 where the action exists; a
+// kernel without seccomp(2) or without filters refuses with ENOSYS
+// or EINVAL, and one that predates the action with EOPNOTSUPP —
+// there an unknown action is read as kill-thread, weaker than the
+// documented kill, so the arch guard could not hold as stated.
+func KillProcessAvailable() error {
+	action := uint32(unix.SECCOMP_RET_KILL_PROCESS)
+	_, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_GET_ACTION_AVAIL, 0, uintptr(unsafe.Pointer(&action)))
+	if errno != 0 {
+		return fmt.Errorf("seccomp kill-process action: %w", errno)
+	}
+	return nil
+}

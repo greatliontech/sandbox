@@ -3,15 +3,20 @@
 package sandbox
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -399,8 +404,11 @@ func TestStartReportsCompositionFailure(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	err = sb.Start(context.Background())
-	if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "sethostname") {
-		t.Fatalf("composition failure: %v", err)
+	if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "hostname") {
+		t.Fatalf("hostname refusal: %v", err)
+	}
+	if sb.(*linuxSandbox).cmd != nil {
+		t.Fatal("a hostname the kernel would refuse was cloned for")
 	}
 
 	tree := worldFixture(t)
@@ -418,9 +426,10 @@ func TestStartReportsCompositionFailure(t *testing.T) {
 }
 
 // The status pipe's shapes classify apart: nothing written is a death
-// before exec, a reason before the sentinel is a refused composition,
-// the sentinel alone is the target running, a reason after the
-// sentinel is a failed exec; anything else is garbled.
+// before exec, an intent reason before the sentinel is a refusal, an
+// application reason before it is the row failing to apply, the
+// sentinel alone is the target running, a reason after the sentinel
+// is a failed exec; anything else is garbled.
 func TestClassifyStatus(t *testing.T) {
 	cases := []struct {
 		in     string
@@ -429,7 +438,9 @@ func TestClassifyStatus(t *testing.T) {
 	}{
 		{"", initDied, ""},
 		{statusExecing, initExeced, ""},
-		{statusFailed + "pivot_root: EPERM\n", initRefused, "pivot_root: EPERM"},
+		{statusFailed + "chdir /x: no such file or directory\n", initRefused, "chdir /x: no such file or directory"},
+		{statusApplyFailed + "pivot_root: EPERM\n", initApplyFailed, "pivot_root: EPERM"},
+		{statusExecing + statusApplyFailed + "x", initGarbled, ""},
 		{statusExecing + statusFailed + "exec /x: permission denied", initRefused, "exec /x: permission denied"},
 		{"junk", initGarbled, ""},
 		{statusExecing + statusExecing, initGarbled, ""},
@@ -1150,22 +1161,29 @@ func TestDestroyReleasesCgroup(t *testing.T) {
 }
 
 // A Start refused after the cgroup was created and the child cloned
-// — here a composition failure the init reports — leaves no
-// accounting behind, and no cgroup.
+// — here an entrypoint the init cannot exec — leaves no accounting
+// behind, no cgroup, and no tier.
 func TestStatsAfterRefusedStart(t *testing.T) {
 	requireTree(t)
 	if !requireCgroups(t) {
 		t.Skip("cgroup placement unavailable here")
 	}
-	sb, err := New(Spec{Exec: "/world", Root: worldTree, Hostname: strings.Repeat("h", 300), Limits: Limits{MemoryBytes: 64 << 20}})
+	tree := worldFixture(t)
+	if err := os.Chmod(filepath.Join(tree, "world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := New(Spec{Exec: "/world", Root: tree, Limits: Limits{MemoryBytes: 64 << 20}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) {
+	if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "exec /world") {
 		t.Fatalf("Start: %v", err)
 	}
 	if st, err := sb.Stats(); err != nil || st.Accounting != AccountingNone {
 		t.Fatalf("Stats after a refused Start = %+v, %v", st, err)
+	}
+	if sb.Tier() != None {
+		t.Fatalf("Tier after a refused Start = %v", sb.Tier())
 	}
 	if leaked := runCgroups(t); len(leaked) > 0 {
 		t.Fatalf("a refused Start left its cgroup behind: %v", leaked)
@@ -1399,5 +1417,414 @@ func TestCgroupNamesSurviveResidue(t *testing.T) {
 	defer b.cgroup.Delete()
 	if b.accounting != AccountingCgroups {
 		t.Fatalf("accounting %v, want cgroups", b.accounting)
+	}
+}
+
+// withHost pins the probed facts for one test, so every row can be
+// exercised on one host.
+func withHost(t *testing.T, f hostFacts) {
+	t.Helper()
+	prev := hostOverride
+	hostOverride = &f
+	t.Cleanup(func() { hostOverride = prev })
+}
+
+// Row selection picks the highest row whose facts hold for the
+// spec's network intent and names what fails for the rows passed
+// over: the network namespace matters only to a spec denying the
+// network.
+func TestSelectRow(t *testing.T) {
+	ns, net, sk := errors.New("namespaces: EPERM"), errors.New("network namespace: EINVAL"), errors.New("seccomp kill-process action: ENOSYS")
+	cases := []struct {
+		facts   hostFacts
+		network bool
+		want    row
+		below   []string
+	}{
+		{hostFacts{}, false, strongRow, nil},
+		{hostFacts{netns: net}, false, minimalRow, []string{net.Error()}},
+		{hostFacts{netns: net}, true, strongRow, nil},
+		{hostFacts{namespaces: ns, netns: net}, true, minimalRow, []string{ns.Error()}},
+		{hostFacts{seccompKill: sk}, true, minimalRow, []string{sk.Error()}},
+		{hostFacts{namespaces: ns, netns: net, seccompKill: sk}, false, minimalRow, []string{ns.Error(), sk.Error()}},
+	}
+	for _, c := range cases {
+		got, below := selectRow(c.facts, c.network)
+		if got != c.want || strings.Join(below, "|") != strings.Join(c.below, "|") {
+			t.Errorf("selectRow(%+v, %v) = %v %q, want %v %q", c.facts, c.network, got, below, c.want, c.below)
+		}
+	}
+}
+
+// MinTier fails closed before exec: a host reaching only the Minimal
+// row refuses a stronger demand at Start, cloning nothing, naming
+// what the host lacks; Tier stays None. The same host admits the
+// demand it can meet.
+func TestMinTierRefusesBeforeExec(t *testing.T) {
+	withHost(t, hostFacts{namespaces: errors.New("clone: operation not permitted (forced)")})
+	for _, min := range []Isolation{Strong, OS} {
+		sb, err := New(Spec{Exec: "/bin/true", Network: true, Limits: Limits{CPUSeconds: 60}, MinTier: min})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		err = sb.Start(context.Background())
+		if !errors.Is(err, ErrWeakerThanRequired) {
+			t.Fatalf("MinTier %v on a minimal host: %v", min, err)
+		}
+		for _, want := range []string{"minimal", "(forced)", min.String() + " required"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal %q does not name %q", err, want)
+			}
+		}
+		if sb.(*linuxSandbox).cmd != nil || sb.Tier() != None {
+			t.Fatalf("a refused Start ran something: tier %v", sb.Tier())
+		}
+	}
+	sb, err := New(Spec{Exec: "/bin/true", Network: true, Limits: Limits{CPUSeconds: 60}, MinTier: Minimal})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start on the admitted row: %v", err)
+	}
+	if es, err := sb.Wait(); err != nil || es.Code != 0 {
+		t.Fatalf("Wait: %+v %v", es, err)
+	}
+	if sb.Tier() != Minimal {
+		t.Fatalf("Tier = %v, want minimal", sb.Tier())
+	}
+}
+
+// Tier is derived from the row that ran: None before Start, the
+// Strong row's tier once it applied.
+func TestTierDerived(t *testing.T) {
+	requireTree(t)
+	sb, err := New(Spec{Exec: "/world", Root: worldTree})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if sb.Tier() != None {
+		t.Fatalf("Tier before Start = %v", sb.Tier())
+	}
+	startOrSkip(t, sb)
+	if sb.Tier() != Strong {
+		t.Fatalf("Tier after Start = %v", sb.Tier())
+	}
+	if _, err := sb.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The Minimal row: the caller's own namespaces and world — no pid 1,
+// the host's hostname and root, the host's environment — no
+// hardening, and the bounds with their accounting reported.
+func TestMinimalRow(t *testing.T) {
+	requireTree(t)
+	withHost(t, hostFacts{namespaces: errors.New("forced")})
+	var out bytes.Buffer
+	sb, err := New(Spec{Exec: filepath.Join(worldTree, "world"), Network: true, Limits: Limits{CPUSeconds: 60}, Stdout: &out, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if sb.Tier() != Minimal {
+		t.Fatalf("Tier = %v, want minimal", sb.Tier())
+	}
+	es, err := sb.Wait()
+	if err != nil || es.Code != 0 {
+		t.Fatalf("Wait: %+v %v\n%s", es, err, out.String())
+	}
+	f := facts(out.String())
+	cwd, _ := os.Getwd()
+	cwd, _ = filepath.EvalSymlinks(cwd)
+	host, _ := os.ReadFile("/proc/sys/kernel/hostname")
+	entries, _ := os.ReadDir("/")
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	for k, want := range map[string]string{
+		"cwd":           cwd,
+		"root":          strings.Join(names, ","),
+		"nnp":           "0 err=false",
+		"proc-hostname": fmt.Sprintf("%q", strings.TrimSpace(string(host))),
+	} {
+		if f[k] != want {
+			t.Errorf("%s = %q, want %q", k, f[k], want)
+		}
+	}
+	if f["pid"] == "1" || f["pid"] == "" {
+		t.Errorf("pid = %q: the minimal row has no pid namespace", f["pid"])
+	}
+	if f["env"] == "0" || f["env"] == "" {
+		t.Errorf("env = %q: without a Root the host environment is inherited", f["env"])
+	}
+	if b, ok := f["bounding"]; !ok || b == "0" {
+		t.Errorf("bounding = %q: the minimal row hardens nothing", b)
+	}
+	st, err := sb.Stats()
+	if err != nil || st.Accounting != AccountingRlimits {
+		t.Fatalf("Stats = %+v, %v", st, err)
+	}
+}
+
+// The Minimal row refuses what only a security boundary delivers — a
+// Root, a hostname, a denied network, a read-only grant — and a spec
+// with no limits, which would leave it nothing to apply; each before
+// anything runs. The same intents run on the Strong row.
+func TestMinimalRefusesUndeliverable(t *testing.T) {
+	requireTree(t)
+	withHost(t, hostFacts{namespaces: errors.New("forced")})
+	tree := worldFixture(t, "grant-ro")
+	world := filepath.Join(tree, "world")
+	limits := Limits{CPUSeconds: 60}
+	cases := []struct {
+		name string
+		spec Spec
+		want string
+	}{
+		{"root", Spec{Exec: "/world", Root: tree, Network: true, Limits: limits}, "cannot restrict the world"},
+		{"hostname", Spec{Exec: world, Network: true, Hostname: "h", Limits: limits}, "no hostname"},
+		{"network denied", Spec{Exec: world, Limits: limits}, "cannot deny the network"},
+		{"read-only grant", Spec{Exec: world, Network: true, Limits: limits, PathGrants: []PathGrant{{Path: filepath.Join(tree, "grant-ro"), Access: ReadOnly}}}, "read-only"},
+		{"no limits", Spec{Exec: world, Network: true}, "none were stated"},
+	}
+	for _, c := range cases {
+		sb, err := New(c.spec)
+		if err != nil {
+			t.Fatalf("%s: New: %v", c.name, err)
+		}
+		err = sb.Start(context.Background())
+		if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want ErrUndeliverable naming %q", c.name, err, c.want)
+		}
+		if sb.(*linuxSandbox).cmd != nil {
+			t.Errorf("%s: something was cloned", c.name)
+		}
+	}
+	withHost(t, hostFacts{})
+	if usernsUnavailable != "" {
+		t.Skipf("user namespaces unavailable: %s", usernsUnavailable)
+	}
+	for _, c := range cases[:2] {
+		sb, err := New(c.spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); err != nil {
+			t.Fatalf("the strong row delivers %s: %v", c.name, err)
+		}
+		sb.Wait()
+	}
+}
+
+// Cancellation on the Minimal row kills the run's process group, so a
+// child the payload spawned dies with it.
+func TestMinimalCancelKillsGroup(t *testing.T) {
+	requireTree(t)
+	withHost(t, hostFacts{namespaces: errors.New("forced")})
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sb, err := New(Spec{Exec: filepath.Join(worldTree, "world"), Args: []string{"spawn"}, Network: true, Limits: Limits{CPUSeconds: 600}, Stdout: w, Stderr: os.Stderr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Start(ctx); err != nil {
+		w.Close()
+		t.Fatalf("Start: %v", err)
+	}
+	w.Close()
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "child=") {
+		t.Fatalf("payload announced %q, %v", line, err)
+	}
+	var child int
+	fmt.Sscanf(line, "child=%d", &child)
+	cancel()
+	es, err := sb.Wait()
+	if err != nil || !es.Signaled {
+		t.Fatalf("Wait after cancel: %+v %v", es, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", child))
+		if errors.Is(err, os.ErrNotExist) || (err == nil && strings.Contains(string(st), ") Z ")) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the spawned child %d outlived the cancelled run: %q", child, st)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The group kill never addresses a group by a reaped leader's pid: a
+// leader os.Process knows was waited for is reported gone, and a live
+// leader's group is killed whole.
+func TestKillRunGuardsReapedLeader(t *testing.T) {
+	if _, err := os.Stat("/bin/sleep"); err != nil {
+		t.Skip("no /bin/sleep on this host")
+	}
+	reaped := exec.Command("/bin/sleep", "60")
+	reaped.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := reaped.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reaped.Process.Kill()
+	reaped.Wait()
+	if err := killRun(minimalRow, bounds{}, reaped.Process); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("a reaped leader: %v, want ErrProcessDone", err)
+	}
+	// A cgroup kill that failed is the error, even beside a process
+	// that is gone: exec ignores a Cancel that says ErrProcessDone.
+	err := killRun(minimalRow, bounds{cgroup: &nslinux.Cgroup{Dir: "/nonexistent-cgroup-for-this-test"}}, reaped.Process)
+	if err == nil || errors.Is(err, os.ErrProcessDone) || !strings.Contains(err.Error(), "nonexistent-cgroup") {
+		t.Fatalf("a failed cgroup kill beside a reaped leader: %v", err)
+	}
+	live := exec.Command("/bin/sleep", "60")
+	live.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := live.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := killRun(minimalRow, bounds{}, live.Process); err != nil {
+		t.Fatalf("a live leader: %v", err)
+	}
+	if err := live.Wait(); err == nil || !strings.Contains(err.Error(), "killed") {
+		t.Fatalf("the group kill did not reach the leader: %v", err)
+	}
+}
+
+// Start's report of an init that did not reach exec follows the
+// status shape: a refused intent is ErrUndeliverable; a row failing
+// to apply is reported as that under neither sentinel; a death
+// before composing names the contract, or the caller's context.
+func TestStartFailureClasses(t *testing.T) {
+	ctxErr := context.DeadlineExceeded
+	cases := []struct {
+		outcome initOutcome
+		reason  string
+		ctxErr  error
+		is      error
+		isNot   []error
+		text    string
+	}{
+		{initRefused, "chdir /x: no such file", nil, ErrUndeliverable, []error{ErrWeakerThanRequired}, "chdir /x"},
+		{initApplyFailed, "bind /a -> /b: no such file", nil, nil, []error{ErrUndeliverable, ErrWeakerThanRequired}, "the strong row failed to apply on this host: bind /a -> /b"},
+		{initDied, "", ctxErr, ctxErr, []error{ErrUndeliverable}, "ended before exec"},
+		{initDied, "", nil, nil, []error{ErrUndeliverable}, "must not act under " + envInit},
+		{initGarbled, "", nil, nil, []error{ErrUndeliverable}, "unreadable init status"},
+	}
+	for _, c := range cases {
+		err := startFailure(strongRow, c.outcome, c.reason, []byte("junk"), c.ctxErr, errors.New("exit status 127"))
+		if c.is != nil && !errors.Is(err, c.is) {
+			t.Errorf("%v: %v is not %v", c.outcome, err, c.is)
+		}
+		for _, not := range c.isNot {
+			if errors.Is(err, not) {
+				t.Errorf("%v: %v is %v", c.outcome, err, not)
+			}
+		}
+		if !strings.Contains(err.Error(), c.text) {
+			t.Errorf("%v: %q lacks %q", c.outcome, err, c.text)
+		}
+	}
+}
+
+// runInitProtocol drives the re-exec protocol as Start does, with a
+// config of the test's choosing, and returns the status the init
+// wrote.
+func runInitProtocol(t *testing.T, cfg initConfig, attr *syscall.SysProcAttr) []byte {
+	t.Helper()
+	cfgR, cfgW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusR, statusW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/proc/self/exe")
+	cmd.Env = append(os.Environ(), envInit+"=1", envInitFD+"=3", envStatusFD+"=4")
+	cmd.ExtraFiles = []*os.File{cfgR, statusW}
+	cmd.SysProcAttr = attr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	cfgR.Close()
+	statusW.Close()
+	if err := json.NewEncoder(cfgW).Encode(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfgW.Close()
+	status, err := io.ReadAll(statusR)
+	statusR.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Wait()
+	return status
+}
+
+// The init tells a mechanism that failed to apply — a pivot onto a
+// root that is no directory, which the parent never hands it — apart
+// from an intent it could not deliver — a bind whose source is gone,
+// a working directory it cannot enter — by the status shape it
+// writes; and it refuses a row it does not know rather than running
+// an unhardened one under that name.
+func TestInitReportsApplicationFailure(t *testing.T) {
+	requireTree(t)
+	if usernsUnavailable != "" {
+		t.Skipf("user namespaces unavailable: %s", usernsUnavailable)
+	}
+	tree, err := filepath.EvalSymlinks(worldFixture(t, "grant-ro"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attr := sysProcAttr(strongRow, false)
+	status := runInitProtocol(t, initConfig{Row: strongRow.name, Root: filepath.Join(tree, "etc", "tree-marker"), Cmd: "/world", Env: []string{}}, attr)
+	if outcome, reason := classifyStatus(status); outcome != initApplyFailed || !strings.Contains(reason, "pivot") {
+		t.Fatalf("a pivot onto a file reported as %v %q (status %q)", outcome, reason, status)
+	}
+	status = runInitProtocol(t, initConfig{
+		Row:   strongRow.name,
+		Root:  tree,
+		Binds: []bind{{Source: "/nonexistent-source-for-this-test", Target: filepath.Join(tree, "grant-ro")}},
+		Cmd:   "/world",
+		Env:   []string{},
+	}, attr)
+	if outcome, reason := classifyStatus(status); outcome != initRefused || !strings.Contains(reason, "bind") {
+		t.Fatalf("a vanished bind source reported as %v %q (status %q)", outcome, reason, status)
+	}
+	status = runInitProtocol(t, initConfig{Row: strongRow.name, Root: tree, WorkDir: "/nonexistent-dir", Cmd: "/world", Env: []string{}}, attr)
+	if outcome, reason := classifyStatus(status); outcome != initRefused || !strings.Contains(reason, "chdir") {
+		t.Fatalf("an unenterable workdir reported as %v %q (status %q)", outcome, reason, status)
+	}
+	status = runInitProtocol(t, initConfig{Row: "bogus", Cmd: "/bin/true", Env: []string{}}, sysProcAttr(minimalRow, true))
+	if outcome, reason := classifyStatus(status); outcome != initApplyFailed || !strings.Contains(reason, "unknown row") {
+		t.Fatalf("an unknown row reported as %v %q (status %q)", outcome, reason, status)
+	}
+}
+
+// A nil Env without a Root inherits the host's environment minus this
+// package's own markers.
+func TestHostEnvStripsMarkers(t *testing.T) {
+	t.Setenv("_SANDBOX_PROBE_MARKER_TEST", "1")
+	t.Setenv("SANDBOX_TEST_KEEP", "1")
+	env := hostEnv()
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "_SANDBOX_") {
+			t.Fatalf("marker leaked: %s", kv)
+		}
+	}
+	if !slices.Contains(env, "SANDBOX_TEST_KEEP=1") {
+		t.Fatal("the host environment was not inherited")
 	}
 }

@@ -70,7 +70,11 @@ independent by design.
   wrong world, and a payload that dereferences image-absolute paths *at
   runtime* observes different resolution than under an at-`/` row. That
   exposure is exactly what a caller accepts by admitting such rows
-  through `MinTier`. Grants and the rendezvous directory land on
+  through `MinTier`. A row with no filesystem-restriction mechanism at
+  all (`Minimal`) cannot bound the world to anything and refuses a
+  stated `Root` (`ErrUndeliverable`): the tier grades exposure, and an
+  intent nothing delivers is a refusal, never an omission. Grants and
+  the rendezvous directory land on
   entries the caller placed in the tree at their own paths — an
   absent or wrong-kind target, or one reached through a symlink at
   any component, is an undeliverable intent, never an omission; so is
@@ -139,8 +143,13 @@ boundary is what the tier grades; the accounting that enforced the
 bounds is a reported fact of the run, so coarser bounds are
 attributable, never silent. A `Minimal` selection accordingly
 guarantees exactly this much: kernel-enforced bounds exist and their
-accounting is reported — it grades nothing else. A host reaching only
-`Minimal` runs only if `MinTier` admits it; a platform matching no row
-refuses with `ErrUnsupported` rather than running unsandboxed. Tier
-`None` stays in the vocabulary as the floor `MinTier` can state —
-"accept anything" — but no row reports it: sandbox never bare-execs.
+accounting is reported — it grades nothing else, so it refuses every
+intent only a security boundary delivers (`Root`, `Hostname`, a denied
+network, a read-only grant), and a `Spec` stating no `Limits` leaves
+it nothing to apply and is refused too (`ErrUndeliverable`). A host
+reaching only `Minimal` runs only if `MinTier` admits it; a platform
+matching no row refuses with `ErrUnsupported` rather than running
+unsandboxed — on Linux `Minimal` is always satisfied, rlimits
+existing on every kernel, so a Linux host never refuses that way.
+Tier `None` stays in the vocabulary as the floor `MinTier` can state
+— "accept anything" — but no row reports it: sandbox never bare-execs.

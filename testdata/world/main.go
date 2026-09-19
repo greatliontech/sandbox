@@ -40,13 +40,26 @@ func main() {
 		}
 		fmt.Printf("hogged=%d\n", len(chunks))
 		return
+	case "spawn":
+		// Start a long sleeper, name it, and sleep alongside it: the
+		// cancellation tests check the kill reaches both.
+		p, err := os.StartProcess(os.Args[0], []string{os.Args[0], "sleep"}, &os.ProcAttr{})
+		if err != nil {
+			fmt.Printf("spawn-err=%v\n", err)
+			return
+		}
+		fmt.Printf("child=%d\n", p.Pid)
+		os.Stdout.Sync()
+		time.Sleep(5 * time.Minute)
+		return
 	case "fork":
 		// Start four idle copies; report how many the process bound
-		// refused.
+		// refused. os.Args[0] is this binary wherever the row execed
+		// it.
 		refused := 0
 		var procs []*os.Process
 		for i := 0; i < 4; i++ {
-			p, err := os.StartProcess("/world", []string{"/world", "idle"}, &os.ProcAttr{})
+			p, err := os.StartProcess(os.Args[0], []string{os.Args[0], "idle"}, &os.ProcAttr{})
 			if err != nil {
 				refused++
 				continue
@@ -69,6 +82,7 @@ func main() {
 
 	cwd, _ := os.Getwd()
 	fmt.Println("cwd=" + cwd)
+	fmt.Printf("pid=%d\n", os.Getpid())
 	fmt.Printf("env=%d\n", len(os.Environ()))
 
 	entries, _ := os.ReadDir("/")

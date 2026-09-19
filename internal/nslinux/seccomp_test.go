@@ -109,3 +109,11 @@ func unsyncHelper() {
 	}
 	os.Exit(0)
 }
+
+// The kill-process action probe answers on every kernel this package
+// supports (4.14 and later): filters with the action exist here.
+func TestKillProcessAvailable(t *testing.T) {
+	if err := KillProcessAvailable(); err != nil {
+		t.Fatalf("on a kernel with seccomp filters: %v", err)
+	}
+}

@@ -36,7 +36,13 @@ const (
 	// reports it; sandbox never bare-execs.
 	None Isolation = iota
 	// Minimal: kernel-enforced resource bounds with their accounting
-	// reported, but no security boundary.
+	// reported, and no security boundary: the world is the caller's
+	// own, so a stated Root, Hostname, read-only grant, or denied
+	// network is refused (ErrUndeliverable), and the lifetime ties are
+	// the weakest — cancellation kills the run's process group, which
+	// a payload can leave with setsid, and caller death reaches the
+	// direct child alone (docs/specs/sandbox.md, "No orphans"). A run
+	// on it states at least one limit: sandbox never bare-execs.
 	Minimal
 	// OS: an OS-policy security boundary (Landlock, Seatbelt,
 	// AppContainer).
@@ -73,7 +79,9 @@ const (
 
 // PathGrant exposes a host path inside the sandbox, at the same
 // absolute path, at the given access level; a read-only grant is
-// read-only throughout, submounts included. Under a stated Root the
+// read-only throughout, submounts included, and needs a row that can
+// make a path read-only — the Minimal row refuses one
+// (ErrUndeliverable). Under a stated Root the
 // path must already exist in the tree as the same kind of entry
 // (directory or file), reached through no symlink at any component —
 // the tree is the caller's to shape, and a grant with nowhere to land
@@ -163,19 +171,25 @@ type Spec struct {
 	// (docs/specs/sandbox.md, "Root is world-restriction"). Exec,
 	// WorkDir, grant paths, and RuntimeDir are then tree-absolute, and
 	// the entrypoint comes from the tree. The tree itself is never
-	// written: nothing is created in it, not even transiently.
+	// written: nothing is created in it, not even transiently. A row
+	// with no filesystem restriction at all (Minimal) cannot bound the
+	// world and refuses a stated Root (ErrUndeliverable).
 	Root string
 
 	// Network grants the process the host's network. When false (default)
 	// the process has no network: on rows with namespaces a fresh, empty
 	// network namespace (a loopback, down), and on the others whatever
 	// the row's mechanism set states (docs/specs/sandbox.md, the ladder).
+	// A row whose mechanism set cannot deny the network (Minimal)
+	// refuses to run with it false (ErrUndeliverable): admitting that
+	// row through MinTier goes with granting the network.
 	Network bool
 
 	// PathGrants are host paths exposed into the sandbox.
 	PathGrants []PathGrant
 
-	// Limits caps process resources.
+	// Limits caps process resources. On the Minimal row, whose whole
+	// mechanism set is bounds, at least one must be stated.
 	Limits Limits
 
 	// RuntimeDir is a host directory the transport socket/pipe lives in; it is
@@ -185,11 +199,17 @@ type Spec struct {
 	// PathGrant.
 	RuntimeDir string
 
-	// Hostname sets the sandbox UTS hostname (where the platform supports it).
+	// Hostname sets the sandbox's hostname, at most 64 bytes. A row
+	// with no hostname of its own to present (Minimal) refuses a
+	// stated one (ErrUndeliverable); it is never an omission.
 	Hostname string
 
-	// MinTier is the weakest isolation the caller will accept. Start fails with
-	// ErrWeakerThanRequired if the platform cannot reach it.
+	// MinTier is the weakest isolation the caller will accept. Start
+	// fails with ErrWeakerThanRequired, before anything runs, if the
+	// row this host reaches sits below it; the error names what the
+	// host lacks for the higher rows. The zero value, None, accepts any
+	// row; admitting Minimal is informed consent to its weaker
+	// lifetime ties (Minimal).
 	MinTier Isolation
 
 	Stdin  io.Reader
@@ -197,8 +217,9 @@ type Spec struct {
 	Stderr io.Writer
 }
 
-// ErrWeakerThanRequired is returned by Start when the achievable isolation is
-// below Spec.MinTier.
+// ErrWeakerThanRequired is returned by Start when the row this host
+// reaches sits below Spec.MinTier: "this host cannot do it strongly
+// enough". Nothing has run.
 var ErrWeakerThanRequired = errors.New("sandbox: platform cannot meet required isolation tier")
 
 // ErrUndeliverable is returned by Start when a stated intent cannot be
@@ -233,20 +254,27 @@ type Stats struct {
 
 // Sandbox is a created-but-not-necessarily-started sandbox for one process.
 type Sandbox interface {
-	// Start launches the process. The context governs the process lifetime:
-	// cancelling it terminates the sandbox.
+	// Start launches the process. The context governs the process
+	// lifetime: cancelling it kills the run by the strongest tie the
+	// row holds — the pid namespace on Strong, the cgroup where the run
+	// was placed in one, and the process group otherwise, which a
+	// payload can leave with setsid (docs/specs/sandbox.md, "No
+	// orphans").
 	Start(ctx context.Context) error
 	// Wait blocks until the process exits. A non-zero exit is reported in the
 	// ExitStatus with a nil error; only failures to wait return an error.
 	Wait() (ExitStatus, error)
 	// Signal sends a signal to the sandboxed process.
 	Signal(sig os.Signal) error
-	// Destroy tears down the sandbox, killing the process if still running.
+	// Destroy tears down the sandbox, killing the process if still
+	// running by the same ties as cancellation.
 	Destroy() error
 	// Stats returns the run's accounting facts: live while the process
 	// runs, final after Wait.
 	Stats() (Stats, error)
-	// Tier reports the isolation actually achieved.
+	// Tier reports the isolation actually achieved: None until Start
+	// has succeeded, then the tier of the row whose mechanism set
+	// fully applied.
 	Tier() Isolation
 }
 

@@ -47,7 +47,7 @@ fmt.Println(es.Code, sb.Tier())
 
 | GOOS | Mechanism | Target tier | Status |
 |---|---|---|---|
-| linux | create-only namespaces (`SysProcAttr` clone) + uid/gid map + pivoted read-only root with path grants + capability drop + seccomp (a native-ABI policy behind an arch guard) + no_new_privs + cgroup-or-rlimit bounds with reported accounting | `Strong` | every arm delivered; row selection and derived tiers pending |
+| linux | create-only namespaces (`SysProcAttr` clone) + uid/gid map + pivoted read-only root with path grants + capability drop + seccomp (a native-ABI policy behind an arch guard) + no_new_privs + cgroup-or-rlimit bounds with reported accounting | `Strong` | delivered; a host without user namespaces reaches the `Minimal` row — bounds only, refusing every intent needing a boundary (`Root`, `Hostname`, a denied network, read-only grants) and a spec with no limits, `MinTier` gating it |
 | windows | AppContainer + Job Object (`KILL_ON_JOB_CLOSE`) | `OS` | skeleton |
 | darwin | `sandbox-exec` SBPL profile + `setrlimit` | `OS` | skeleton |
 | other | — | — | `ErrUnsupported` |
@@ -57,8 +57,8 @@ the Linux backend) is a future tier, not yet wired.
 
 ## Roadmap
 
-1. **Linux**: row selection and derived tiers (the Strong row's mechanisms
-   have all landed).
+1. **Linux**: the `OS` row — Landlock filesystem allowlist and seccomp
+   network denial — for hosts without user namespaces.
 2. **Windows**: AppContainer profile + Job Object; named-pipe transport plumbing.
 3. **macOS**: SBPL generation + `sandbox-exec`; runtime availability probe that
    degrades `Tier()` to `Minimal` when Seatbelt is unavailable.

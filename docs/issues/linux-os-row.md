@@ -1,16 +1,23 @@
 # The Linux OS row has no implementation home
 
-Lands: strong-backend plan close-out (scheduling the row is the
-user's call there)
+Lands: user decision
 
 docs/specs/sandbox.md's ladder names a Linux `OS` row — Landlock
 filesystem allowlist, seccomp network denial (Landlock ABI 4's TCP
 restrictions supplementary, never the sole arm), `no_new_privs`,
 rlimit bounds, static entrypoints only — for hosts without
-unprivileged user namespaces. The strong-backend plan delivers the
-Strong row only, and no artifact tracks the OS row's implementation;
+unprivileged user namespaces. The Strong row is delivered whole,
+and no artifact tracks the OS row's implementation;
 docs/issues/linux-mechanism-replica.md mentions "a Landlock rung
 later" as rationale, not as a tracked deferral. This issue is that
 deferral: until it lands, a Linux host without unprivileged user
 namespaces refuses instead of degrading to the OS tier the spec
 offers.
+
+Selection today falls past the row: a row with no mechanism to apply
+is not one a host satisfies, so such a host reaches `Minimal`.
+
+Consumer note: pb's REQ-plugin-sandboxed wording assumes the at-`/`
+root view the Strong row presents; when an `OS`-tier row first
+reaches pb, that spec's wording reconciles against `Root` as
+world-restriction.
