@@ -86,14 +86,60 @@ type PathGrant struct {
 }
 
 // Limits are resource caps applied to the sandboxed process. Zero means
-// unlimited for that dimension. Backends map these to the closest native
-// mechanism (cgroups, Job Object, rlimits) and may round or ignore caps they
-// cannot enforce — Tier reflects what was actually achievable.
+// unlimited for that dimension. A backend maps them to the strongest
+// native accounting the selected row admits (docs/specs/sandbox.md,
+// "Bounded means bounded") and reports which one enforced them
+// (Stats.Accounting); it never rounds a cap silently — a cap it
+// cannot enforce refuses Start.
 type Limits struct {
-	MemoryBytes uint64 // address-space / committed-memory cap
-	CPUSeconds  uint64 // CPU time cap
-	MaxFiles    uint64 // open file descriptors
-	MaxProcs    uint64 // process/thread count
+	// MemoryBytes caps memory: memory.max of the sandbox's own cgroup
+	// under cgroups — the payload is killed at the bound; RLIMIT_AS
+	// under rlimits, which caps address space rather than use — a
+	// runtime that reserves more address space than the cap (a Go
+	// binary reserves well over 64 MiB) is refused at its very start,
+	// loudly. Which of the two enforced it is reported
+	// (Stats.Accounting).
+	MemoryBytes uint64
+	CPUSeconds  uint64 // CPU time cap (rlimits on every row)
+	MaxFiles    uint64 // open file descriptors (rlimits on every row)
+	// MaxProcs caps the process and thread count: pids.max of the
+	// sandbox's own cgroup under cgroups; RLIMIT_NPROC under rlimits,
+	// which current kernels count within the sandbox's user namespace
+	// (older ones over every task of the user, the host's included, so
+	// a value below that count refuses the payload its first thread).
+	// Which of the two enforced it is reported (Stats.Accounting).
+	MaxProcs uint64
+}
+
+// Accounting names the native mechanism that enforced a run's Limits
+// — a reported fact of the run, so a bound-exceeded death is
+// attributable to a specific enforcement.
+type Accounting int
+
+const (
+	// AccountingNone: no limit was stated, so nothing enforced one.
+	AccountingNone Accounting = iota
+	// AccountingRlimits: POSIX resource limits on the process.
+	AccountingRlimits
+	// AccountingCgroups: a cgroup v2 the process was born into.
+	AccountingCgroups
+	// AccountingJobObject: a Windows Job Object.
+	AccountingJobObject
+)
+
+func (a Accounting) String() string {
+	switch a {
+	case AccountingNone:
+		return "none"
+	case AccountingRlimits:
+		return "rlimits"
+	case AccountingCgroups:
+		return "cgroups"
+	case AccountingJobObject:
+		return "job-object"
+	default:
+		return "unknown"
+	}
 }
 
 // Spec describes a sandbox to create.
@@ -169,9 +215,21 @@ type ExitStatus struct {
 	Signal   os.Signal
 }
 
-// Stats holds resource-usage counters. Reserved; backends populate what their
-// native accounting exposes (cgroup/job/rusage).
-type Stats struct{}
+// Stats are the run's accounting facts: which mechanism enforced the
+// memory and process-count limits — the CPU-time and open-files
+// limits are rlimits on every row, so a CPU-time death is always
+// RLIMIT_CPU's — and, where the mechanism keeps counters (cgroups),
+// the peak memory use and the bound enforcements that happened:
+// processes the memory bound killed, forks the process bound
+// refused. Zero counters under rlimits mean the mechanism does not
+// count, not that nothing happened; a zero peak under cgroups on a
+// kernel before 5.19 means the kernel keeps no peak.
+type Stats struct {
+	Accounting      Accounting
+	MemoryPeakBytes uint64
+	MemoryKills     uint64
+	ForksRefused    uint64
+}
 
 // Sandbox is a created-but-not-necessarily-started sandbox for one process.
 type Sandbox interface {
@@ -185,7 +243,8 @@ type Sandbox interface {
 	Signal(sig os.Signal) error
 	// Destroy tears down the sandbox, killing the process if still running.
 	Destroy() error
-	// Stats returns current resource usage.
+	// Stats returns the run's accounting facts: live while the process
+	// runs, final after Wait.
 	Stats() (Stats, error)
 	// Tier reports the isolation actually achieved.
 	Tier() Isolation

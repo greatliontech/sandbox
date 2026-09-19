@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -88,50 +87,6 @@ func parseSelfCgroup(data []byte) (string, error) {
 	return "", errors.New("cgroup: no v2 entry in cgroup membership")
 }
 
-// Available reports whether this process can create a cgroup that
-// enforces the named controllers — privileged near the root, or
-// rootless in a delegated subtree. It dry-runs Create with a unique
-// throwaway name and deletes the result, so its answer and Create's
-// cannot diverge; like any Create, the dry run may permanently
-// enable controllers in an ancestor's subtree_control (see Create).
-// A non-nil error reports an anomaly — the mount table or own
-// membership unreadable, an abandoned or probe cgroup irremovable, a
-// probe name colliding — never an ordinary "no cgroups here", which
-// is (false, nil): the one Create outcome that means that is its
-// no-accepting-ancestry refusal, and everything else propagates.
-// Callers pick their bounds mechanism by the bool: cgroups where
-// true, the rlimit fallback where false.
-func (h *Hierarchy) Available(controllers []string) (bool, error) {
-	mounted, err := h.Mounted()
-	if err != nil {
-		return false, err
-	}
-	if !mounted {
-		return false, nil
-	}
-	cg, err := h.Create(probeName(), controllers)
-	if errors.Is(err, errNoAncestryBase) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if err := cg.Delete(); err != nil {
-		return true, fmt.Errorf("cgroup: probe cleanup: %w", err)
-	}
-	return true, nil
-}
-
-var probeSeq atomic.Int64
-
-// probeName returns a name unique to this call — pid plus a counter —
-// so concurrent probes in one process never collide (Create refuses
-// an existing name outright) and a crashed probe's residue never
-// shadows the next call.
-func probeName() string {
-	return fmt.Sprintf(".probe-%d-%d", os.Getpid(), probeSeq.Add(1))
-}
-
 // Create makes a fresh cgroup named name with the named controllers
 // enabled for it in its parent's subtree_control. The parent is
 // found by walking from the caller's own cgroup upward to Root,
@@ -149,11 +104,20 @@ func probeName() string {
 // (and by the no-internal-process rule usually must) place the new
 // cgroup outside the caller's own leaf, so a supervisor killing the
 // caller's cgroup does not reach it — the caller's kill path owns
-// that tie.
+// that tie. The enabled set always includes a domain controller
+// (withDomain): a thread-capable set alone would turn the parent
+// into a thread root whose children can host no process.
 func (h *Hierarchy) Create(name string, controllers []string) (*Cgroup, error) {
+	controllers = withDomain(controllers)
 	self, err := h.SelfDir()
 	if err != nil {
 		return nil, err
+	}
+	// A process vacate moved into a supervisor leaf is still the
+	// delegated cgroup's tenant: its cgroups are the leaf's siblings,
+	// never its children.
+	if filepath.Base(self) == supervisorLeaf {
+		self = filepath.Dir(self)
 	}
 	root := h.root()
 	var firstErr error
@@ -182,20 +146,50 @@ func (h *Hierarchy) Create(name string, controllers []string) (*Cgroup, error) {
 			break
 		}
 	}
-	return nil, fmt.Errorf("cgroup: create %s: %w: %w", name, errNoAncestryBase, firstErr)
+	return nil, fmt.Errorf("cgroup: create %s: %w: %w", name, ErrNoAncestryBase, firstErr)
 }
 
-// errNoAncestryBase marks Create's ordinary refusal — every
+// ErrNoAncestryBase marks Create's ordinary refusal — every
 // directory on self's cgroup ancestry declined the creation or the
 // controllers — as distinct from an anomaly (membership unreadable,
-// an abandoned directory irremovable), so Available can classify
-// without matching error text.
-var errNoAncestryBase = errors.New("no directory on self's ancestry accepts it")
+// an abandoned directory irremovable), so a caller can fall back to
+// another accounting without matching error text.
+var ErrNoAncestryBase = errors.New("no directory on self's ancestry accepts it")
+
+// domainControllers are the cgroup v2 controllers that make a cgroup
+// a domain; the others (cpu, cpuset, pids) are thread-capable. A
+// parent whose subtree_control names thread-capable controllers only
+// becomes an implicit thread root, after which its children are
+// domain-invalid and can host no process, and no domain controller
+// can be enabled there again — so a request naming no domain
+// controller is completed with memory before the write. The parent
+// then accounts memory for every child it has, permanently: the cost
+// of keeping it a domain.
+var domainControllers = map[string]bool{"memory": true, "io": true, "hugetlb": true, "rdma": true, "misc": true}
+
+// withDomain returns controllers with memory added when none of them
+// is a domain controller.
+func withDomain(controllers []string) []string {
+	for _, c := range controllers {
+		if domainControllers[c] {
+			return controllers
+		}
+	}
+	return append([]string{"memory"}, controllers...)
+}
 
 // enableControllers ensures each named controller is listed in dir's
-// cgroup.subtree_control, enabling the missing ones. Already-enabled
-// controllers need no write, so a base whose subtree_control is not
-// writable still serves when its state is already right.
+// cgroup.subtree_control, enabling the missing ones in one write.
+// One write, deliberately: enabling only thread-capable controllers
+// (pids, cpu) first would make dir an implicit thread root, after
+// which the kernel refuses every domain controller (memory) with
+// EOPNOTSUPP. Already-enabled controllers need no write, so a base
+// whose subtree_control is not writable still serves when its state
+// is already right. A refusal with EBUSY — dir holds member
+// processes, which cgroup v2 forbids beside child controllers —
+// vacates dir into its supervisor leaf and asks once more: the
+// delegation pattern for a cgroup that holds its own delegatee (a
+// systemd scope, a container's namespace root).
 func enableControllers(dir string, controllers []string) error {
 	ctlPath := filepath.Join(dir, "cgroup.subtree_control")
 	data, err := os.ReadFile(ctlPath)
@@ -203,15 +197,63 @@ func enableControllers(dir string, controllers []string) error {
 		return fmt.Errorf("cgroup: read subtree_control: %w", err)
 	}
 	enabled := strings.Fields(string(data))
+	var missing []string
 	for _, c := range controllers {
-		if slices.Contains(enabled, c) {
-			continue
-		}
-		if err := writeExistingFile(ctlPath, "+"+c); err != nil {
-			return fmt.Errorf("cgroup: enable controller %s in %s: %w", c, dir, err)
+		if !slices.Contains(enabled, c) {
+			missing = append(missing, "+"+c)
 		}
 	}
+	if len(missing) == 0 {
+		return nil
+	}
+	err = writeExistingFile(ctlPath, strings.Join(missing, " "))
+	if errors.Is(err, unix.EBUSY) {
+		if verr := vacate(dir); verr != nil {
+			return fmt.Errorf("cgroup: enable controllers %v in %s: %w (vacating it: %v)", controllers, dir, err, verr)
+		}
+		err = writeExistingFile(ctlPath, strings.Join(missing, " "))
+	}
+	if err != nil {
+		return fmt.Errorf("cgroup: enable controllers %v in %s: %w", controllers, dir, err)
+	}
 	return nil
+}
+
+// supervisorLeaf is the child cgroup a vacated cgroup's member
+// processes move into.
+const supervisorLeaf = ".supervisor"
+
+// vacate moves every member process of dir into a leaf child so that
+// controllers can be enabled for dir's children. Every member, not
+// only this process: a namespace root holds a container's init beside
+// us and a delegated scope may hold our parent. Membership is live —
+// a member may exit between the listing and its move (ESRCH: gone,
+// not an error) and forks may arrive — so the listing is re-read
+// until it comes back empty, bounded so a cgroup gaining members
+// faster than they move reports that rather than spinning. Kernel
+// precondition: write access to dir and the leaf's cgroup.procs (the
+// delegation the caller already holds).
+func vacate(dir string) error {
+	leaf := filepath.Join(dir, supervisorLeaf)
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", leaf, err)
+	}
+	for attempt := 0; attempt < 100; attempt++ {
+		pids, err := procsAt(dir)
+		if err != nil {
+			return err
+		}
+		if len(pids) == 0 {
+			return nil
+		}
+		for _, pid := range pids {
+			err := writeExistingFile(filepath.Join(leaf, "cgroup.procs"), strconv.Itoa(pid))
+			if err != nil && !errors.Is(err, unix.ESRCH) {
+				return fmt.Errorf("move process %d out of %s: %w", pid, dir, err)
+			}
+		}
+	}
+	return fmt.Errorf("%s keeps gaining member processes faster than they can be moved", dir)
 }
 
 // defaultFreezeTimeout bounds the whole freeze-completion wait in
@@ -415,11 +457,89 @@ func eventsFrozen(data []byte) bool {
 	return false
 }
 
+// Counters are the kernel's own accounting of a cgroup: the peak
+// memory use, the processes the memory bound killed (memory.events
+// oom_kill), and the forks the process bound refused (pids.events
+// max). A counter whose file the cgroup does not carry (a controller
+// not enabled for it) reads as zero.
+type Counters struct {
+	MemoryPeak  uint64
+	OOMKills    uint64
+	ForksDenied uint64
+}
+
+// Counters reads the cgroup's accounting. The directory outlives the
+// process until Delete, so the final counts are readable after the
+// process has been reaped; a descendant still dying at that moment
+// can move the event counters by a little afterwards. memory.peak
+// exists since kernel 5.19 — on an older kernel MemoryPeak reads as
+// zero, which the caller cannot tell from an unused cgroup.
+func (c *Cgroup) Counters() (Counters, error) {
+	var ct Counters
+	var err error
+	if ct.MemoryPeak, err = c.readOptionalUint("memory.peak"); err != nil {
+		return ct, err
+	}
+	if ct.OOMKills, err = c.readOptionalKey("memory.events", "oom_kill"); err != nil {
+		return ct, err
+	}
+	if ct.ForksDenied, err = c.readOptionalKey("pids.events", "max"); err != nil {
+		return ct, err
+	}
+	return ct, nil
+}
+
+func (c *Cgroup) readOptionalUint(name string) (uint64, error) {
+	data, err := os.ReadFile(filepath.Join(c.Dir, name))
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("cgroup: read %s: %w", name, err)
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("cgroup: parse %s: %w", name, err)
+	}
+	return n, nil
+}
+
+func (c *Cgroup) readOptionalKey(name, key string) (uint64, error) {
+	data, err := os.ReadFile(filepath.Join(c.Dir, name))
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("cgroup: read %s: %w", name, err)
+	}
+	for line := range bytes.Lines(data) {
+		f := strings.Fields(string(line))
+		if len(f) == 2 && f[0] == key {
+			n, err := strconv.ParseUint(f[1], 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("cgroup: parse %s %s: %w", name, key, err)
+			}
+			return n, nil
+		}
+	}
+	return 0, nil
+}
+
 // Delete removes the cgroup directory. The kernel refuses (EBUSY)
 // while member processes remain, including unreaped zombies — kill
-// and wait first.
+// and wait first — and, briefly, while it finishes offlining a
+// just-emptied cgroup; that transient refusal is retried for up to
+// half a second before it is reported.
 func (c *Cgroup) Delete() error {
-	if err := os.Remove(c.Dir); err != nil {
+	var err error
+	for attempt := 0; attempt < 50; attempt++ {
+		err = os.Remove(c.Dir)
+		if !errors.Is(err, unix.EBUSY) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
 		return fmt.Errorf("cgroup: delete: %w", err)
 	}
 	return nil

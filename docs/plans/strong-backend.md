@@ -19,7 +19,7 @@ row selection with derived tiers.
 - [x] 3. Strong hardening: capability drop, seccomp, no_new_privs,
       network-namespace denial with the `Network` grant; live probes
       (dial, capability read).
-- [ ] 4. Bounds: cgroup placement via the delegated subtree and
+- [x] 4. Bounds: cgroup placement via the delegated subtree and
       clone-into with the rlimit fallback, the accounting reported on
       the public surface, `cgroup.kill` wired into cancellation
       cleanup; live memory-bound test.

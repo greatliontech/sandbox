@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/elastic/go-seccomp-bpf/arch"
+	"github.com/greatliontech/sandbox/internal/nslinux"
+	"golang.org/x/sys/unix"
 )
 
 // worldTree is the static probe binary built once into a bare tree
@@ -957,5 +959,445 @@ func TestNetworkGrant(t *testing.T) {
 	}
 	if got := run(true)["ifaces"]; got == "lo" || got == "" {
 		t.Errorf("granted network sees interfaces %q, want the host's", got)
+	}
+}
+
+// requireCgroups says whether this host affords cgroup placement for
+// the memory and pids controllers; where SANDBOX_TEST_REQUIRE_CGROUPS
+// is set the cap fails the test instead of skipping it, so a CI job
+// can demand the live cgroups arms.
+func requireCgroups(t *testing.T) bool {
+	t.Helper()
+	available, err := placementSupported(context.Background(), nslinux.DefaultHierarchy())
+	if err != nil {
+		t.Fatalf("cgroup probe: %v", err)
+	}
+	if !available && os.Getenv("SANDBOX_TEST_REQUIRE_CGROUPS") != "" {
+		t.Fatal("SANDBOX_TEST_REQUIRE_CGROUPS is set and cgroup placement is unavailable here")
+	}
+	return available
+}
+
+// The memory bound stops a runaway allocator, and the run reports
+// which accounting did it: under cgroups a kill counted in the
+// cgroup's events, under rlimits an allocation refused and the
+// payload's own failure (docs/specs/sandbox.md, "Bounded means
+// bounded").
+func TestMemoryBound(t *testing.T) {
+	requireTree(t)
+	cgroups := requireCgroups(t)
+	var out bytes.Buffer
+	sb, err := New(Spec{
+		Exec:   "/world",
+		Args:   []string{"hog"},
+		Root:   worldTree,
+		Limits: Limits{MemoryBytes: 64 << 20},
+		Stdout: &out,
+		Stderr: &out,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	es, err := sb.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	st, err := sb.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if strings.Contains(out.String(), "hogged=256") {
+		t.Fatalf("the hog finished under a 64 MiB bound (accounting %s)", st.Accounting)
+	}
+	if cgroups {
+		if !strings.Contains(out.String(), "hog-start") {
+			t.Fatalf("the payload never started under the cgroup bound: %+v %q", es, out.String())
+		}
+		if st.Accounting != AccountingCgroups || st.MemoryKills == 0 || !es.Signaled || es.Signal != syscall.SIGKILL {
+			t.Fatalf("cgroups bound: accounting %s, kills %d, exit %+v", st.Accounting, st.MemoryKills, es)
+		}
+		if st.MemoryPeakBytes == 0 || st.MemoryPeakBytes > 64<<20+4<<20 {
+			t.Errorf("memory peak %d, want a value at or under the bound", st.MemoryPeakBytes)
+		}
+		return
+	}
+	// Under rlimits an address-space cap this small refuses a Go
+	// payload its start, which is the bound enforced at the
+	// coarseness it has (Limits.MemoryBytes); the allocation-refused
+	// shape is pinned by TestMemoryBoundRlimitsRefusesAllocation.
+	if st.Accounting != AccountingRlimits || es.Code == 0 {
+		t.Fatalf("rlimits bound: accounting %s, exit %+v", st.Accounting, es)
+	}
+}
+
+// Under rlimits a payload that fits the address-space cap starts, and
+// an allocation past it is refused: a shell whose dd asks for a
+// 64 MiB buffer under a 32 MiB cap fails after starting.
+func TestMemoryBoundRlimitsRefusesAllocation(t *testing.T) {
+	if requireCgroups(t) {
+		t.Skip("cgroup placement available: the rlimits arm is not selected here")
+	}
+	for _, bin := range []string{"/bin/sh", "/bin/dd"} {
+		if _, err := os.Stat(bin); err != nil {
+			t.Skipf("no %s", bin)
+		}
+	}
+	var out bytes.Buffer
+	sb, err := New(Spec{
+		Exec:   "/bin/sh",
+		Args:   []string{"-c", "echo started; dd if=/dev/zero of=/dev/null bs=64M count=1 2>&1 && echo allocated"},
+		Limits: Limits{MemoryBytes: 32 << 20},
+		Stdout: &out,
+		Stderr: &out,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	if _, err := sb.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "started") || strings.Contains(got, "allocated") {
+		t.Fatalf("rlimits memory bound: %q, want the shell to start and the 64 MiB buffer to be refused", got)
+	}
+	if st, _ := sb.Stats(); st.Accounting != AccountingRlimits {
+		t.Fatalf("accounting %s", st.Accounting)
+	}
+}
+
+// The process-count bound refuses forks beyond it: the payload's own
+// runtime fits under six and its forks are refused — counted by the
+// kernel under cgroups, and by the payload alone under rlimits, which
+// current kernels count within the sandbox's user namespace.
+func TestProcessBound(t *testing.T) {
+	requireTree(t)
+	cgroups := requireCgroups(t)
+	var out bytes.Buffer
+	sb, err := New(Spec{
+		Exec:   "/world",
+		Args:   []string{"fork"},
+		Root:   worldTree,
+		Limits: Limits{MaxProcs: 6},
+		Stdout: &out,
+		Stderr: &out,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	es, err := sb.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	st, err := sb.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cgroups {
+		if es.Code != 0 {
+			t.Fatalf("payload under the cgroup bound: %+v %s", es, out.String())
+		}
+		if refused := facts(out.String())["fork-refused"]; refused == "0" || refused == "" {
+			t.Fatalf("no fork refused under a bound of 6: %q", out.String())
+		}
+		if st.Accounting != AccountingCgroups || st.ForksRefused == 0 {
+			t.Fatalf("cgroups: accounting %s, forks refused %d", st.Accounting, st.ForksRefused)
+		}
+		return
+	}
+	if st.Accounting != AccountingRlimits {
+		t.Fatalf("rlimits: accounting %s", st.Accounting)
+	}
+	if !kernelAtLeast(5, 14) {
+		t.Skip("RLIMIT_NPROC is counted per user namespace since kernel 5.14; older kernels count the user's tasks host-wide")
+	}
+	if es.Code != 0 {
+		t.Fatalf("payload under RLIMIT_NPROC=6: %+v %s", es, out.String())
+	}
+	if refused := facts(out.String())["fork-refused"]; refused == "0" || refused == "" {
+		t.Fatalf("no fork refused under RLIMIT_NPROC=6: %q", out.String())
+	}
+}
+
+// Destroy on a running placed run kills it through the cgroup, reaps
+// it, and releases the cgroup; Wait afterwards returns the outcome.
+func TestDestroyReleasesCgroup(t *testing.T) {
+	requireTree(t)
+	if !requireCgroups(t) {
+		t.Skip("cgroup placement unavailable here")
+	}
+	sb, err := New(Spec{Exec: "/world", Args: []string{"sleep"}, Root: worldTree, Limits: Limits{MaxProcs: 8}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	dir := sb.(*linuxSandbox).bounds.cgroup.Dir
+	if err := sb.Destroy(); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cgroup %s survives Destroy: %v", dir, err)
+	}
+	es, err := sb.Wait()
+	if err != nil || !es.Signaled {
+		t.Fatalf("Wait after Destroy: %v %+v", err, es)
+	}
+	if err := sb.Destroy(); err != nil {
+		t.Fatalf("second Destroy: %v", err)
+	}
+}
+
+// A Start refused after the cgroup was created and the child cloned
+// — here a composition failure the init reports — leaves no
+// accounting behind, and no cgroup.
+func TestStatsAfterRefusedStart(t *testing.T) {
+	requireTree(t)
+	if !requireCgroups(t) {
+		t.Skip("cgroup placement unavailable here")
+	}
+	sb, err := New(Spec{Exec: "/world", Root: worldTree, Hostname: strings.Repeat("h", 300), Limits: Limits{MemoryBytes: 64 << 20}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) {
+		t.Fatalf("Start: %v", err)
+	}
+	if st, err := sb.Stats(); err != nil || st.Accounting != AccountingNone {
+		t.Fatalf("Stats after a refused Start = %+v, %v", st, err)
+	}
+	if leaked := runCgroups(t); len(leaked) > 0 {
+		t.Fatalf("a refused Start left its cgroup behind: %v", leaked)
+	}
+}
+
+// runCgroups lists this process's run cgroups still standing
+// anywhere on the caller's ancestry — every directory Create may
+// place in.
+func runCgroups(t *testing.T) []string {
+	t.Helper()
+	h := nslinux.DefaultHierarchy()
+	self, err := h.SelfDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for dir := self; strings.HasPrefix(dir, h.Root); dir = filepath.Dir(dir) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), fmt.Sprintf("sandbox-%d-", os.Getpid())) {
+				out = append(out, filepath.Join(dir, e.Name()))
+			}
+		}
+		if dir == h.Root {
+			break
+		}
+	}
+	return out
+}
+
+// A cgroup that Wait could not release yet is released by Destroy:
+// the cgroup stays owned across the failed release and Destroy after
+// Wait retries it.
+func TestDestroyRetriesRelease(t *testing.T) {
+	if !requireCgroups(t) {
+		t.Skip("cgroup placement unavailable here")
+	}
+	cg, err := nslinux.DefaultHierarchy().Create(cgroupName("sandbox"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(cg.Dir) })
+	cmd := exec.Command("/bin/true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	s := &linuxSandbox{cmd: cmd, waited: true, bounds: bounds{accounting: AccountingCgroups, cgroup: cg}}
+	if err := s.Destroy(); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if _, err := os.Stat(cg.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cgroup %s survives Destroy after Wait: %v", cg.Dir, err)
+	}
+	if s.bounds.cgroup != nil {
+		t.Fatal("released cgroup still owned")
+	}
+}
+
+// A run with no limits stated has no accounting to report; one with
+// only rlimit-shaped limits reports rlimits without touching cgroups.
+func TestAccountingReported(t *testing.T) {
+	requireTree(t)
+	sb, err := New(Spec{Exec: "/world", Root: worldTree})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	if _, err := sb.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := sb.Stats(); st.Accounting != AccountingNone {
+		t.Errorf("no limits: accounting %s", st.Accounting)
+	}
+	sb, err = New(Spec{Exec: "/world", Root: worldTree, Limits: Limits{CPUSeconds: 60, MaxFiles: 64}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	startOrSkip(t, sb)
+	if _, err := sb.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := sb.Stats(); st.Accounting != AccountingRlimits {
+		t.Errorf("cpu/files limits: accounting %s", st.Accounting)
+	}
+}
+
+// Cancellation ends a placed run through the cgroup's kill, and the
+// cgroup is gone once Wait returns.
+func TestCancelKillsPlacedRun(t *testing.T) {
+	requireTree(t)
+	if !requireCgroups(t) {
+		t.Skip("cgroup placement unavailable here")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sb, err := New(Spec{Exec: "/world", Args: []string{"sleep"}, Root: worldTree, Limits: Limits{MaxProcs: 8}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if usernsUnavailable != "" {
+		t.Skipf("user namespaces unavailable: %s", usernsUnavailable)
+	}
+	if err := sb.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	dir := sb.(*linuxSandbox).bounds.cgroup.Dir
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("placed run has no cgroup: %v", err)
+	}
+	cancel()
+	es, err := sb.Wait()
+	if err != nil || !es.Signaled {
+		t.Fatalf("Wait after cancel: %v %+v", err, es)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cgroup %s survives Wait: %v", dir, err)
+	}
+}
+
+// selectBounds maps limits to accounting without a hierarchy where
+// none is needed, and to rlimits where the hierarchy affords no
+// cgroup, never dropping a stated limit.
+func TestSelectBounds(t *testing.T) {
+	none := &nslinux.Hierarchy{Root: t.TempDir(), ProcMounts: filepath.Join(t.TempDir(), "mounts"), ProcSelfCgroup: filepath.Join(t.TempDir(), "cg")}
+	if err := os.WriteFile(none.ProcMounts, []byte("proc /proc proc rw 0 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b, err := selectBounds(context.Background(), Limits{}, none)
+	if err != nil || b.accounting != AccountingNone || len(b.rlimits) != 0 || b.cgroup != nil {
+		t.Fatalf("no limits: %+v %v", b, err)
+	}
+	b, err = selectBounds(context.Background(), Limits{CPUSeconds: 5, MaxFiles: 7}, none)
+	if err != nil || b.accounting != AccountingRlimits || len(b.rlimits) != 2 || b.cgroup != nil {
+		t.Fatalf("rlimit-shaped limits: %+v %v", b, err)
+	}
+	b, err = selectBounds(context.Background(), Limits{MemoryBytes: 1 << 20, MaxProcs: 3, CPUSeconds: 5}, none)
+	if err != nil || b.accounting != AccountingRlimits || b.cgroup != nil {
+		t.Fatalf("no cgroups: %+v %v", b, err)
+	}
+	var early []int
+	for _, rl := range b.rlimits {
+		early = append(early, rl.Resource)
+	}
+	if len(early) != 2 || early[0] != unix.RLIMIT_CPU || early[1] != unix.RLIMIT_AS {
+		t.Fatalf("early rlimits = %v, want CPU then AS", early)
+	}
+	if len(b.late) != 1 || b.late[0].Resource != unix.RLIMIT_NPROC || b.late[0].Cur != 3 {
+		t.Fatalf("late rlimits = %+v, want NPROC 3", b.late)
+	}
+}
+
+// kernelAtLeast reports whether the running kernel is at least
+// major.minor.
+func kernelAtLeast(major, minor int) bool {
+	var u syscall.Utsname
+	if err := syscall.Uname(&u); err != nil {
+		return false
+	}
+	var rel []byte
+	for _, c := range u.Release {
+		if c == 0 {
+			break
+		}
+		rel = append(rel, byte(c))
+	}
+	var gotMajor, gotMinor int
+	fmt.Sscanf(string(rel), "%d.%d", &gotMajor, &gotMinor)
+	return gotMajor > major || (gotMajor == major && gotMinor >= minor)
+}
+
+// The placement probe runs on the caller's clock: a context that has
+// already ended refuses Start at once and remembers no answer.
+func TestPlacementProbeHonorsContext(t *testing.T) {
+	requireTree(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// A hierarchy spelled differently from the default's is a fresh
+	// cache entry over the same live kernel interface.
+	fresh := &nslinux.Hierarchy{Root: "/sys/fs/cgroup/", ProcMounts: "/proc/self/mounts", ProcSelfCgroup: "/proc/self/cgroup"}
+	if _, err := placementSupported(ctx, fresh); !errors.Is(err, context.Canceled) {
+		t.Fatalf("probe under a cancelled context: %v", err)
+	}
+	// Nothing was cached for that hierarchy: a live context probes.
+	if _, err := placementSupported(context.Background(), fresh); errors.Is(err, context.Canceled) {
+		t.Fatal("the cancelled probe's outcome was remembered")
+	}
+}
+
+// Cgroup names differ across calls, and residue named after the pid
+// alone or the pid and a counter — a predecessor killed at this pid
+// with its probe or run cgroup still standing — never shadows the
+// next probe or run: Start still places.
+func TestCgroupNamesSurviveResidue(t *testing.T) {
+	if cgroupName("x") == cgroupName("x") {
+		t.Fatal("two cgroup names collide")
+	}
+	requireTree(t)
+	if !requireCgroups(t) {
+		t.Skip("cgroup placement unavailable here")
+	}
+	h := nslinux.DefaultHierarchy()
+	self, err := h.SelfDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		fmt.Sprintf(".placement-%d", os.Getpid()),
+		fmt.Sprintf(".placement-%d-1", os.Getpid()),
+		fmt.Sprintf("sandbox-%d-1", os.Getpid()),
+	} {
+		residue := filepath.Join(filepath.Dir(self), name)
+		if err := os.Mkdir(residue, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+			t.Skipf("cannot seed residue beside %s: %v", self, err)
+		}
+		t.Cleanup(func() { os.Remove(residue) })
+	}
+	// A hierarchy spelled afresh probes anew, beside the residue.
+	fresh := &nslinux.Hierarchy{Root: "/sys/fs/cgroup", ProcMounts: "/proc/mounts", ProcSelfCgroup: "/proc/self/../self/cgroup"}
+	ok, err := placementSupported(context.Background(), fresh)
+	if err != nil || !ok {
+		t.Fatalf("placement beside residue: %v %v", ok, err)
+	}
+	b, err := selectBounds(context.Background(), Limits{MemoryBytes: 64 << 20}, fresh)
+	if err != nil {
+		t.Fatalf("run cgroup beside residue: %v", err)
+	}
+	defer b.cgroup.Delete()
+	if b.accounting != AccountingCgroups {
+		t.Fatalf("accounting %v, want cgroups", b.accounting)
 	}
 }

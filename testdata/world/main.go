@@ -21,6 +21,50 @@ import (
 )
 
 func main() {
+	// Behavior modes for the bounds tests, selected by the first
+	// argument; everything else reports facts.
+	switch arg(1) {
+	case "hog":
+		// Announce, then touch 256 MiB: under a smaller memory bound
+		// this dies after announcing — a bound that refused the process
+		// its start leaves no announcement.
+		fmt.Println("hog-start")
+		os.Stdout.Sync()
+		var chunks [][]byte
+		for i := 0; i < 256; i++ {
+			c := make([]byte, 1<<20)
+			for j := 0; j < len(c); j += 4096 {
+				c[j] = byte(j)
+			}
+			chunks = append(chunks, c)
+		}
+		fmt.Printf("hogged=%d\n", len(chunks))
+		return
+	case "fork":
+		// Start four idle copies; report how many the process bound
+		// refused.
+		refused := 0
+		var procs []*os.Process
+		for i := 0; i < 4; i++ {
+			p, err := os.StartProcess("/world", []string{"/world", "idle"}, &os.ProcAttr{})
+			if err != nil {
+				refused++
+				continue
+			}
+			procs = append(procs, p)
+		}
+		for _, p := range procs {
+			p.Wait()
+		}
+		fmt.Printf("fork-refused=%d\n", refused)
+		return
+	case "idle":
+		time.Sleep(200 * time.Millisecond)
+		return
+	case "sleep":
+		time.Sleep(5 * time.Minute)
+		return
+	}
 	ro, rw, run := arg(1), arg(2), arg(3)
 
 	cwd, _ := os.Getwd()

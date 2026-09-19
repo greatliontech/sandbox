@@ -44,6 +44,7 @@ const (
 	envInit     = "_SANDBOX_INIT"
 	envInitFD   = "_SANDBOX_INITFD"
 	envStatusFD = "_SANDBOX_STATUSFD"
+	envProbe    = "_SANDBOX_PROBE" // the re-exec is a host probe: exit at once
 
 	statusExecing = "\x00" // the init is about to exec the target
 	statusFailed  = "E"    // followed by the reason
@@ -66,9 +67,14 @@ type initConfig struct {
 	WorkDir  string           `json:"workdir,omitempty"`
 	Binds    []bind           `json:"binds,omitempty"`
 	Rlimits  []nslinux.Rlimit `json:"rlimits,omitempty"`
-	Cmd      string           `json:"cmd"`
-	Args     []string         `json:"args,omitempty"`
-	Env      []string         `json:"env"`
+	// LateRlimits and PidsMax land right before exec: the process-count
+	// bound that fits the payload does not fit the multithreaded init.
+	LateRlimits []nslinux.Rlimit `json:"late_rlimits,omitempty"`
+	PidsMaxFile string           `json:"pids_max_file,omitempty"`
+	PidsMax     uint64           `json:"pids_max,omitempty"`
+	Cmd         string           `json:"cmd"`
+	Args        []string         `json:"args,omitempty"`
+	Env         []string         `json:"env"`
 }
 
 // bind is one path exposed into the world: the host source, the
@@ -83,7 +89,12 @@ type bind struct {
 type linuxSandbox struct {
 	spec   Spec
 	cmd    *exec.Cmd
-	exited bool
+	bounds bounds
+	final  *Stats // the accounting read at Wait, before the cgroup went
+
+	waited  bool // Wait's outcome is memoized: Destroy waits too
+	status  ExitStatus
+	waitErr error
 }
 
 func newSandbox(spec Spec) (Sandbox, error) {
@@ -108,6 +119,20 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	b, err := selectBounds(ctx, s.spec.Limits, nslinux.DefaultHierarchy())
+	if err != nil {
+		return err
+	}
+	// From here every failure path releases the cgroup, which nothing
+	// else would, and leaves no accounting behind for a run that never
+	// happened.
+	fail := func(err error) error {
+		if b.cgroup != nil {
+			_ = b.cgroup.Delete()
+		}
+		s.bounds = bounds{}
+		return err
+	}
 
 	env := s.spec.Env
 	if env == nil {
@@ -119,28 +144,46 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 		}
 	}
 	cfg := initConfig{
-		Hostname: s.spec.Hostname,
-		Root:     root,
-		WorkDir:  s.spec.WorkDir,
-		Binds:    binds,
-		Rlimits:  buildRlimits(s.spec.Limits),
-		Cmd:      s.spec.Exec,
-		Args:     s.spec.Args,
-		Env:      env,
+		Hostname:    s.spec.Hostname,
+		Root:        root,
+		WorkDir:     s.spec.WorkDir,
+		Binds:       binds,
+		Rlimits:     b.rlimits,
+		LateRlimits: b.late,
+		PidsMax:     b.pidsMax,
+		Cmd:         s.spec.Exec,
+		Args:        s.spec.Args,
+		Env:         env,
+	}
+	if b.cgroup != nil && b.pidsMax > 0 {
+		cfg.PidsMaxFile = filepath.Join(b.cgroup.Dir, "pids.max")
 	}
 
 	cfgR, cfgW, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("sandbox: config pipe: %w", err)
+		return fail(fmt.Errorf("sandbox: config pipe: %w", err))
 	}
 	statusR, statusW, err := os.Pipe()
 	if err != nil {
 		cfgR.Close()
 		cfgW.Close()
-		return fmt.Errorf("sandbox: status pipe: %w", err)
+		return fail(fmt.Errorf("sandbox: status pipe: %w", err))
 	}
 
 	cmd := exec.CommandContext(ctx, "/proc/self/exe")
+	// Cancellation kills by the strongest tie the row holds
+	// (docs/specs/sandbox.md, "No orphans"): the cgroup's kill where
+	// the run was placed in one — atomic over the subtree, unescapable
+	// — and the pid namespace's init otherwise, whose death takes the
+	// namespace with it.
+	cmd.Cancel = func() error {
+		if b.cgroup != nil {
+			if err := b.cgroup.Kill(); err != nil {
+				return errors.Join(err, cmd.Process.Kill())
+			}
+		}
+		return cmd.Process.Kill()
+	}
 	cmd.Stdin = s.spec.Stdin
 	cmd.Stdout = s.spec.Stdout
 	cmd.Stderr = s.spec.Stderr
@@ -158,14 +201,37 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 		// /proc/<pid>/setgroups, required for an unprivileged gid_map.
 		Pdeathsig: syscall.SIGKILL, // child dies if the host process dies
 	}
+	// Born bounded: the child is cloned straight into its cgroup, so
+	// no instruction of it runs unaccounted and nothing migrates
+	// later (rootless placement could not migrate across the
+	// delegation boundary anyway).
+	var cgroupFD *os.File
+	if b.cgroup != nil {
+		cgroupFD, err = b.cgroup.OpenFD()
+		if err != nil {
+			cfgR.Close()
+			cfgW.Close()
+			statusR.Close()
+			statusW.Close()
+			return fail(err)
+		}
+		cmd.SysProcAttr.UseCgroupFD = true
+		cmd.SysProcAttr.CgroupFD = int(cgroupFD.Fd())
+	}
 
-	if err := cmd.Start(); err != nil {
+	startErr := cmd.Start()
+	if cgroupFD != nil {
+		runtime.KeepAlive(cgroupFD)
+		cgroupFD.Close()
+	}
+	if startErr != nil {
 		cfgR.Close()
 		cfgW.Close()
 		statusR.Close()
 		statusW.Close()
-		return fmt.Errorf("sandbox: start: %w", err)
+		return fail(fmt.Errorf("sandbox: start: %w", startErr))
 	}
+	s.bounds = b
 	// The child holds its own copies; close ours so EOF can reach us.
 	cfgR.Close()
 	statusW.Close()
@@ -181,14 +247,14 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	if readErr != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		return fmt.Errorf("sandbox: read init status: %w", readErr)
+		return fail(fmt.Errorf("sandbox: read init status: %w", readErr))
 	}
 	if encodeErr != nil {
 		// The init never received a whole config; whatever it reported
 		// is the consequence of this fault, not of the intent.
 		_ = cmd.Process.Kill()
 		waitErr := cmd.Wait()
-		return fmt.Errorf("sandbox: write init config: %v (init: %v)", encodeErr, waitErr)
+		return fail(fmt.Errorf("sandbox: write init config: %v (init: %v)", encodeErr, waitErr))
 	}
 	outcome, reason := classifyStatus(status)
 	if outcome == initExeced {
@@ -200,18 +266,18 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	waitErr := cmd.Wait()
 	switch outcome {
 	case initRefused:
-		return fmt.Errorf("%w: %s", ErrUndeliverable, reason)
+		return fail(fmt.Errorf("%w: %s", ErrUndeliverable, reason))
 	case initDied:
 		// Nothing was written: the init died before composing — a
 		// consumer package init exiting under the re-exec marker, a
 		// kill, or the caller's context ending — and the payload
 		// never ran.
 		if ctx.Err() != nil {
-			return fmt.Errorf("sandbox: the init was ended before exec: %w", ctx.Err())
+			return fail(fmt.Errorf("sandbox: the init was ended before exec: %w", ctx.Err()))
 		}
-		return fmt.Errorf("sandbox: the init died before exec (%v): a package init of this binary must not act under %s", waitErr, envInit)
+		return fail(fmt.Errorf("sandbox: the init died before exec (%v): a package init of this binary must not act under %s", waitErr, envInit))
 	}
-	return fmt.Errorf("sandbox: unreadable init status %q", status)
+	return fail(fmt.Errorf("sandbox: unreadable init status %q", status))
 }
 
 // initOutcome is what the status pipe's content says happened in the
@@ -462,25 +528,68 @@ func checkNativeELF(path string) error {
 	return nil
 }
 
+// Wait reaps the process and reports how it ended, together with the
+// run's final accounting. The accounting is read while the cgroup
+// still exists, then the cgroup is released; a run whose accounting
+// cannot be read is not a run known to have stayed in bounds, and
+// Wait fails. A cgroup that cannot be released yet — the kernel is
+// still offlining it — keeps the exit status: Wait returns it along
+// with the release error, the cgroup stays owned, and Destroy retries
+// the release. Wait is memoized: Destroy waits too, and a second call
+// returns the first's outcome.
 func (s *linuxSandbox) Wait() (ExitStatus, error) {
 	if s.cmd == nil {
 		return ExitStatus{}, errors.New("sandbox: not started")
 	}
+	if s.waited {
+		// A release that failed earlier is retried, not forgotten; the
+		// outcome itself is what it was.
+		if s.bounds.cgroup != nil {
+			if err := s.release(); err != nil {
+				return s.status, errors.Join(s.waitErr, err)
+			}
+		}
+		return s.status, s.waitErr
+	}
+	s.waited = true
 	err := s.cmd.Wait()
-	s.exited = true
-
 	var ee *exec.ExitError
 	if err != nil && !errors.As(err, &ee) {
-		return ExitStatus{}, err
+		s.waitErr = err
+		return ExitStatus{}, errors.Join(err, s.release())
 	}
 	ps := s.cmd.ProcessState
-	es := ExitStatus{Code: ps.ExitCode()}
+	s.status = ExitStatus{Code: ps.ExitCode()}
 	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-		es.Signaled = true
-		es.Signal = ws.Signal()
-		es.Code = 128 + int(ws.Signal())
+		s.status.Signaled = true
+		s.status.Signal = ws.Signal()
+		s.status.Code = 128 + int(ws.Signal())
 	}
-	return es, nil
+	if s.bounds.cgroup != nil {
+		st, serr := s.bounds.stats()
+		if serr != nil {
+			s.waitErr = serr
+		} else {
+			s.final = &st
+		}
+		if rerr := s.release(); rerr != nil {
+			return s.status, errors.Join(s.waitErr, rerr)
+		}
+	}
+	return s.status, s.waitErr
+}
+
+// release deletes the run's cgroup once; idempotent, and a failure
+// leaves the cgroup owned for a later retry.
+func (s *linuxSandbox) release() error {
+	if s.bounds.cgroup == nil {
+		return nil
+	}
+	if err := s.bounds.cgroup.Delete(); err != nil {
+		return err
+	}
+	s.bounds.cgroup = nil
+	return nil
 }
 
 func (s *linuxSandbox) Signal(sig os.Signal) error {
@@ -490,14 +599,33 @@ func (s *linuxSandbox) Signal(sig os.Signal) error {
 	return s.cmd.Process.Signal(sig)
 }
 
+// Destroy tears the sandbox down: kills the process if it still
+// runs — through the cgroup where the run was placed in one — reaps
+// it, and releases the cgroup. Safe after Wait, and Wait afterwards
+// returns the run's outcome.
 func (s *linuxSandbox) Destroy() error {
-	if s.cmd == nil || s.cmd.Process == nil || s.exited {
+	if s.cmd == nil || s.cmd.Process == nil {
 		return nil
 	}
-	return s.cmd.Process.Kill()
+	if !s.waited {
+		if s.bounds.cgroup != nil {
+			_ = s.bounds.cgroup.Kill()
+		}
+		_ = s.cmd.Process.Kill()
+		if _, err := s.Wait(); err != nil {
+			return err
+		}
+		return nil
+	}
+	return s.release()
 }
 
-func (s *linuxSandbox) Stats() (Stats, error) { return Stats{}, nil }
+func (s *linuxSandbox) Stats() (Stats, error) {
+	if s.final != nil {
+		return *s.final, nil
+	}
+	return s.bounds.stats()
+}
 
 // cloneFlags returns the namespace creation flags. Network isolation (a new,
 // empty net namespace) is the default; granting network shares the host's.
@@ -513,26 +641,12 @@ func cloneFlags(network bool) uintptr {
 	return flags
 }
 
-func buildRlimits(l Limits) []nslinux.Rlimit {
-	var out []nslinux.Rlimit
-	if l.MemoryBytes > 0 {
-		out = append(out, nslinux.Rlimit{Resource: unix.RLIMIT_AS, Cur: l.MemoryBytes, Max: l.MemoryBytes})
-	}
-	if l.CPUSeconds > 0 {
-		out = append(out, nslinux.Rlimit{Resource: unix.RLIMIT_CPU, Cur: l.CPUSeconds, Max: l.CPUSeconds})
-	}
-	if l.MaxFiles > 0 {
-		out = append(out, nslinux.Rlimit{Resource: unix.RLIMIT_NOFILE, Cur: l.MaxFiles, Max: l.MaxFiles})
-	}
-	if l.MaxProcs > 0 {
-		out = append(out, nslinux.Rlimit{Resource: unix.RLIMIT_NPROC, Cur: l.MaxProcs, Max: l.MaxProcs})
-	}
-	return out
-}
-
 // --- re-exec'd init side ---
 
 func runInit() {
+	if os.Getenv(envProbe) == "1" {
+		os.Exit(0) // a host probe: the clone succeeded, nothing else is asked
+	}
 	status := statusPipe()
 	report := func(msg string) {
 		if status != nil {
@@ -595,6 +709,15 @@ func composeInit() (*initConfig, error) {
 	}
 	f.Close()
 
+	// The cgroup's pids.max is opened while the host view is still
+	// here and written last (see initConfig.PidsMaxFile).
+	var pidsMax *os.File
+	if cfg.PidsMaxFile != "" {
+		pidsMax, err = os.OpenFile(cfg.PidsMaxFile, os.O_WRONLY, 0)
+		if err != nil {
+			return nil, fmt.Errorf("process bound: %w", err)
+		}
+	}
 	if cfg.Hostname != "" {
 		if err := syscall.Sethostname([]byte(cfg.Hostname)); err != nil {
 			return nil, fmt.Errorf("sethostname: %w", err)
@@ -629,6 +752,17 @@ func composeInit() (*initConfig, error) {
 		return nil, err
 	}
 	if err := nslinux.LoadSeccomp(strongSeccompPolicy(native)); err != nil {
+		return nil, err
+	}
+	// The process-count bound, last: from here to exec nothing forks
+	// or spawns a thread.
+	if pidsMax != nil {
+		if _, err := fmt.Fprintf(pidsMax, "%d", cfg.PidsMax); err != nil {
+			return nil, fmt.Errorf("process bound: %w", err)
+		}
+		pidsMax.Close()
+	}
+	if err := nslinux.SetRlimits(cfg.LateRlimits); err != nil {
 		return nil, err
 	}
 	if cfg.Env == nil {

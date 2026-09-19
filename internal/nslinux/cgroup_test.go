@@ -286,100 +286,6 @@ func TestCreateRefusesExistingName(t *testing.T) {
 	}
 }
 
-func TestAvailable(t *testing.T) {
-	t.Run("self accepts", func(t *testing.T) {
-		h := fixtureHierarchy(t, "/a")
-		subtreeControl(t, filepath.Join(h.Root, "a"), "memory pids\n")
-		ok, err := h.Available([]string{"memory", "pids"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !ok {
-			t.Error("want available")
-		}
-		// The dry-run cgroup must not linger.
-		entries, err := os.ReadDir(filepath.Join(h.Root, "a"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, e := range entries {
-			if e.IsDir() {
-				t.Errorf("dry-run residue: %s", e.Name())
-			}
-		}
-	})
-	t.Run("not mounted", func(t *testing.T) {
-		h := fixtureHierarchy(t, "/a")
-		subtreeControl(t, filepath.Join(h.Root, "a"), "memory\n")
-		if err := os.WriteFile(h.ProcMounts, []byte("proc /proc proc rw 0 0\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		ok, err := h.Available([]string{"memory"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ok {
-			t.Error("want unavailable without a cgroup2 mount")
-		}
-	})
-	t.Run("controllers undeliverable", func(t *testing.T) {
-		// Placement alone is not availability: a tree that accepts
-		// mkdir everywhere but can enable the controllers nowhere
-		// must answer false, so the caller takes the rlimit fallback
-		// instead of failing Start.
-		h := fixtureHierarchy(t, "/a")
-		ok, err := h.Available([]string{"memory"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ok {
-			t.Error("want unavailable when controllers cannot be enabled")
-		}
-	})
-	t.Run("mount table unreadable is an anomaly", func(t *testing.T) {
-		h := fixtureHierarchy(t, "/a")
-		if err := os.Remove(h.ProcMounts); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := h.Available(nil); err == nil {
-			t.Error("want error when the mount table cannot be read")
-		}
-	})
-	t.Run("membership unreadable is an anomaly", func(t *testing.T) {
-		// A mount table showing cgroup2 with an unreadable own
-		// membership is an inconsistency, not "no cgroups here" —
-		// answering (false, nil) would send the caller to rlimit
-		// bounds on a host where cgroups work.
-		h := fixtureHierarchy(t, "/a")
-		subtreeControl(t, filepath.Join(h.Root, "a"), "memory\n")
-		if err := os.Remove(h.ProcSelfCgroup); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := h.Available([]string{"memory"}); err == nil {
-			t.Error("want error when own membership cannot be read")
-		}
-	})
-	t.Run("repeat and concurrent calls never collide", func(t *testing.T) {
-		// Probe names are unique per call, so a residue or a
-		// concurrent probe can never make Create refuse EEXIST and
-		// turn availability falsely false.
-		if probeName() == probeName() {
-			t.Fatal("probe names must be unique per call")
-		}
-		h := fixtureHierarchy(t, "/a")
-		subtreeControl(t, filepath.Join(h.Root, "a"), "memory\n")
-		for range 2 {
-			ok, err := h.Available([]string{"memory"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !ok {
-				t.Error("want available on every call")
-			}
-		}
-	})
-}
-
 func cgroupFixture(t *testing.T, files map[string]string) *Cgroup {
 	t.Helper()
 	dir := t.TempDir()
@@ -631,5 +537,87 @@ func TestDelete(t *testing.T) {
 	}
 	if _, err := os.Stat(cg.Dir); !errors.Is(err, os.ErrNotExist) {
 		t.Error("cgroup dir must be gone")
+	}
+}
+
+// A cgroup created under a delegated cgroup that holds this process —
+// a systemd scope, a container's namespace root — is still bounded:
+// the parent is vacated into a supervisor leaf so its controllers can
+// be enabled, and a second cgroup lands beside the first, never inside
+// the leaf. Runs where the caller's own cgroup is writable, for
+// example under `systemd-run --user --scope -p Delegate=yes`.
+func TestCreateVacatesDelegatedParent(t *testing.T) {
+	h := DefaultHierarchy()
+	if mounted, err := h.Mounted(); err != nil || !mounted {
+		t.Skip("no cgroup2 hierarchy")
+	}
+	probe, err := h.Create("test-vacate-probe-"+strconv.Itoa(os.Getpid()), []string{"memory", "pids"})
+	if errors.Is(err, ErrNoAncestryBase) {
+		if os.Getenv("SANDBOX_TEST_REQUIRE_CGROUPS") != "" {
+			t.Fatal("SANDBOX_TEST_REQUIRE_CGROUPS is set and cgroup placement is unavailable here")
+		}
+		t.Skip("cgroup placement unavailable here")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probe.Delete(); err != nil {
+		t.Fatal(err)
+	}
+	selfBefore, err := h.SelfDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(selfBefore) == supervisorLeaf {
+		selfBefore = filepath.Dir(selfBefore)
+	}
+	first, err := h.Create("test-vacate-"+strconv.Itoa(os.Getpid()), []string{"memory", "pids"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Delete()
+	if err := first.SetMemoryMax(64 << 20); err != nil {
+		t.Fatalf("the created cgroup does not carry the memory controller: %v", err)
+	}
+	// Placement is inside the delegated cgroup this process lived in
+	// — never an ancestor reached by walking past a refusal — and this
+	// process now lives in that cgroup's supervisor leaf.
+	parent := filepath.Dir(first.Dir)
+	if parent != selfBefore {
+		t.Fatalf("cgroup placed under %s, want the delegated cgroup %s itself", parent, selfBefore)
+	}
+	self, err := h.SelfDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if self != filepath.Join(selfBefore, supervisorLeaf) {
+		t.Fatalf("this process lives in %s, want the supervisor leaf of %s", self, selfBefore)
+	}
+	second, err := h.Create("test-vacate-2-"+strconv.Itoa(os.Getpid()), []string{"memory", "pids"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Delete()
+	if filepath.Dir(second.Dir) != parent {
+		t.Fatalf("second cgroup %s not beside the first under %s", second.Dir, parent)
+	}
+}
+
+// A request naming only thread-capable controllers is completed with
+// a domain one, in one write: the fixture's subtree_control receives
+// "+memory +pids" for a pids-only request.
+func TestCreateKeepsParentADomain(t *testing.T) {
+	h := fixtureHierarchy(t, "/self")
+	subtreeControl(t, filepath.Join(h.Root, "self"), "")
+	cg, err := h.Create("child", []string{"pids"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(filepath.Dir(cg.Dir), "cgroup.subtree_control"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "+memory +pids" {
+		t.Fatalf("subtree_control written %q, want one write naming memory first", got)
 	}
 }
