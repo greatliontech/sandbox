@@ -61,7 +61,7 @@ type Recorder struct {
 
 func (r *Recorder) Helper()       {}
 func (r *Recorder) Name() string  { return "observed" }
-func (r *Recorder) Failed() bool  { return r.FailureText != "" || len(r.Errors) > 0 }
+func (r *Recorder) Failed() bool  { return r.failed || r.FailureText != "" || len(r.Errors) > 0 }
 func (r *Recorder) Skipped() bool { return r.skipped || r.SkipText != "" }
 
 func (r *Recorder) Fatalf(format string, args ...any) {

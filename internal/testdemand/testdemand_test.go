@@ -108,3 +108,17 @@ func TestRecorderCoversTB(t *testing.T) {
 		}
 	}
 }
+
+// A message-free failure or skip is reported by the recorder's state,
+// not by a message it did not receive.
+func TestRecorderMessageFreeCalls(t *testing.T) {
+	if r := Observe(func(t testing.TB) { t.FailNow() }); !r.Failed() || r.FailureText != "" || r.Ran {
+		t.Errorf("FailNow: %+v", r)
+	}
+	if r := Observe(func(t testing.TB) { t.Fail() }); !r.Failed() || r.FailureText != "" || len(r.Errors) != 0 || !r.Ran {
+		t.Errorf("Fail: %+v", r)
+	}
+	if r := Observe(func(t testing.TB) { t.SkipNow() }); !r.Skipped() || r.SkipText != "" || r.Failed() || r.Ran {
+		t.Errorf("SkipNow: %+v", r)
+	}
+}
