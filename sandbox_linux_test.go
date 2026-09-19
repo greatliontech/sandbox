@@ -25,6 +25,7 @@ import (
 
 	"github.com/elastic/go-seccomp-bpf/arch"
 	"github.com/greatliontech/sandbox/internal/nslinux"
+	"github.com/greatliontech/sandbox/internal/testdemand"
 	"golang.org/x/sys/unix"
 )
 
@@ -100,14 +101,25 @@ func probeUserns() string {
 	return ""
 }
 
-// startOrSkip starts the sandbox, skipping the test only when the host
-// cannot create user namespaces at all; every Start failure on a
-// capable host is the test's to judge.
+// requireUserns skips a Strong-row arm where the host cannot create
+// user namespaces at all — unless SANDBOX_TEST_REQUIRE_USERNS demands
+// the row, in which case a host that was meant to deliver it fails
+// instead of skipping past every Strong-row arm.
+func requireUserns(t testing.TB) {
+	t.Helper()
+	unavailable := ""
+	if usernsUnavailable != "" {
+		unavailable = "user namespaces are unavailable here: " + usernsUnavailable
+	}
+	testdemand.Live(t, "SANDBOX_TEST_REQUIRE_USERNS", unavailable)
+}
+
+// startOrSkip starts the sandbox where the host can create user
+// namespaces (requireUserns says what happens where it cannot);
+// every Start failure on a capable host is the test's to judge.
 func startOrSkip(t *testing.T, sb Sandbox) {
 	t.Helper()
-	if usernsUnavailable != "" {
-		t.Skipf("user namespaces unavailable in this environment: %s", usernsUnavailable)
-	}
+	requireUserns(t)
 	if err := sb.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -397,9 +409,7 @@ func TestRootRefusesUndeliverable(t *testing.T) {
 // exec itself (an entrypoint present but not executable).
 func TestStartReportsCompositionFailure(t *testing.T) {
 	requireTree(t)
-	if usernsUnavailable != "" {
-		t.Skipf("user namespaces unavailable: %s", usernsUnavailable)
-	}
+	requireUserns(t)
 	sb, err := New(Spec{Exec: "/world", Root: worldTree, Hostname: strings.Repeat("h", 300)})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -522,9 +532,7 @@ func TestStartReturnsAtExec(t *testing.T) {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("no /bin/sh available")
 	}
-	if usernsUnavailable != "" {
-		t.Skipf("user namespaces unavailable: %s", usernsUnavailable)
-	}
+	requireUserns(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sb, err := New(Spec{Exec: "/bin/sh", Args: []string{"-c", "sleep 30"}})
@@ -792,7 +800,9 @@ func TestForeignABIRefused(t *testing.T) {
 	build := exec.Command("go", "build", "-o", filepath.Join(tree, "world32"), "testdata/world/main.go")
 	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOARCH="+foreign)
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Skipf("cannot build the %s probe here: %v\n%s", foreign, err, out)
+		// The toolchain cross-compiles every architecture it ships:
+		// a failure is a broken harness, never a skip.
+		t.Fatalf("cannot build the %s probe here: %v\n%s", foreign, err, out)
 	}
 	for name, spec := range map[string]Spec{
 		"under a root": {Exec: "/world32", Root: tree},
@@ -974,20 +984,71 @@ func TestNetworkGrant(t *testing.T) {
 	}
 }
 
-// requireCgroups says whether this host affords cgroup placement for
-// the memory and pids controllers; where SANDBOX_TEST_REQUIRE_CGROUPS
-// is set the cap fails the test instead of skipping it, so a CI job
-// can demand the live cgroups arms.
-func requireCgroups(t *testing.T) bool {
+// cgroupPlacement says whether this host affords cgroup placement
+// for the memory and pids controllers — a fact an arm that runs
+// either way branches on; a probe that cannot answer is a broken
+// harness.
+func cgroupPlacement(t testing.TB) bool {
 	t.Helper()
 	available, err := placementSupported(context.Background(), nslinux.DefaultHierarchy())
 	if err != nil {
 		t.Fatalf("cgroup probe: %v", err)
 	}
-	if !available && os.Getenv("SANDBOX_TEST_REQUIRE_CGROUPS") != "" {
-		t.Fatal("SANDBOX_TEST_REQUIRE_CGROUPS is set and cgroup placement is unavailable here")
-	}
 	return available
+}
+
+// requireCgroups skips an arm that needs cgroup placement where the
+// host affords none — unless SANDBOX_TEST_REQUIRE_CGROUPS demands the
+// arms, in which case the host fails instead.
+func requireCgroups(t testing.TB) {
+	t.Helper()
+	if !cgroupPlacement(t) {
+		testdemand.Live(t, "SANDBOX_TEST_REQUIRE_CGROUPS", "cgroup placement is unavailable here")
+	}
+}
+
+// The two demands fail where the host cannot deliver and the variable
+// is set, and skip where it is not: the wiring of each surface's
+// unavailability into the one rule, pinned by forcing it.
+func TestDemandsFailWhereTheHostCannot(t *testing.T) {
+	prev := usernsUnavailable
+	usernsUnavailable = "forced for the test"
+	t.Cleanup(func() { usernsUnavailable = prev })
+	t.Setenv("SANDBOX_TEST_REQUIRE_USERNS", "1")
+	if r := testdemand.Observe(func(t testing.TB) { requireUserns(t) }); r.Ran || !strings.Contains(r.FailureText, "SANDBOX_TEST_REQUIRE_USERNS is set and user namespaces are unavailable here: forced for the test") {
+		t.Errorf("a demanded Strong row the host cannot deliver: %+v", r)
+	}
+	t.Setenv("SANDBOX_TEST_REQUIRE_USERNS", "")
+	if r := testdemand.Observe(func(t testing.TB) { requireUserns(t) }); r.Ran || r.FailureText != "" || !strings.Contains(r.SkipText, "forced for the test") {
+		t.Errorf("an undemanded Strong row the host cannot deliver: %+v", r)
+	}
+
+	h := nslinux.DefaultHierarchy()
+	key := placementKey(h)
+	placements.mu.Lock()
+	saved, had := placements.results[key]
+	if placements.results == nil {
+		placements.results = map[string]probeResult[bool]{}
+	}
+	placements.results[key] = probeResult[bool]{value: false}
+	placements.mu.Unlock()
+	t.Cleanup(func() {
+		placements.mu.Lock()
+		defer placements.mu.Unlock()
+		if had {
+			placements.results[key] = saved
+		} else {
+			delete(placements.results, key)
+		}
+	})
+	t.Setenv("SANDBOX_TEST_REQUIRE_CGROUPS", "1")
+	if r := testdemand.Observe(func(t testing.TB) { requireCgroups(t) }); r.Ran || !strings.Contains(r.FailureText, "SANDBOX_TEST_REQUIRE_CGROUPS is set and cgroup placement is unavailable here") {
+		t.Errorf("demanded cgroup placement the host cannot deliver: %+v", r)
+	}
+	t.Setenv("SANDBOX_TEST_REQUIRE_CGROUPS", "")
+	if r := testdemand.Observe(func(t testing.TB) { requireCgroups(t) }); r.Ran || r.FailureText != "" || r.SkipText == "" {
+		t.Errorf("undemanded cgroup placement the host cannot deliver: %+v", r)
+	}
 }
 
 // The memory bound stops a runaway allocator, and the run reports
@@ -997,7 +1058,12 @@ func requireCgroups(t *testing.T) bool {
 // bounded").
 func TestMemoryBound(t *testing.T) {
 	requireTree(t)
-	cgroups := requireCgroups(t)
+	cgroups := cgroupPlacement(t)
+	if !cgroups {
+		// The arm degrades to the rlimits row — unless the counters
+		// were demanded of this host.
+		testdemand.Degrade(t, "SANDBOX_TEST_REQUIRE_CGROUPS", "cgroup placement is unavailable here")
+	}
 	var out bytes.Buffer
 	sb, err := New(Spec{
 		Exec:   "/world",
@@ -1047,7 +1113,7 @@ func TestMemoryBound(t *testing.T) {
 // an allocation past it is refused: a shell whose dd asks for a
 // 64 MiB buffer under a 32 MiB cap fails after starting.
 func TestMemoryBoundRlimitsRefusesAllocation(t *testing.T) {
-	if requireCgroups(t) {
+	if cgroupPlacement(t) {
 		t.Skip("cgroup placement available: the rlimits arm is not selected here")
 	}
 	for _, bin := range []string{"/bin/sh", "/bin/dd"} {
@@ -1085,7 +1151,12 @@ func TestMemoryBoundRlimitsRefusesAllocation(t *testing.T) {
 // current kernels count within the sandbox's user namespace.
 func TestProcessBound(t *testing.T) {
 	requireTree(t)
-	cgroups := requireCgroups(t)
+	cgroups := cgroupPlacement(t)
+	if !cgroups {
+		// The arm degrades to the rlimits row — unless the counters
+		// were demanded of this host.
+		testdemand.Degrade(t, "SANDBOX_TEST_REQUIRE_CGROUPS", "cgroup placement is unavailable here")
+	}
 	var out bytes.Buffer
 	sb, err := New(Spec{
 		Exec:   "/world",
@@ -1137,9 +1208,7 @@ func TestProcessBound(t *testing.T) {
 // it, and releases the cgroup; Wait afterwards returns the outcome.
 func TestDestroyReleasesCgroup(t *testing.T) {
 	requireTree(t)
-	if !requireCgroups(t) {
-		t.Skip("cgroup placement unavailable here")
-	}
+	requireCgroups(t)
 	sb, err := New(Spec{Exec: "/world", Args: []string{"sleep"}, Root: worldTree, Limits: Limits{MaxProcs: 8}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1166,9 +1235,7 @@ func TestDestroyReleasesCgroup(t *testing.T) {
 // behind, no cgroup, and no tier.
 func TestStatsAfterRefusedStart(t *testing.T) {
 	requireTree(t)
-	if !requireCgroups(t) {
-		t.Skip("cgroup placement unavailable here")
-	}
+	requireCgroups(t)
 	tree := worldFixture(t)
 	if err := os.Chmod(filepath.Join(tree, "world"), 0o644); err != nil {
 		t.Fatal(err)
@@ -1223,9 +1290,7 @@ func runCgroups(t *testing.T) []string {
 // the cgroup stays owned across the failed release and Destroy after
 // Wait retries it.
 func TestDestroyRetriesRelease(t *testing.T) {
-	if !requireCgroups(t) {
-		t.Skip("cgroup placement unavailable here")
-	}
+	requireCgroups(t)
 	cg, err := nslinux.DefaultHierarchy().Create(cgroupName("sandbox"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1279,18 +1344,14 @@ func TestAccountingReported(t *testing.T) {
 // cgroup is gone once Wait returns.
 func TestCancelKillsPlacedRun(t *testing.T) {
 	requireTree(t)
-	if !requireCgroups(t) {
-		t.Skip("cgroup placement unavailable here")
-	}
+	requireCgroups(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sb, err := New(Spec{Exec: "/world", Args: []string{"sleep"}, Root: worldTree, Limits: Limits{MaxProcs: 8}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if usernsUnavailable != "" {
-		t.Skipf("user namespaces unavailable: %s", usernsUnavailable)
-	}
+	requireUserns(t)
 	if err := sb.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -1386,9 +1447,7 @@ func TestCgroupNamesSurviveResidue(t *testing.T) {
 		t.Fatal("two cgroup names collide")
 	}
 	requireTree(t)
-	if !requireCgroups(t) {
-		t.Skip("cgroup placement unavailable here")
-	}
+	requireCgroups(t)
 	h := nslinux.DefaultHierarchy()
 	self, err := h.SelfDir()
 	if err != nil {
@@ -1401,7 +1460,7 @@ func TestCgroupNamesSurviveResidue(t *testing.T) {
 	} {
 		residue := filepath.Join(filepath.Dir(self), name)
 		if err := os.Mkdir(residue, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
-			t.Skipf("cannot seed residue beside %s: %v", self, err)
+			t.Fatalf("cannot seed residue beside %s: %v", self, err)
 		}
 		t.Cleanup(func() { os.Remove(residue) })
 	}
@@ -1615,9 +1674,7 @@ func TestMinimalRefusesUndeliverable(t *testing.T) {
 		}
 	}
 	withHost(t, hostFacts{})
-	if usernsUnavailable != "" {
-		t.Skipf("user namespaces unavailable: %s", usernsUnavailable)
-	}
+	requireUserns(t)
 	for _, c := range cases[:2] {
 		sb, err := New(c.spec)
 		if err != nil {
@@ -1790,9 +1847,7 @@ func runInitProtocol(t *testing.T, cfg initConfig, attr *syscall.SysProcAttr) []
 // an unhardened one under that name.
 func TestInitReportsApplicationFailure(t *testing.T) {
 	requireTree(t)
-	if usernsUnavailable != "" {
-		t.Skipf("user namespaces unavailable: %s", usernsUnavailable)
-	}
+	requireUserns(t)
 	tree, err := filepath.EvalSymlinks(worldFixture(t, "grant-ro"))
 	if err != nil {
 		t.Fatal(err)
@@ -1844,9 +1899,7 @@ func TestHostEnvStripsMarkers(t *testing.T) {
 // instead, never by a cgroup that bounds memory alone.
 func TestMemoryBoundClosesSwap(t *testing.T) {
 	requireTree(t)
-	if !requireCgroups(t) {
-		t.Skip("cgroup placement unavailable here")
-	}
+	requireCgroups(t)
 	sb, err := New(Spec{Exec: "/world", Args: []string{"sleep"}, Root: worldTree, Limits: Limits{MemoryBytes: 64 << 20}})
 	if err != nil {
 		t.Fatal(err)
@@ -1918,9 +1971,7 @@ func TestSwapUnbounded(t *testing.T) {
 // on a kernel without swap support and falls to rlimits — the cgroup
 // released — on one that can hold swap.
 func TestSelectBoundsWithoutSwapAccounting(t *testing.T) {
-	if !requireCgroups(t) {
-		t.Skip("cgroup placement unavailable here")
-	}
+	requireCgroups(t)
 	prev := setMemoryMax
 	setMemoryMax = func(c *nslinux.Cgroup, bytes uint64) error {
 		if err := prev(c, bytes); err != nil {

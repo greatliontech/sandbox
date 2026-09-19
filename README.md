@@ -68,5 +68,9 @@ the Linux backend) is a future tier, not yet wired.
 
 ```
 go run ./cmd/spike      # runs /bin/sh in fresh PID/UTS/NET/IPC/user namespaces
-go test ./...           # asserts the isolation (skips if userns is unavailable)
+go test ./...           # asserts the isolation; the Strong row's arms skip where user
+                        # namespaces are unavailable, the cgroup arms where placement is:
+                        # SANDBOX_TEST_REQUIRE_USERNS=1 and SANDBOX_TEST_REQUIRE_CGROUPS=1
+                        # make either a failure instead, as continuous integration runs
+                        # them under systemd-run --user --scope -p Delegate=yes
 ```

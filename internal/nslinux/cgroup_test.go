@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/greatliontech/sandbox/internal/testdemand"
 )
 
 const blockHelperEnv = "NSLINUX_BLOCK_HELPER"
@@ -598,15 +600,16 @@ func TestDelete(t *testing.T) {
 // example under `systemd-run --user --scope -p Delegate=yes`.
 func TestCreateVacatesDelegatedParent(t *testing.T) {
 	h := DefaultHierarchy()
-	if mounted, err := h.Mounted(); err != nil || !mounted {
-		t.Skip("no cgroup2 hierarchy")
+	mounted, err := h.Mounted()
+	if err != nil {
+		t.Fatalf("cgroup2 mount probe: %v", err)
+	}
+	if !mounted {
+		testdemand.Live(t, "SANDBOX_TEST_REQUIRE_CGROUPS", "no cgroup2 hierarchy is mounted here")
 	}
 	probe, err := h.Create("test-vacate-probe-"+strconv.Itoa(os.Getpid()), []string{"memory", "pids"})
 	if errors.Is(err, ErrNoAncestryBase) {
-		if os.Getenv("SANDBOX_TEST_REQUIRE_CGROUPS") != "" {
-			t.Fatal("SANDBOX_TEST_REQUIRE_CGROUPS is set and cgroup placement is unavailable here")
-		}
-		t.Skip("cgroup placement unavailable here")
+		testdemand.Live(t, "SANDBOX_TEST_REQUIRE_CGROUPS", "cgroup placement is unavailable here")
 	}
 	if err != nil {
 		t.Fatal(err)

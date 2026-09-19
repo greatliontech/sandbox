@@ -169,8 +169,12 @@ var placements probeCache[bool]
 // wait behind the cache's lock unobservable; only a consumer init
 // that breaches the re-exec contract stretches it.
 func placementSupported(ctx context.Context, hierarchy *nslinux.Hierarchy) (bool, error) {
-	key := hierarchy.Root + "\x00" + hierarchy.ProcMounts + "\x00" + hierarchy.ProcSelfCgroup
-	return placements.get(ctx, key, func(ctx context.Context) (bool, error) { return probePlacement(ctx, hierarchy) })
+	return placements.get(ctx, placementKey(hierarchy), func(ctx context.Context) (bool, error) { return probePlacement(ctx, hierarchy) })
+}
+
+// placementKey names a hierarchy in the placement cache.
+func placementKey(hierarchy *nslinux.Hierarchy) string {
+	return hierarchy.Root + "\x00" + hierarchy.ProcMounts + "\x00" + hierarchy.ProcSelfCgroup
 }
 
 func probePlacement(ctx context.Context, hierarchy *nslinux.Hierarchy) (bool, error) {
