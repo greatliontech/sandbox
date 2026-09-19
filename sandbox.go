@@ -47,7 +47,12 @@ const (
 	// on it states at least one limit: sandbox never bare-execs.
 	Minimal
 	// OS: an OS-policy security boundary (Landlock, Seatbelt,
-	// AppContainer).
+	// AppContainer). On Linux the row has no namespaces: it presents
+	// no hostname (a stated one is refused, ErrUndeliverable), it
+	// bounds the world to a Root at the tree's host path rather than
+	// at "/", loading static entrypoints only there, and it refuses a
+	// read-only grant without a Root; its kill ties are the Minimal
+	// row's (docs/specs/sandbox.md, the ladder).
 	OS
 	// Strong: a kernel-enforced boundary (Linux namespaces).
 	Strong
@@ -206,8 +211,11 @@ type Spec struct {
 	RuntimeDir string
 
 	// Hostname sets the sandbox's hostname, at most 64 bytes. A row
-	// with no hostname of its own to present (Minimal) refuses a
-	// stated one (ErrUndeliverable); it is never an omission.
+	// with no hostname of its own to present — one without a UTS
+	// namespace: the Linux OS row, Minimal — refuses a stated one
+	// (ErrUndeliverable); it is never an omission. Reach names the
+	// row ahead, so a caller states a hostname only where it can be
+	// presented.
 	Hostname string
 
 	// MinTier is the weakest isolation the caller will accept, None
@@ -308,4 +316,24 @@ func New(spec Spec) (Sandbox, error) {
 		return nil, fmt.Errorf("sandbox: MinTier %d names no tier (%s through %s)", spec.MinTier, None, Strong)
 	}
 	return newSandbox(spec)
+}
+
+// Reach reports the row this host reaches for spec — the one Start
+// would select, by the same probes and the same rule, which reads
+// one thing of the spec, whether the network is granted — as its
+// tier, with what the host lacks for the rows above it in probe
+// order (docs/specs/sandbox.md, "Rows are selected by probes"). The
+// answer is the selection alone: MinTier is not consulted (a row
+// below it is Start's refusal), nothing of the world is resolved,
+// and the tier a run reports is derived from what applied, never
+// from this answer. Reading the selection is the probe: the first
+// read in a process re-execs the calling binary as a probe child,
+// so the Re-exec clause's constraint on a consumer's package init
+// governs this call as it governs Start, and a probe the context
+// ends is an error, not an answer. A caller whose intent depends on
+// the row — a hostname only a row with a UTS namespace presents —
+// states it against the answer. A platform with no backend reports
+// ErrUnsupported.
+func Reach(ctx context.Context, spec Spec) (Isolation, []string, error) {
+	return reach(ctx, spec)
 }

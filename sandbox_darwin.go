@@ -41,3 +41,5 @@ func (s *darwinSandbox) Signal(sig os.Signal) error      { return errNotImplemen
 func (s *darwinSandbox) Destroy() error                  { return nil }
 func (s *darwinSandbox) Stats() (Stats, error)           { return Stats{}, errNotImplemented }
 func (s *darwinSandbox) Tier() Isolation                 { return None }
+
+func reach(context.Context, Spec) (Isolation, []string, error) { return None, nil, errNotImplemented }

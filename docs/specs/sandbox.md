@@ -49,7 +49,17 @@ independent by design.
   all-or-nothing: an application failure fails `Start`, it never
   quietly re-selects a lower row. Downgrade exists only at selection
   time and is visible — the reported tier names the row that ran, and
-  `MinTier` gates it.
+  `MinTier` gates it. The selection is a fact a caller may read
+  before `Start` (`Reach`): the row this host reaches for a spec, by
+  the same probes and the same rule, with what the host lacks for
+  the rows above it — so an intent only some rows deliver (a
+  hostname, which needs a UTS namespace) is stated against the row
+  that will run rather than refused by it. The answer is the
+  selection alone, `MinTier` not consulted — a row below the floor
+  is `Start`'s refusal — and the tier a run reports is still derived
+  from what applied. Reading the selection is the probe: the first
+  read in a process runs the probe, the re-exec included, so the
+  Re-exec clause governs the read as it governs `Start`.
 - **Tier is derived, never asserted.** A backend reports the tier of
   the row whose mechanism set fully applied. There is no other path to
   a tier value.

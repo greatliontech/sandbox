@@ -38,3 +38,5 @@ func (s *windowsSandbox) Signal(sig os.Signal) error      { return errNotImpleme
 func (s *windowsSandbox) Destroy() error                  { return nil }
 func (s *windowsSandbox) Stats() (Stats, error)           { return Stats{}, errNotImplemented }
 func (s *windowsSandbox) Tier() Isolation                 { return None }
+
+func reach(context.Context, Spec) (Isolation, []string, error) { return None, nil, errNotImplemented }

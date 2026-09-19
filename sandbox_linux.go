@@ -116,6 +116,27 @@ func newSandbox(spec Spec) (Sandbox, error) {
 	return &linuxSandbox{spec: spec}, nil
 }
 
+// selection is the one selection site: the host's facts and the row
+// they reach for a spec granting the network or not, with what fails
+// for the rows passed over. Start runs from it; reach reports it.
+func selection(ctx context.Context, network bool) (hostFacts, row, []string, error) {
+	facts, err := hostFactsFor(ctx)
+	if err != nil {
+		return hostFacts{}, row{}, nil, err
+	}
+	r, below := selectRow(facts, network)
+	return facts, r, below, nil
+}
+
+// reach is the selection reported: Reach's answer on Linux.
+func reach(ctx context.Context, spec Spec) (Isolation, []string, error) {
+	_, r, below, err := selection(ctx, spec.Network)
+	if err != nil {
+		return None, nil, err
+	}
+	return r.tier, below, nil
+}
+
 // Tier is the tier of the row that ran: the row is set only when
 // Start has succeeded, so until then the zero row's tier, None, says
 // nothing has applied, and from then on all-or-nothing application
@@ -131,11 +152,10 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	if s.cmd != nil {
 		return errors.New("sandbox: already started")
 	}
-	facts, err := hostFactsFor(ctx)
+	facts, r, below, err := selection(ctx, s.spec.Network)
 	if err != nil {
 		return err
 	}
-	r, below := selectRow(facts, s.spec.Network)
 	if r.tier < s.spec.MinTier {
 		return &TierError{Reached: r.tier, Required: s.spec.MinTier, Lacking: below}
 	}

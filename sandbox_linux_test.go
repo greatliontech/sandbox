@@ -2646,3 +2646,70 @@ func TestOSRowScopesIPC(t *testing.T) {
 		t.Errorf("ABI %d: signal-parent=%q abstract-connect=%q, want %q", abi, f["signal-parent"], f["abstract-connect"], want)
 	}
 }
+
+// Reach is Start's selection read ahead: it names the row this host
+// reaches for a spec and what the host lacks for the rows above, by
+// the same rule, and agrees with the tier a run on that host then
+// reports.
+func TestReachIsStartsSelection(t *testing.T) {
+	requireTree(t)
+	ns := errors.New("namespaces: forced")
+	ll := errors.New("landlock: forced")
+	for _, c := range []struct {
+		name  string
+		facts hostFacts
+		spec  Spec
+		want  Isolation
+		below string
+	}{
+		{"strong", hostFacts{}, Spec{Exec: filepath.Join(worldTree, "world"), Network: true}, Strong, ""},
+		{"os", hostFacts{namespaces: ns, landlockABI: 3}, Spec{Exec: filepath.Join(worldTree, "world"), Network: true}, OS, ns.Error()},
+		{"minimal", hostFacts{namespaces: ns, landlock: ll}, Spec{Exec: filepath.Join(worldTree, "world"), Network: true, Limits: Limits{CPUSeconds: 60}}, Minimal, ns.Error() + "|" + ll.Error()},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			withHost(t, c.facts)
+			// The floor is not consulted: the answer names the row
+			// reached, a floor above it being Start's refusal.
+			c.spec.MinTier = Strong
+			got, below, err := Reach(context.Background(), c.spec)
+			if err != nil || got != c.want || strings.Join(below, "|") != c.below {
+				t.Fatalf("Reach = %v %q %v, want %v lacking %q", got, below, err, c.want, c.below)
+			}
+			c.spec.MinTier = None
+			if c.want == Strong {
+				requireUserns(t)
+			}
+			if c.want == OS {
+				osHost(t)
+			}
+			sb, err := New(c.spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sb.Start(context.Background()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if es, err := sb.Wait(); err != nil || es.Code != 0 {
+				t.Fatalf("Wait: %+v %v", es, err)
+			}
+			if sb.Tier() != got {
+				t.Fatalf("Start ran the %v row where Reach named %v", sb.Tier(), got)
+			}
+		})
+	}
+	// The network intent is the one thing of the spec the selection
+	// reads: a host without a network namespace reaches Strong for a
+	// granted network and the OS row for a denied one.
+	t.Run("network intent", func(t *testing.T) {
+		net := errors.New("network namespace: forced")
+		withHost(t, hostFacts{netns: net, landlockABI: 3})
+		granted, _, err := Reach(context.Background(), Spec{Exec: "/x", Network: true})
+		if err != nil || granted != Strong {
+			t.Fatalf("network granted reaches %v, %v", granted, err)
+		}
+		denied, below, err := Reach(context.Background(), Spec{Exec: "/x"})
+		if err != nil || denied != OS || strings.Join(below, "|") != net.Error() {
+			t.Fatalf("network denied reaches %v lacking %q, %v", denied, below, err)
+		}
+	})
+}

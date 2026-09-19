@@ -23,7 +23,10 @@ builds).
 
 One interface; each platform provides the strongest mechanism it can and
 **reports the tier it actually achieved**, so a caller never gets a silently
-weaker guarantee than it asked for (`Spec.MinTier`).
+weaker guarantee than it asked for (`Spec.MinTier`). The row a host
+reaches for a spec can be read before a run (`Reach`), so an intent
+only some rows deliver — a hostname — is stated against the row
+that will run.
 
 | Tier | Meaning |
 |---|---|
