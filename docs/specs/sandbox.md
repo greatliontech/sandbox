@@ -56,7 +56,11 @@ independent by design.
 - **`MinTier` fails closed before exec.** The selected row's tier is
   known before anything runs; a host whose best row sits below
   `MinTier` refuses with `ErrWeakerThanRequired` without running
-  anything.
+  anything, the refusal carrying as a value the row reached, the tier
+  required, and what the host lacks for the higher rows the backend
+  implements — a caller deciding what to say about the refusal reads
+  the row, never the message. A `MinTier` naming no tier is refused
+  at construction.
 - **`Root` is world-restriction.** A stated `Root` bounds the process's
   world: it may read exactly that tree, the granted paths, and the
   platform's execution substrate (the runtime every process on that

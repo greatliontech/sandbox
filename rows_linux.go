@@ -24,12 +24,11 @@ import (
 // not a row this host satisfies.
 type row struct {
 	tier Isolation
-	name string
 }
 
 var (
-	strongRow  = row{tier: Strong, name: "strong"}
-	minimalRow = row{tier: Minimal, name: "minimal"}
+	strongRow  = row{tier: Strong}
+	minimalRow = row{tier: Minimal}
 )
 
 // groupKill reports whether the row's own kill tie is the process
@@ -50,7 +49,7 @@ func (r row) refuses(spec Spec) error {
 		return nil
 	}
 	undeliverable := func(what string) error {
-		return fmt.Errorf("%w: the %s row %s", ErrUndeliverable, r.name, what)
+		return fmt.Errorf("%w: the %s row %s", ErrUndeliverable, r.tier, what)
 	}
 	switch {
 	case spec.Root != "":

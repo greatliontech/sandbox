@@ -130,7 +130,7 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	}
 	r, below := selectRow(facts, s.spec.Network)
 	if r.tier < s.spec.MinTier {
-		return fmt.Errorf("%w: this host reaches the %s row (%s); %s required", ErrWeakerThanRequired, r.name, strings.Join(below, "; "), s.spec.MinTier)
+		return &TierError{Reached: r.tier, Required: s.spec.MinTier, Lacking: below}
 	}
 	w, err := resolveWorld(s.spec, r)
 	if err != nil {
@@ -161,7 +161,7 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 		}
 	}
 	cfg := initConfig{
-		Row:         r.name,
+		Row:         r.tier.String(),
 		Hostname:    s.spec.Hostname,
 		Root:        w.root,
 		WorkDir:     w.workDir,
@@ -280,7 +280,7 @@ func startFailure(r row, outcome initOutcome, reason string, status []byte, ctxE
 	case initRefused:
 		return fmt.Errorf("%w: %s", ErrUndeliverable, reason)
 	case initApplyFailed:
-		return fmt.Errorf("sandbox: the %s row failed to apply on this host: %s", r.name, reason)
+		return fmt.Errorf("sandbox: the %s row failed to apply on this host: %s", r.tier, reason)
 	case initDied:
 		if ctxErr != nil {
 			return fmt.Errorf("sandbox: the init was ended before exec: %w", ctxErr)
@@ -799,9 +799,9 @@ func composeInit() (*initConfig, error) {
 	}
 	var strong bool
 	switch cfg.Row {
-	case strongRow.name:
+	case Strong.String():
 		strong = true
-	case minimalRow.name:
+	case Minimal.String():
 	default:
 		// The parent names the row it selected; a name this init
 		// does not know is a protocol fault, never a row to run.

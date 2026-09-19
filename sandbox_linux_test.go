@@ -1472,6 +1472,14 @@ func TestMinTierRefusesBeforeExec(t *testing.T) {
 		if !errors.Is(err, ErrWeakerThanRequired) {
 			t.Fatalf("MinTier %v on a minimal host: %v", min, err)
 		}
+		var te *TierError
+		wrapped := fmt.Errorf("a caller's wrap: %w", err)
+		if !errors.As(wrapped, &te) || te.Reached != Minimal || te.Required != min || len(te.Lacking) == 0 || !strings.Contains(te.Lacking[0], "(forced)") {
+			t.Fatalf("the refusal as a value: %+v", te)
+		}
+		if errors.Is(err, ErrUndeliverable) || errors.Is(err, ErrUnsupported) || errors.Unwrap(err) != ErrWeakerThanRequired {
+			t.Fatalf("the refusal's class: %v", err)
+		}
 		for _, want := range []string{"minimal", "(forced)", min.String() + " required"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("refusal %q does not name %q", err, want)
@@ -1790,12 +1798,12 @@ func TestInitReportsApplicationFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	attr := sysProcAttr(strongRow, false)
-	status := runInitProtocol(t, initConfig{Row: strongRow.name, Root: filepath.Join(tree, "etc", "tree-marker"), Cmd: "/world", Env: []string{}}, attr)
+	status := runInitProtocol(t, initConfig{Row: Strong.String(), Root: filepath.Join(tree, "etc", "tree-marker"), Cmd: "/world", Env: []string{}}, attr)
 	if outcome, reason := classifyStatus(status); outcome != initApplyFailed || !strings.Contains(reason, "pivot") {
 		t.Fatalf("a pivot onto a file reported as %v %q (status %q)", outcome, reason, status)
 	}
 	status = runInitProtocol(t, initConfig{
-		Row:   strongRow.name,
+		Row:   Strong.String(),
 		Root:  tree,
 		Binds: []bind{{Source: "/nonexistent-source-for-this-test", Target: filepath.Join(tree, "grant-ro")}},
 		Cmd:   "/world",
@@ -1804,7 +1812,7 @@ func TestInitReportsApplicationFailure(t *testing.T) {
 	if outcome, reason := classifyStatus(status); outcome != initRefused || !strings.Contains(reason, "bind") {
 		t.Fatalf("a vanished bind source reported as %v %q (status %q)", outcome, reason, status)
 	}
-	status = runInitProtocol(t, initConfig{Row: strongRow.name, Root: tree, WorkDir: "/nonexistent-dir", Cmd: "/world", Env: []string{}}, attr)
+	status = runInitProtocol(t, initConfig{Row: Strong.String(), Root: tree, WorkDir: "/nonexistent-dir", Cmd: "/world", Env: []string{}}, attr)
 	if outcome, reason := classifyStatus(status); outcome != initRefused || !strings.Contains(reason, "chdir") {
 		t.Fatalf("an unenterable workdir reported as %v %q (status %q)", outcome, reason, status)
 	}
@@ -1966,5 +1974,15 @@ func TestSelectBoundsWithoutSwapAccounting(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), "releasing the cgroup left unused") {
 		t.Fatalf("a held cgroup on the fallback: %v", err)
+	}
+}
+
+// A MinTier naming no tier is refused at construction, before any
+// probe: the tiers are None through Strong.
+func TestNewRefusesUnknownMinTier(t *testing.T) {
+	for _, min := range []Isolation{Isolation(-1), Strong + 1, Isolation(42)} {
+		if _, err := New(Spec{Exec: "/bin/true", Network: true, Limits: Limits{CPUSeconds: 60}, MinTier: min}); err == nil || !strings.Contains(err.Error(), "names no tier") {
+			t.Errorf("MinTier %d: %v", min, err)
+		}
 	}
 }

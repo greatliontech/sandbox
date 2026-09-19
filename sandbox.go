@@ -24,8 +24,10 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 // Isolation describes the strength of the boundary a sandbox achieved.
@@ -208,10 +210,11 @@ type Spec struct {
 	// stated one (ErrUndeliverable); it is never an omission.
 	Hostname string
 
-	// MinTier is the weakest isolation the caller will accept. Start
-	// fails with ErrWeakerThanRequired, before anything runs, if the
-	// row this host reaches sits below it; the error names what the
-	// host lacks for the higher rows. The zero value, None, accepts any
+	// MinTier is the weakest isolation the caller will accept, None
+	// through Strong: New refuses any other value. Start fails with
+	// ErrWeakerThanRequired — a *TierError carrying the row reached
+	// and what the host lacks — before anything runs, if the row this
+	// host reaches sits below it. The zero value, None, accepts any
 	// row; admitting Minimal is informed consent to its weaker
 	// lifetime ties (Minimal).
 	MinTier Isolation
@@ -223,8 +226,25 @@ type Spec struct {
 
 // ErrWeakerThanRequired is returned by Start when the row this host
 // reaches sits below Spec.MinTier: "this host cannot do it strongly
-// enough". Nothing has run.
+// enough". Nothing has run. The error is a *TierError, so a caller
+// can read the row reached rather than parse the message.
 var ErrWeakerThanRequired = errors.New("sandbox: platform cannot meet required isolation tier")
+
+// TierError is a tier refusal as a value: the tier of the row this
+// host reaches, the tier the Spec required, and what the host lacks
+// for the higher rows this backend implements, in the order its
+// probes found them. It unwraps to ErrWeakerThanRequired.
+type TierError struct {
+	Reached  Isolation
+	Required Isolation
+	Lacking  []string
+}
+
+func (e *TierError) Error() string {
+	return fmt.Sprintf("%v: this host reaches the %s row (%s); %s required", ErrWeakerThanRequired, e.Reached, strings.Join(e.Lacking, "; "), e.Required)
+}
+
+func (e *TierError) Unwrap() error { return ErrWeakerThanRequired }
 
 // ErrUndeliverable is returned by Start when a stated intent cannot be
 // delivered on this host at all — a grant with no target in the tree,
@@ -284,5 +304,8 @@ type Sandbox interface {
 
 // New creates a sandbox for the given spec using the platform backend.
 func New(spec Spec) (Sandbox, error) {
+	if spec.MinTier < None || spec.MinTier > Strong {
+		return nil, fmt.Errorf("sandbox: MinTier %d names no tier (%s through %s)", spec.MinTier, None, Strong)
+	}
 	return newSandbox(spec)
 }
