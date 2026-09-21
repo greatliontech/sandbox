@@ -2713,3 +2713,24 @@ func TestReachIsStartsSelection(t *testing.T) {
 		}
 	})
 }
+
+// The namespace probe reads a refusal beneath a failed clone however
+// wrapped: the sysctl's EPERM and the security module's EACCES both
+// name a host without unprivileged user namespaces; any other errno
+// is a fault of the probe.
+func TestNamespaceRefusal(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want syscall.Errno
+		ok   bool
+	}{
+		{&os.PathError{Op: "fork/exec", Path: "/proc/self/exe", Err: syscall.EPERM}, syscall.EPERM, true},
+		{fmt.Errorf("wrapped: %w", &os.PathError{Op: "fork/exec", Path: "/proc/self/exe", Err: syscall.EACCES}), syscall.EACCES, true},
+		{&os.PathError{Op: "fork/exec", Path: "/proc/self/exe", Err: syscall.ENOENT}, 0, false},
+		{errors.New("no errno"), 0, false},
+	} {
+		if got, ok := refusal(c.err, namespaceRefusals); got != c.want || ok != c.ok {
+			t.Errorf("refusal(%v) = %v %v, want %v %v", c.err, got, ok, c.want, c.ok)
+		}
+	}
+}

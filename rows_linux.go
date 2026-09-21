@@ -186,9 +186,12 @@ func hostFactsFor(ctx context.Context) (hostFacts, error) {
 
 // namespaceRefusals are the kernel's answers that a namespace cannot
 // be created: EPERM where unprivileged user namespaces are disabled
-// or restricted, ENOSPC where a namespace budget is exhausted, EINVAL
-// or ENOSYS where a namespace type is not built.
-var namespaceRefusals = []syscall.Errno{syscall.EPERM, syscall.ENOSPC, syscall.EINVAL, syscall.ENOSYS}
+// or restricted by sysctl, EACCES where a security module restricts
+// them — AppArmor's restriction of unprivileged user namespaces, on
+// by default on Ubuntu 24.04, answers so — ENOSPC where a namespace
+// budget is exhausted, EINVAL or ENOSYS where a namespace type is
+// not built.
+var namespaceRefusals = []syscall.Errno{syscall.EPERM, syscall.EACCES, syscall.ENOSPC, syscall.EINVAL, syscall.ENOSYS}
 
 // probeHost asks the kernel: a clone of this binary into the Strong
 // row's namespaces, the network namespace included; where that is
@@ -230,8 +233,7 @@ func probeReexec(ctx context.Context, attr *syscall.SysProcAttr, refusals ...sys
 	if err == nil {
 		return nil, nil
 	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) && slices.Contains(refusals, errno) {
+	if errno, ok := refusal(err, refusals); ok {
 		return errno, nil
 	}
 	var exit *exec.ExitError
@@ -239,6 +241,16 @@ func probeReexec(ctx context.Context, attr *syscall.SysProcAttr, refusals ...sys
 		return nil, fmt.Errorf("the re-exec'd init died (%v): a package init of this binary must not act under %s", err, envInit)
 	}
 	return nil, err
+}
+
+// refusal is the kernel's refusal an error carries, where it carries
+// one of the given: the errno beneath a failed clone, however wrapped.
+func refusal(err error, refusals []syscall.Errno) (syscall.Errno, bool) {
+	var errno syscall.Errno
+	if errors.As(err, &errno) && slices.Contains(refusals, errno) {
+		return errno, true
+	}
+	return 0, false
 }
 
 // killRun issues the strongest kill the run holds (docs/specs/
