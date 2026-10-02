@@ -62,3 +62,22 @@ jobs:
       - run: go test ./... -count=1 -race -timeout=20m
         env:
           SANDBOX_TEST_REQUIRE_SEATBELT: "1"
+
+  # The windows row on the windows runners: the OS row demanded, so a
+  # runner that makes no AppContainer fails here rather than letting
+  # the container arms skip to the Minimal row.
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1 -race -timeout=20m
+        env:
+          SANDBOX_TEST_REQUIRE_APPCONTAINER: "1"
