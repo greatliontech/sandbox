@@ -111,8 +111,8 @@ independent by design.
   must be free of side effects that the marker environment would make
   wrong, and an init child that dies before exec is reported by
   `Start` as such — never as the payload's own exit.
-- **Bounded means bounded.** `Limits` map to the strongest native
-  accounting the selected row admits (cgroups where a delegated
+- **Bounded means bounded.** `Limits` map to the strongest accounting
+  the selected row admits on its platform (cgroups where a delegated
   subtree accepts both placement and the controllers the limits
   need — a subtree can accept a child yet refuse controller
   delegation, and a cgroup that cannot enforce the stated limits is
@@ -120,7 +120,27 @@ independent by design.
   whole of what the process may hold: under cgroups swap is closed to
   the run, never a second allowance past the bound — and a kernel
   that accounts no swap yet can hold it cannot close it, so such a
-  host accounts the memory bound by rlimits instead. Which accounting
+  host accounts the memory bound by rlimits instead. Where the
+  platform affords an unprivileged process no native bound at all —
+  darwin, whose kernel refuses every memory rlimit (`RLIMIT_AS`,
+  `RLIMIT_DATA`, `RLIMIT_RSS`) and keeps its per-task memory limit
+  for root, which delivers the CPU limit as `SIGXCPU`, a signal a
+  payload may handle, and whose process limit counts every process
+  of the user — the row bounds by a watchdog: the kernel's own
+  per-process readings (the resident size, the CPU time, the thread
+  count), sampled over the run's process group at the stated
+  interval (`WatchdogInterval`), the group killed at the bound — the
+  memory bound over the group's resident sizes summed, the CPU bound
+  over each process's own time as `RLIMIT_CPU` reads it, the process
+  bound over the threads of the group's processes (every process
+  has at least one); a member the kernel will not show the sandbox
+  — one that gained privilege — is a bound the watchdog cannot
+  hold, which ends the run. Such a bound is
+  exceeded by at most what the group can take in one interval, and
+  it reaches what the group holds: a process that leaves the group
+  (`setsid`) leaves the bounds, the same escape that leaves the
+  kill tie, stated under "No orphans"; the accounting reported names
+  the watchdog. Which accounting
   enforced the bounds is a reported fact of the run, so a
   bound-exceeded death is attributable.
 - **The wall clock belongs to the caller.** `Start`'s context governs
@@ -142,7 +162,11 @@ independent by design.
   parent-death tie at all — the sandboxed process itself survives a
   caller `SIGKILL` there. Both strengths are stated, never silent;
   admitting rows with the weaker ties through `MinTier` is informed
-  consent.
+  consent. On darwin the run's end is a third trigger: when the
+  payload exits — before it is reaped, so a descendant holding its
+  pipes cannot hold the caller's Wait open — the group's remnants
+  are killed, there being no namespace to take a descendant with
+  it.
 
 ## Mechanism ladder
 
@@ -150,9 +174,9 @@ independent by design.
 |---|---|---|
 | linux, unprivileged user namespaces available | namespaces (user, mount, pid, uts, ipc; net unless granted), pivoted read-only root repeating locked mount flags, capability drop, seccomp holding for every syscall ABI the kernel exposes (a foreign-ABI call is killed, never let through unfiltered), `no_new_privs`, cgroup-or-rlimit bounds | `Strong` |
 | linux, user namespaces unavailable, Landlock available | Landlock filesystem allowlist over the world at its host paths (the caller's whole world where no `Root` is stated), seccomp network denial at the socket (Landlock ABI 4's TCP restrictions are supplementary, never the sole arm — UDP and raw sockets stay open without seccomp; an ABI that also multiplexes the socket calls through `socketcall` refuses that route whole, the local family reached by the direct calls), Landlock's IPC scoping where the kernel has it (ABI 6), `no_new_privs`, cgroup-or-rlimit bounds; static entrypoints only under a `Root` — an ELF the kernel loads whole, native, with no interpreter; a script, a dynamically linked executable, or a file the check cannot read is refused | `OS` |
-| darwin, Seatbelt available | Seatbelt profile (filesystem allowlist, network denial), rlimit bounds | `OS` |
+| darwin, Seatbelt available (`sandbox-exec` applies a profile) | Seatbelt profile (filesystem allowlist, network denial at the socket — the platform's mach services stay reachable, name resolution among them, as a row without namespaces leaves IPC; a read-only grant refused without a `Root`, the profile over the whole world having no rule a renamed ancestor cannot carry a grant out of), rlimit bounds with the watchdog behind them | `OS` |
 | windows, AppContainer available | AppContainer boundary, Job Object bounds | `OS` |
-| any platform where no security boundary is available but resource bounds are | resource bounds (rlimits, Job Object) | `Minimal` |
+| any platform where no security boundary is available but resource bounds are | resource bounds (rlimits, Job Object, darwin's watchdog) | `Minimal` |
 | anything else | refused (`ErrUnsupported`) | — |
 
 The ladder is normative: a backend selects the highest row its host's
@@ -165,14 +189,16 @@ windows — because the security
 boundary is what the tier grades; the accounting that enforced the
 bounds is a reported fact of the run, so coarser bounds are
 attributable, never silent. A `Minimal` selection accordingly
-guarantees exactly this much: kernel-enforced bounds exist and their
-accounting is reported — it grades nothing else, so it refuses every
+guarantees exactly this much: bounds exist by the strongest
+accounting the platform affords, kernel-enforced where it has one,
+and their accounting is reported — it grades nothing else, so it refuses every
 intent only a security boundary delivers (`Root`, `Hostname`, a denied
 network, a read-only grant), and a `Spec` stating no `Limits` leaves
 it nothing to apply and is refused too (`ErrUndeliverable`). A host
 reaching only `Minimal` runs only if `MinTier` admits it; a platform
 matching no row refuses with `ErrUnsupported` rather than running
-unsandboxed — on Linux `Minimal` is always satisfied, rlimits
-existing on every kernel, so a Linux host never refuses that way.
+unsandboxed — on Linux and darwin `Minimal` is always satisfied,
+rlimits existing on every kernel and the watchdog on every darwin,
+so neither host ever refuses that way.
 Tier `None` stays in the vocabulary as the floor `MinTier` can state
 — "accept anything" — but no row reports it: sandbox never bare-execs.

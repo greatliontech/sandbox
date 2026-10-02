@@ -28,6 +28,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 )
 
 // Isolation describes the strength of the boundary a sandbox achieved.
@@ -37,22 +38,27 @@ const (
 	// None: the floor MinTier can state — accept any row. No backend
 	// reports it; sandbox never bare-execs.
 	None Isolation = iota
-	// Minimal: kernel-enforced resource bounds with their accounting
-	// reported, and no security boundary: the world is the caller's
-	// own, so a stated Root, Hostname, read-only grant, or denied
-	// network is refused (ErrUndeliverable), and the lifetime ties are
-	// the weakest — cancellation kills the run's process group, which
-	// a payload can leave with setsid, and caller death reaches the
-	// direct child alone (docs/specs/sandbox.md, "No orphans"). A run
-	// on it states at least one limit: sandbox never bare-execs.
+	// Minimal: resource bounds by the strongest accounting the
+	// platform affords — the kernel's where it has one, darwin's
+	// watchdog where it has none — with their accounting reported,
+	// and no security boundary: the world is the caller's own, so a
+	// stated Root, Hostname, read-only grant, or denied network is
+	// refused (ErrUndeliverable), and the lifetime ties are the
+	// weakest — cancellation kills the run's process group, which a
+	// payload can leave with setsid, and caller death reaches the
+	// direct child alone on Linux and nothing on darwin
+	// (docs/specs/sandbox.md, "No orphans"). A run on it states at
+	// least one limit: sandbox never bare-execs.
 	Minimal
 	// OS: an OS-policy security boundary (Landlock, Seatbelt,
-	// AppContainer). On Linux the row has no namespaces: it presents
-	// no hostname (a stated one is refused, ErrUndeliverable), it
-	// bounds the world to a Root at the tree's host path rather than
-	// at "/", loading static entrypoints only there, and it refuses a
-	// read-only grant without a Root; its kill ties are the Minimal
-	// row's (docs/specs/sandbox.md, the ladder).
+	// AppContainer). On Linux and darwin the row has no namespaces:
+	// it presents no hostname (a stated one is refused,
+	// ErrUndeliverable), it bounds the world to a Root at the tree's
+	// host path rather than at "/" (on Linux loading static
+	// entrypoints only there; on darwin a Root is refused until its
+	// world is delivered), and it refuses a read-only grant without
+	// a Root; its kill ties are the Minimal row's (docs/specs/
+	// sandbox.md, the ladder).
 	OS
 	// Strong: a kernel-enforced boundary (Linux namespaces).
 	Strong
@@ -116,17 +122,28 @@ type Limits struct {
 	// under rlimits, which caps address space rather than use — a
 	// runtime that reserves more address space than the cap (a Go
 	// binary reserves well over 64 MiB) is refused at its very start,
-	// loudly. Which of the two enforced it is reported
+	// loudly; on darwin, whose kernel refuses every memory rlimit to
+	// an unprivileged process, the resident size of the run's
+	// process group sampled by the watchdog, the group killed past
+	// the bound. Which of them enforced it is reported
 	// (Stats.Accounting).
 	MemoryBytes uint64
-	CPUSeconds  uint64 // CPU time cap (rlimits on every row)
-	MaxFiles    uint64 // open file descriptors (rlimits on every row)
+	// CPUSeconds caps CPU time: RLIMIT_CPU on every row, which Linux
+	// ends with a kill at the limit and darwin with SIGXCPU, a signal
+	// a payload may handle — so on darwin the watchdog's sample of
+	// the group's CPU time kills behind it.
+	CPUSeconds uint64
+	MaxFiles   uint64 // open file descriptors (rlimits on every row)
 	// MaxProcs caps the process and thread count: pids.max of the
 	// sandbox's own cgroup under cgroups; RLIMIT_NPROC under rlimits,
 	// which current kernels count within the sandbox's user namespace
 	// (older ones over every task of the user, the host's included, so
-	// a value below that count refuses the payload its first thread).
-	// Which of the two enforced it is reported (Stats.Accounting).
+	// a value below that count refuses the payload its first thread);
+	// on darwin, whose process rlimit counts every process of the
+	// user, the threads of the run's processes summed by the
+	// watchdog (every process has at least one), the run killed past
+	// the bound. Which of them enforced it is
+	// reported (Stats.Accounting).
 	MaxProcs uint64
 }
 
@@ -144,7 +161,20 @@ const (
 	AccountingCgroups
 	// AccountingJobObject: a Windows Job Object.
 	AccountingJobObject
+	// AccountingWatchdog: the sandbox's own sampling of the kernel's
+	// per-process readings over the run's process group, the group
+	// killed at the bound — darwin's memory bound, whose kernel
+	// refuses every memory rlimit to an unprivileged process; the
+	// bound is exceeded by at most what the group can take in one
+	// sampling interval (docs/specs/sandbox.md, "Bounded means
+	// bounded").
+	AccountingWatchdog
 )
+
+// WatchdogInterval is the interval at which the watchdog samples the
+// run (AccountingWatchdog): a bound it holds is exceeded by at most
+// what the run can take in one interval.
+const WatchdogInterval = 10 * time.Millisecond
 
 func (a Accounting) String() string {
 	switch a {
@@ -156,6 +186,8 @@ func (a Accounting) String() string {
 		return "cgroups"
 	case AccountingJobObject:
 		return "job-object"
+	case AccountingWatchdog:
+		return "watchdog"
 	default:
 		return "unknown"
 	}
@@ -270,13 +302,15 @@ type ExitStatus struct {
 
 // Stats are the run's accounting facts: which mechanism enforced the
 // memory and process-count limits — the CPU-time and open-files
-// limits are rlimits on every row, so a CPU-time death is always
-// RLIMIT_CPU's — and, where the mechanism keeps counters (cgroups),
-// the peak memory use and the bound enforcements that happened:
-// processes the memory bound killed, forks the process bound
-// refused. Zero counters under rlimits mean the mechanism does not
-// count, not that nothing happened; a zero peak under cgroups on a
-// kernel before 5.19 means the kernel keeps no peak.
+// limits are rlimits on every row, so a CPU-time death is
+// RLIMIT_CPU's, or on darwin the watchdog's behind it — and, where
+// the mechanism keeps counters (cgroups, the watchdog), the peak
+// memory use and the bound enforcements that happened: processes the
+// memory bound killed (the watchdog's one kill of the group), forks
+// the process bound refused. Zero counters under rlimits mean the
+// mechanism does not count, not that nothing happened; a zero peak
+// under cgroups on a kernel before 5.19 means the kernel keeps no
+// peak.
 type Stats struct {
 	Accounting      Accounting
 	MemoryPeakBytes uint64

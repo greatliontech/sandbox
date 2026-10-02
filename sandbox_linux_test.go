@@ -451,34 +451,6 @@ func TestStartReportsCompositionFailure(t *testing.T) {
 	}
 }
 
-// The status pipe's shapes classify apart: nothing written is a death
-// before exec, an intent reason before the sentinel is a refusal, an
-// application reason before it is the row failing to apply, the
-// sentinel alone is the target running, a reason after the sentinel
-// is a failed exec; anything else is garbled.
-func TestClassifyStatus(t *testing.T) {
-	cases := []struct {
-		in     string
-		want   initOutcome
-		reason string
-	}{
-		{"", initDied, ""},
-		{statusExecing, initExeced, ""},
-		{statusFailed + "chdir /x: no such file or directory\n", initRefused, "chdir /x: no such file or directory"},
-		{statusApplyFailed + "pivot_root: EPERM\n", initApplyFailed, "pivot_root: EPERM"},
-		{statusExecing + statusApplyFailed + "x", initGarbled, ""},
-		{statusExecing + statusFailed + "exec /x: permission denied", initRefused, "exec /x: permission denied"},
-		{"junk", initGarbled, ""},
-		{statusExecing + statusExecing, initGarbled, ""},
-	}
-	for _, c := range cases {
-		got, reason := classifyStatus([]byte(c.in))
-		if got != c.want || reason != c.reason {
-			t.Errorf("classifyStatus(%q) = %v %q, want %v %q", c.in, got, reason, c.want, c.reason)
-		}
-	}
-}
-
 // Without a Root the world is the host's, in a private mount
 // namespace, with the host environment inherited; a read-only grant
 // is still delivered throughout its subtree — its submounts included
@@ -1855,7 +1827,7 @@ func TestStartFailureClasses(t *testing.T) {
 		{initGarbled, "", nil, nil, []error{ErrUndeliverable}, "unreadable init status"},
 	}
 	for _, c := range cases {
-		err := startFailure(strongRow, c.outcome, c.reason, []byte("junk"), c.ctxErr, errors.New("exit status 127"))
+		err := startFailure(strongRow.tier, c.outcome, c.reason, []byte("junk"), c.ctxErr, errors.New("exit status 127"))
 		if c.is != nil && !errors.Is(err, c.is) {
 			t.Errorf("%v: %v is not %v", c.outcome, err, c.is)
 		}
@@ -2733,4 +2705,13 @@ func TestNamespaceRefusal(t *testing.T) {
 			t.Errorf("refusal(%v) = %v %v, want %v %v", c.err, got, ok, c.want, c.ok)
 		}
 	}
+}
+
+// overrideMinimal makes every selection reach the Minimal row, the
+// probes' answers set aside: the shared tests' name for it.
+func overrideMinimal(t *testing.T) {
+	t.Helper()
+	refused := errors.New("set aside for the test")
+	hostOverride = &hostFacts{namespaces: refused, netns: refused, seccompKill: refused, landlock: refused}
+	t.Cleanup(func() { hostOverride = nil })
 }

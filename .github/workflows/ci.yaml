@@ -43,3 +43,22 @@ jobs:
       # create user namespaces or delegate fails here, loudly.
       - name: Live Strong-row and cgroup arms under a delegated scope
         run: systemd-run --user --scope -q -p Delegate=yes env SANDBOX_TEST_REQUIRE_USERNS=1 SANDBOX_TEST_REQUIRE_CGROUPS=1 SANDBOX_TEST_REQUIRE_LANDLOCK=1 go test ./... -count=1 -race -timeout=20m
+
+  # The darwin row on the macOS runners: the OS row demanded, so a
+  # runner whose sandbox-exec cannot apply a profile fails here
+  # rather than letting the Seatbelt arms skip to the Minimal row.
+  test-darwin:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1 -race -timeout=20m
+        env:
+          SANDBOX_TEST_REQUIRE_SEATBELT: "1"
