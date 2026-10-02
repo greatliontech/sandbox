@@ -33,8 +33,15 @@ var _ = func() int {
 	return 0
 }()
 
+// initDeathMarker names the marker beside this binary: a place the
+// init child, whose environment is the markers alone (no TMPDIR),
+// spells exactly as the test process does.
 func initDeathMarker(pid int) string {
-	return filepath.Join(os.TempDir(), "sandbox-init-death-"+strconv.Itoa(pid))
+	exe, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	return filepath.Join(filepath.Dir(exe), "sandbox-init-death-"+strconv.Itoa(pid))
 }
 
 // TestInitDeathReported pins the Re-exec clause's report on every
