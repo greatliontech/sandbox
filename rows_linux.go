@@ -67,23 +67,7 @@ func (r row) refuses(spec Spec) error {
 	if r.tier != Minimal {
 		return nil
 	}
-	switch {
-	case spec.Root != "":
-		return undeliverable("cannot restrict the world to a Root")
-	case spec.Hostname != "":
-		return undeliverable("presents no hostname")
-	case !spec.Network:
-		return undeliverable("cannot deny the network: Network must be granted to run on it")
-	}
-	for _, g := range spec.PathGrants {
-		if g.Access == ReadOnly {
-			return undeliverable(fmt.Sprintf("cannot make grant %s read-only", g.Path))
-		}
-	}
-	if spec.Limits == (Limits{}) {
-		return undeliverable("applies bounds only, and none were stated: sandbox never bare-execs")
-	}
-	return nil
+	return minimalRefuses(spec, undeliverable)
 }
 
 // hostFacts are the probed facts row selection reads. Each holds the

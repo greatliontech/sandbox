@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -173,17 +172,6 @@ func tokenDword(class uint32) string {
 	return strconv.Itoa(int(v))
 }
 
-// facts parses the payload's "key=value" lines.
-func facts(out string) map[string]string {
-	m := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if k, v, ok := strings.Cut(strings.TrimSpace(line), "="); ok {
-			m[k] = v
-		}
-	}
-	return m
-}
-
 // payload is a spec running this binary as the payload in the named
 // mode, its output captured, the network granted and a bound stated
 // so that every row runs it.
@@ -214,22 +202,6 @@ func overrideMinimal(t testing.TB) {
 	t.Helper()
 	hostOverride = &hostFacts{appContainer: errors.New("forced")}
 	t.Cleanup(func() { hostOverride = nil })
-}
-
-func run(t *testing.T, spec Spec) (Sandbox, ExitStatus) {
-	t.Helper()
-	sb, err := New(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := sb.Start(context.Background()); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	st, err := sb.Wait()
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	return sb, st
 }
 
 // TestReachIsStartsSelection pins Reach as Start's selection: the OS
@@ -779,8 +751,6 @@ func TestMinTierRefusesBeforeExec(t *testing.T) {
 		t.Fatalf("something ran: %q", out.String())
 	}
 }
-
-var _ = syscall.EscapeArg
 
 // rootTree lays out a tree for a Root: this binary as the payload
 // and as a sibling, a marker to read, directories to grant.

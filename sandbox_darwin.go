@@ -127,17 +127,11 @@ func resolveWorld(spec Spec, r row) (world, error) {
 	undeliverable := func(format string, a ...any) (world, error) {
 		return world{}, fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
 	}
-	if err := checkSpelling(spec); err != nil {
-		return world{}, err
-	}
-	if err := r.refuses(spec); err != nil {
-		return world{}, err
-	}
 	checkEntry := executableFile
 	if spec.Root != "" {
 		checkEntry = checkMachO
 	}
-	t, err := resolveTree(spec, checkEntry)
+	t, err := resolveWorldTree(spec, r, checkEntry)
 	if err != nil {
 		return world{}, err
 	}

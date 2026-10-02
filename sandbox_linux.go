@@ -217,12 +217,6 @@ type world struct {
 // cannot do what was asked. landlockABI is the ABI the OS row's
 // rights are spelled for.
 func resolveWorld(spec Spec, r row, landlockABI int) (world, error) {
-	if err := checkSpelling(spec); err != nil {
-		return world{}, err
-	}
-	if err := r.refuses(spec); err != nil {
-		return world{}, err
-	}
 	// The native-ABI rule is the Strong and OS rows': their guard
 	// kills a foreign-ABI call, so a foreign entrypoint could not run
 	// there; under a Root the OS row loads static entrypoints only.
@@ -233,7 +227,7 @@ func resolveWorld(spec Spec, r row, landlockABI int) (world, error) {
 	case OS:
 		checkEntry = func(p string) error { return checkELF(p, spec.Root != "") }
 	}
-	t, err := resolveTree(spec, checkEntry)
+	t, err := resolveWorldTree(spec, r, checkEntry)
 	if err != nil {
 		return world{}, err
 	}
