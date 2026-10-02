@@ -223,3 +223,51 @@ func (g group) kill() error {
 func sysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setpgid: true}
 }
+
+// exitWatch ends the group when its leader exits: a kqueue event on
+// the leader's exit, which fires before the reap, so the zombie still
+// pins the pid and the kill lands on the run's own group — and
+// before the reap frees the pipes, so a descendant holding them
+// cannot hold Wait open.
+type exitWatch struct {
+	kq   int
+	done chan struct{}
+}
+
+func watchExit(g group) (*exitWatch, error) {
+	kq, err := unix.Kqueue()
+	if err != nil {
+		return nil, fmt.Errorf("sandbox: exit watch: %w", err)
+	}
+	ev := unix.Kevent_t{Ident: uint64(g.pgid), Filter: unix.EVFILT_PROC, Flags: unix.EV_ADD | unix.EV_ONESHOT, Fflags: unix.NOTE_EXIT}
+	if _, err := unix.Kevent(kq, []unix.Kevent_t{ev}, nil, nil); err != nil {
+		unix.Close(kq)
+		return nil, fmt.Errorf("sandbox: exit watch: %w", err)
+	}
+	w := &exitWatch{kq: kq, done: make(chan struct{})}
+	go func() {
+		defer close(w.done)
+		var out [1]unix.Kevent_t
+		for {
+			n, err := unix.Kevent(w.kq, nil, out[:], nil)
+			if err == unix.EINTR {
+				continue
+			}
+			if err != nil || n == 0 {
+				return // the watch closed
+			}
+			_ = g.kill()
+			return
+		}
+	}()
+	return w, nil
+}
+
+// halt closes the watch and waits for its goroutine.
+func (w *exitWatch) halt() {
+	if w == nil {
+		return
+	}
+	unix.Close(w.kq)
+	<-w.done
+}

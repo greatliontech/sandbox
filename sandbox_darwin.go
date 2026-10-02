@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -33,7 +34,8 @@ type darwinSandbox struct {
 	spec   Spec
 	row    row // the row that ran; meaningful once cmd is set
 	cmd    *exec.Cmd
-	group  group
+	group  atomic.Pointer[group] // set once read, after the clone; nil until then
+	exited *exitWatch
 	bounds bounds
 
 	waited  bool // Wait's outcome is memoized: Destroy waits too
@@ -230,8 +232,18 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	}
 	cmd := exec.CommandContext(ctx, self)
 	// Cancellation kills by the strongest tie the run holds: the
-	// group, by its identity (group.kill).
-	cmd.Cancel = func() error { return s.group.kill() }
+	// group, by its identity (group.kill) — or, before the identity
+	// is read, by the leader's pid alone, which the unreaped init
+	// still holds (os/exec stops watching the context at Wait).
+	cmd.Cancel = func() error {
+		if g := s.group.Load(); g != nil {
+			return g.kill()
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		return nil
+	}
 	cmd.SysProcAttr = sysProcAttr()
 	cmd.Env = []string{envInit + "=1", envInitFD + "=3", envStatusFD + "=4"}
 	cmd.ExtraFiles = []*os.File{cfgR, statusW}
@@ -249,10 +261,13 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	// The child holds its own copies; close ours so EOF can reach us.
 	cfgR.Close()
 	statusW.Close()
-	// The group's identity is read while the init is certainly alive:
-	// it blocks on the config until written.
+	// The group's identity is read, and the leader's exit watched,
+	// while the init is certainly alive: it blocks on the config until
+	// written.
 	g, groupErr := groupOf(cmd.Process)
-	s.group = g
+	if groupErr == nil {
+		s.group.Store(&g)
+	}
 	encodeErr := json.NewEncoder(cfgW).Encode(&cfg)
 	cfgW.Close()
 	status, readErr := io.ReadAll(statusR)
@@ -274,6 +289,13 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	outcome, reason := classifyStatus(status)
 	if outcome == initExeced {
 		s.cmd, s.row, s.bounds = cmd, r, b
+		exited, err := watchExit(g)
+		if err != nil {
+			_ = g.kill()
+			cmd.Wait()
+			return err
+		}
+		s.exited = exited
 		if b.watch != nil {
 			b.watch.start(g)
 		}
@@ -285,12 +307,14 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 
 // Wait reaps the payload and reports how it ended — a signal death
 // with the code 128 plus the signal, as the Linux rows report it —
-// the watchdog halted first so its last sample is in the account,
-// and the group's remnants ended: a descendant the payload left
-// behind has no namespace to die with here and is not left to run
-// on. A bound the watchdog could not hold is Wait's error. Wait is
-// memoized: Destroy waits too, and a second call returns the first's
-// outcome.
+// the watchdog halted first so its last sample is in the account.
+// The group's remnants are ended at the payload's exit by the exit
+// watch (watchExit), before the reap, so a descendant holding the
+// payload's pipes cannot hold Wait open; a descendant the payload
+// left behind has no namespace to die with here and is not left to
+// run on. A bound the watchdog could not hold is Wait's error. Wait
+// is memoized: Destroy waits too, and a second call returns the
+// first's outcome.
 func (s *darwinSandbox) Wait() (ExitStatus, error) {
 	if s.cmd == nil {
 		return ExitStatus{}, errors.New("sandbox: not started")
@@ -300,10 +324,11 @@ func (s *darwinSandbox) Wait() (ExitStatus, error) {
 	}
 	s.waited = true
 	err := s.cmd.Wait()
+	s.exited.halt()
 	if s.bounds.watch != nil {
 		s.bounds.watch.halt()
 	}
-	_ = s.group.kill()
+	_ = s.group.Load().kill()
 	var exit *exec.ExitError
 	switch {
 	case err == nil:
@@ -341,7 +366,7 @@ func (s *darwinSandbox) Destroy() error {
 		return nil
 	}
 	if !s.waited {
-		_ = s.group.kill()
+		_ = s.group.Load().kill()
 	}
 	_, err := s.Wait()
 	return err
@@ -416,6 +441,12 @@ func composeInit() (execPlan, error) {
 // (execPayload).
 func runStage() {
 	status := statusPipe()
+	if status != nil {
+		if _, err := status.WriteString(statusStaged); err != nil {
+			fmt.Fprintln(os.Stderr, "sandbox-init: status pipe:", err)
+			os.Exit(127)
+		}
+	}
 	var plan execPlan
 	if err := json.Unmarshal([]byte(os.Getenv(envPlan)), &plan); err != nil {
 		msg := statusApplyFailed + fmt.Sprintf("decode the second stage's plan: %v", err)

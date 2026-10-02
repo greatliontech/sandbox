@@ -49,6 +49,7 @@ const (
 	statusFailed      = "E"    // an intent the host would not deliver; the reason follows
 	statusApplyFailed = "A"    // the row's mechanism failed to apply; the reason follows
 	statusApplying    = "S"    // the init handed the run to the row's applier (a staged plan)
+	statusStaged      = "T"    // the second stage runs under the applied mechanism
 )
 
 func init() {
@@ -117,7 +118,14 @@ func runInit() {
 		}
 		argv := append([]string{plan.Cmd}, plan.Args...)
 		err = syscall.Exec(plan.Cmd, argv, plan.Env)
-		report(statusApplyFailed + fmt.Sprintf("exec %s: %v", plan.Cmd, err))
+		// An argument list the platform refuses is the intent's size
+		// (the payload's arguments and environment ride the
+		// applier's), not the row failing.
+		if errors.Is(err, syscall.E2BIG) {
+			report(statusFailed + fmt.Sprintf("exec %s: %v", plan.Cmd, err))
+		} else {
+			report(statusApplyFailed + fmt.Sprintf("exec %s: %v", plan.Cmd, err))
+		}
 		os.Exit(127)
 	}
 	execPayload(status, plan)
@@ -207,6 +215,16 @@ func startFailure(tier Isolation, outcome initOutcome, reason string, status []b
 			return fmt.Errorf("sandbox: the init was ended before exec: %w", ctxErr)
 		}
 		return fmt.Errorf("sandbox: the init died before exec (%v): a package init of this binary must not act under %s", waitErr, envInit)
+	case initApplierDied:
+		if ctxErr != nil {
+			return fmt.Errorf("sandbox: the init was ended before exec: %w", ctxErr)
+		}
+		return fmt.Errorf("sandbox: the %s row failed to apply on this host: its applier exited before the second stage ran (%v), or a package init of this binary acted under %s=2", tier, waitErr, envInit)
+	case initStageDied:
+		if ctxErr != nil {
+			return fmt.Errorf("sandbox: the init was ended before exec: %w", ctxErr)
+		}
+		return fmt.Errorf("sandbox: the second stage died before exec (%v)", waitErr)
 	}
 	return fmt.Errorf("sandbox: unreadable init status %q", status)
 }
@@ -221,6 +239,8 @@ const (
 	initApplyFailed                    // the row's mechanism failed to apply, with a reason
 	initExeced                         // the sentinel alone: the target is running
 	initGarbled                        // a shape the protocol never writes
+	initApplierDied                    // the applying marker alone: the applier never reached the second stage
+	initStageDied                      // the stage marker alone: the second stage died before composing
 )
 
 // classifyStatus reads the status pipe's content into an outcome and,
@@ -229,10 +249,18 @@ func classifyStatus(status []byte) (initOutcome, string) {
 	st := string(status)
 	if strings.HasPrefix(st, statusApplying) {
 		// The applier was reached: nothing after the marker is the
-		// applier dying before the second stage ran.
+		// applier dying before the second stage ran, and the stage
+		// marker alone is the second stage dying before composing.
 		st = strings.TrimPrefix(st, statusApplying)
 		if st == "" {
-			return initApplyFailed, "the row's applier exited before the payload ran"
+			return initApplierDied, ""
+		}
+		if !strings.HasPrefix(st, statusStaged) {
+			return initGarbled, ""
+		}
+		st = strings.TrimPrefix(st, statusStaged)
+		if st == "" {
+			return initStageDied, ""
 		}
 	}
 	switch {

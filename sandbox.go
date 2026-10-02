@@ -55,9 +55,10 @@ const (
 	// it presents no hostname (a stated one is refused,
 	// ErrUndeliverable), it bounds the world to a Root at the tree's
 	// host path rather than at "/" (on Linux loading static
-	// entrypoints only there), and it refuses a read-only grant
-	// without a Root; its kill ties are the Minimal row's
-	// (docs/specs/sandbox.md, the ladder).
+	// entrypoints only there; on darwin a Root is refused until its
+	// world is delivered), and it refuses a read-only grant without
+	// a Root; its kill ties are the Minimal row's (docs/specs/
+	// sandbox.md, the ladder).
 	OS
 	// Strong: a kernel-enforced boundary (Linux namespaces).
 	Strong
@@ -139,8 +140,9 @@ type Limits struct {
 	// (older ones over every task of the user, the host's included, so
 	// a value below that count refuses the payload its first thread);
 	// on darwin, whose process rlimit counts every process of the
-	// user, the run's processes and threads summed by the watchdog,
-	// the run killed past the bound. Which of them enforced it is
+	// user, the threads of the run's processes summed by the
+	// watchdog (every process has at least one), the run killed past
+	// the bound. Which of them enforced it is
 	// reported (Stats.Accounting).
 	MaxProcs uint64
 }

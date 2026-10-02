@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -28,7 +29,7 @@ type rlimit struct {
 // EINVAL) and keeps its per-task memory limit for root, a payload
 // that handles SIGXCPU outlives the CPU limit, and its process
 // rlimit counts every process of the user rather than the run's, so
-// memory, CPU time and the process count are bounded by sampling
+// memory, CPU time and the thread count are bounded by sampling
 // the kernel's own per-process readings over the run's process group
 // and killing the group at a bound.
 type bounds struct {
@@ -74,7 +75,8 @@ func (b bounds) accounting() Accounting {
 // group at a bound: the memory bound over the members' resident
 // sizes summed, the CPU bound over each member's own time (the
 // per-process reading RLIMIT_CPU has on every row), the process
-// bound over the members and their threads summed. It counts what
+// bound over the threads of the group's processes summed (every
+// process has at least one). It counts what
 // it enforced: the peak resident size seen and the one kill a bound
 // made; a failure to read the group is a bound it could not hold,
 // which kills the run and is reported from Wait.
@@ -148,6 +150,13 @@ func (w *watchdog) sample() bool {
 	var over bool
 	for _, m := range members {
 		ti, err := taskInfo(int(m.Proc.P_pid))
+		if errors.Is(err, unix.EPERM) {
+			// A member the kernel will not show this process — one
+			// that gained privilege, a setuid exec — is a bound the
+			// watchdog cannot hold.
+			w.fail(fmt.Errorf("sandbox: the watchdog could not read process %d of the run: %w", m.Proc.P_pid, err))
+			return false
+		}
 		if err != nil {
 			continue
 		}

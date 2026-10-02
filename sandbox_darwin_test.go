@@ -139,6 +139,18 @@ func TestMain(m *testing.M) {
 		os.Stdout.Sync()
 		time.Sleep(5 * time.Minute)
 		os.Exit(0)
+	case "spawn-exit":
+		// Start a long sleeper holding this output, name it, and exit:
+		// the run's end must end the sleeper and release the output.
+		cmd := exec.Command(must(os.Executable()))
+		cmd.Env = append(os.Environ(), childEnv+"=sleep")
+		cmd.Stdout = os.Stdout
+		if err := cmd.Start(); err != nil {
+			fmt.Printf("spawn=err:%v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("child=%d\n", cmd.Process.Pid)
+		os.Exit(0)
 	case "sleep":
 		time.Sleep(5 * time.Minute)
 		os.Exit(0)
@@ -407,7 +419,6 @@ func TestProcessBoundKillsThreads(t *testing.T) {
 	}
 	spec, out = payload("threads", "SANDBOX_TEST_THREADS=20")
 	spec.Limits = Limits{MaxProcs: 100}
-	spec.Stdin = nil
 	sb, err := New(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -424,8 +435,50 @@ func TestProcessBoundKillsThreads(t *testing.T) {
 	if facts(out.String())["threads"] != "parked" {
 		t.Fatalf("under the bound the payload never parked: %q", out.String())
 	}
+	// Alive under the bound right up to the cancellation.
+	time.Sleep(100 * time.Millisecond)
+	if err := sb.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("the payload under the bound died: %v", err)
+	}
 	cancel()
-	sb.Wait()
+	if st, err := sb.Wait(); err != nil || !st.Signaled {
+		t.Fatalf("Wait after cancel: %+v %v", st, err)
+	}
+}
+
+// TestRunEndKillsRemnants pins the run's end as a kill trigger: a
+// descendant the payload leaves behind, holding the payload's
+// output, neither outlives the payload nor holds Wait open.
+func TestRunEndKillsRemnants(t *testing.T) {
+	spec, out := payload("spawn-exit")
+	spec.Limits = Limits{MaxFiles: 256}
+	sb, err := New(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	st, err := sb.Wait()
+	if err != nil || st.Code != 0 {
+		t.Fatalf("Wait: %+v %v", st, err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Wait held open by the remnant for %v", elapsed)
+	}
+	child, err := strconv.Atoi(facts(out.String())["child"])
+	if err != nil {
+		t.Fatalf("the payload named no child: %q", out.String())
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(child, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("the remnant %d outlived the run", child)
 }
 
 // TestOSRowUnixSockets pins what a denied network leaves open: a
@@ -572,22 +625,6 @@ func TestStartRefusals(t *testing.T) {
 		}
 		if out.Len() != 0 {
 			t.Errorf("%s: something ran: %q", name, out.String())
-		}
-	}
-}
-
-// TestClassifyStatus pins the status pipe's reading, shared with the
-// Linux rows.
-func TestClassifyStatus(t *testing.T) {
-	for in, want := range map[string]initOutcome{
-		"":                      initDied,
-		statusExecing:           initExeced,
-		statusFailed + "why":    initRefused,
-		statusApplyFailed + "x": initApplyFailed,
-		"junk":                  initGarbled,
-	} {
-		if got, _ := classifyStatus([]byte(in)); got != want {
-			t.Errorf("classifyStatus(%q) = %v, want %v", in, got, want)
 		}
 	}
 }

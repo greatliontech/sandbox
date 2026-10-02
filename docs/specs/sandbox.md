@@ -132,7 +132,10 @@ independent by design.
   interval (`WatchdogInterval`), the group killed at the bound — the
   memory bound over the group's resident sizes summed, the CPU bound
   over each process's own time as `RLIMIT_CPU` reads it, the process
-  bound over the group's processes and threads. Such a bound is
+  bound over the threads of the group's processes (every process
+  has at least one); a member the kernel will not show the sandbox
+  — one that gained privilege — is a bound the watchdog cannot
+  hold, which ends the run. Such a bound is
   exceeded by at most what the group can take in one interval, and
   it reaches what the group holds: a process that leaves the group
   (`setsid`) leaves the bounds, the same escape that leaves the
@@ -160,8 +163,10 @@ independent by design.
   caller `SIGKILL` there. Both strengths are stated, never silent;
   admitting rows with the weaker ties through `MinTier` is informed
   consent. On darwin the run's end is a third trigger: when the
-  payload exits, the group's remnants are killed, there being no
-  namespace to take a descendant with it.
+  payload exits — before it is reaped, so a descendant holding its
+  pipes cannot hold the caller's Wait open — the group's remnants
+  are killed, there being no namespace to take a descendant with
+  it.
 
 ## Mechanism ladder
 

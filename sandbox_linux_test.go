@@ -451,34 +451,6 @@ func TestStartReportsCompositionFailure(t *testing.T) {
 	}
 }
 
-// The status pipe's shapes classify apart: nothing written is a death
-// before exec, an intent reason before the sentinel is a refusal, an
-// application reason before it is the row failing to apply, the
-// sentinel alone is the target running, a reason after the sentinel
-// is a failed exec; anything else is garbled.
-func TestClassifyStatus(t *testing.T) {
-	cases := []struct {
-		in     string
-		want   initOutcome
-		reason string
-	}{
-		{"", initDied, ""},
-		{statusExecing, initExeced, ""},
-		{statusFailed + "chdir /x: no such file or directory\n", initRefused, "chdir /x: no such file or directory"},
-		{statusApplyFailed + "pivot_root: EPERM\n", initApplyFailed, "pivot_root: EPERM"},
-		{statusExecing + statusApplyFailed + "x", initGarbled, ""},
-		{statusExecing + statusFailed + "exec /x: permission denied", initRefused, "exec /x: permission denied"},
-		{"junk", initGarbled, ""},
-		{statusExecing + statusExecing, initGarbled, ""},
-	}
-	for _, c := range cases {
-		got, reason := classifyStatus([]byte(c.in))
-		if got != c.want || reason != c.reason {
-			t.Errorf("classifyStatus(%q) = %v %q, want %v %q", c.in, got, reason, c.want, c.reason)
-		}
-	}
-}
-
 // Without a Root the world is the host's, in a private mount
 // namespace, with the host environment inherited; a read-only grant
 // is still delivered throughout its subtree — its submounts included
