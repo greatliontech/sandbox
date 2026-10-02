@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -83,6 +84,7 @@ type watchdog struct {
 	interval time.Duration
 
 	mu       sync.Mutex
+	leader   *os.Process // the group's leader, which knows whether it was reaped
 	pgid     int
 	peak     uint64
 	memKills uint64
@@ -91,9 +93,10 @@ type watchdog struct {
 	done     chan struct{}
 }
 
-// start begins sampling the group led by pgid.
-func (w *watchdog) start(pgid int) {
-	w.pgid = pgid
+// start begins sampling the group the leader leads.
+func (w *watchdog) start(leader *os.Process) {
+	w.leader = leader
+	w.pgid = leader.Pid
 	w.stop = make(chan struct{})
 	w.done = make(chan struct{})
 	go w.run()
@@ -127,10 +130,19 @@ func (w *watchdog) run() {
 }
 
 // sample reads the group once and kills it where a bound is
-// exceeded. A member the kernel no longer reports — exited between
-// the listing and the reading — is skipped; a listing that fails is
-// a sample missed, never a kill.
+// exceeded. The group is addressed by the leader's pid, which names
+// the group only while the leader is unreaped (a zombie holds its
+// pid; a reaped leader's pid may already lead another group), so a
+// sample runs only while the leader is known alive through
+// os.Process, which knows whether it was waited for — the same
+// two-syscall window the Linux rows' group kill leaves open. A
+// member the kernel no longer reports — exited between the listing
+// and the reading — is skipped; a listing that fails is a sample
+// missed, never a kill.
 func (w *watchdog) sample() {
+	if err := w.leader.Signal(syscall.Signal(0)); err != nil {
+		return
+	}
 	members, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", w.pgid)
 	if err != nil {
 		return

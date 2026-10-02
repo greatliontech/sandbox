@@ -256,7 +256,7 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	if outcome == initExeced {
 		s.cmd, s.row, s.bounds = cmd, r, b
 		if b.watch != nil {
-			b.watch.start(cmd.Process.Pid)
+			b.watch.start(cmd.Process)
 		}
 		return nil
 	}
