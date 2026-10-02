@@ -1855,7 +1855,7 @@ func TestStartFailureClasses(t *testing.T) {
 		{initGarbled, "", nil, nil, []error{ErrUndeliverable}, "unreadable init status"},
 	}
 	for _, c := range cases {
-		err := startFailure(strongRow, c.outcome, c.reason, []byte("junk"), c.ctxErr, errors.New("exit status 127"))
+		err := startFailure(strongRow.tier, c.outcome, c.reason, []byte("junk"), c.ctxErr, errors.New("exit status 127"))
 		if c.is != nil && !errors.Is(err, c.is) {
 			t.Errorf("%v: %v is not %v", c.outcome, err, c.is)
 		}

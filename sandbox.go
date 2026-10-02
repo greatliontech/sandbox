@@ -116,11 +116,18 @@ type Limits struct {
 	// under rlimits, which caps address space rather than use — a
 	// runtime that reserves more address space than the cap (a Go
 	// binary reserves well over 64 MiB) is refused at its very start,
-	// loudly. Which of the two enforced it is reported
+	// loudly; on darwin, whose kernel refuses every memory rlimit to
+	// an unprivileged process, the resident size of the run's
+	// process group sampled by the watchdog, the group killed past
+	// the bound. Which of them enforced it is reported
 	// (Stats.Accounting).
 	MemoryBytes uint64
-	CPUSeconds  uint64 // CPU time cap (rlimits on every row)
-	MaxFiles    uint64 // open file descriptors (rlimits on every row)
+	// CPUSeconds caps CPU time: RLIMIT_CPU on every row, which Linux
+	// ends with a kill at the limit and darwin with SIGXCPU, a signal
+	// a payload may handle — so on darwin the watchdog's sample of
+	// the group's CPU time kills behind it.
+	CPUSeconds uint64
+	MaxFiles   uint64 // open file descriptors (rlimits on every row)
 	// MaxProcs caps the process and thread count: pids.max of the
 	// sandbox's own cgroup under cgroups; RLIMIT_NPROC under rlimits,
 	// which current kernels count within the sandbox's user namespace
@@ -144,6 +151,14 @@ const (
 	AccountingCgroups
 	// AccountingJobObject: a Windows Job Object.
 	AccountingJobObject
+	// AccountingWatchdog: the sandbox's own sampling of the kernel's
+	// per-process readings over the run's process group, the group
+	// killed at the bound — darwin's memory bound, whose kernel
+	// refuses every memory rlimit to an unprivileged process; the
+	// bound is exceeded by at most what the group can take in one
+	// sampling interval (docs/specs/sandbox.md, "Bounded means
+	// bounded").
+	AccountingWatchdog
 )
 
 func (a Accounting) String() string {
@@ -156,6 +171,8 @@ func (a Accounting) String() string {
 		return "cgroups"
 	case AccountingJobObject:
 		return "job-object"
+	case AccountingWatchdog:
+		return "watchdog"
 	default:
 		return "unknown"
 	}

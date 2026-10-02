@@ -19,46 +19,12 @@ import (
 
 	seccomp "github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
-	"golang.org/x/sys/unix"
 
 	"github.com/greatliontech/sandbox/internal/nslinux"
 )
 
 // Internal re-exec protocol.
 //
-// Start re-execs /proc/self/exe with envInit set; the init() below
-// intercepts that, reads the init config from a pipe (envInitFD),
-// composes the world inside the freshly created namespaces, then
-// execs the target. The namespaces themselves are created by the Go
-// runtime at clone time via SysProcAttr — no cgo, and identical
-// isolation to a C-driven clone. A second pipe (envStatusFD) carries
-// the outcome of composition back and is close-on-exec: the init
-// writes one sentinel byte immediately before exec, then either the
-// exec closes the pipe or its failure is written after the sentinel;
-// a failure before exec is written before any sentinel, marked as an
-// intent the host would not deliver or as the row's own mechanism
-// failing to apply; and an init that dies earlier — a consumer
-// package init exiting under the marker, a kill — leaves the pipe
-// empty. Start reads the shapes apart, so a world that cannot be
-// delivered refuses Start with the reason, a row that failed to
-// apply is reported as that and never re-selected, and a payload
-// that never ran is never reported as one that did.
-const (
-	envInit     = "_SANDBOX_INIT"
-	envInitFD   = "_SANDBOX_INITFD"
-	envStatusFD = "_SANDBOX_STATUSFD"
-	envProbe    = "_SANDBOX_PROBE" // the re-exec is a host probe: exit at once
-
-	statusExecing     = "\x00" // the init is about to exec the target
-	statusFailed      = "E"    // an intent the host would not deliver; the reason follows
-	statusApplyFailed = "A"    // the row's mechanism failed to apply; the reason follows
-)
-
-func init() {
-	if os.Getenv(envInit) == "1" {
-		runInit() // never returns
-	}
-}
 
 // initConfig is the JSON payload handed to the re-exec'd init process.
 // Root and every bind's Target are canonical paths resolved by the
@@ -295,7 +261,7 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	// Every other shape means the init has exited: reap it so Start's
 	// failure is the whole story.
 	waitErr := cmd.Wait()
-	return fail(startFailure(r, outcome, reason, status, ctx.Err(), waitErr))
+	return fail(startFailure(r.tier, outcome, reason, status, ctx.Err(), waitErr))
 }
 
 // startFailure is Start's report of an init that did not reach exec,
@@ -305,66 +271,6 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 // never re-selected; nothing written is a death before composing —
 // a consumer package init exiting under the re-exec marker, a kill,
 // or the caller's context ending — and the payload never ran.
-func startFailure(r row, outcome initOutcome, reason string, status []byte, ctxErr, waitErr error) error {
-	switch outcome {
-	case initRefused:
-		return fmt.Errorf("%w: %s", ErrUndeliverable, reason)
-	case initApplyFailed:
-		return fmt.Errorf("sandbox: the %s row failed to apply on this host: %s", r.tier, reason)
-	case initDied:
-		if ctxErr != nil {
-			return fmt.Errorf("sandbox: the init was ended before exec: %w", ctxErr)
-		}
-		return fmt.Errorf("sandbox: the init died before exec (%v): a package init of this binary must not act under %s", waitErr, envInit)
-	}
-	return fmt.Errorf("sandbox: unreadable init status %q", status)
-}
-
-// initOutcome is what the status pipe's content says happened in the
-// init child.
-type initOutcome int
-
-const (
-	initDied        initOutcome = iota // nothing written: died before composing
-	initRefused                        // an intent refused before or at exec, with a reason
-	initApplyFailed                    // the row's mechanism failed to apply, with a reason
-	initExeced                         // the sentinel alone: the target is running
-	initGarbled                        // a shape the protocol never writes
-)
-
-// classifyStatus reads the status pipe's content into an outcome and,
-// for a failure, its reason.
-func classifyStatus(status []byte) (initOutcome, string) {
-	st := string(status)
-	switch {
-	case st == "":
-		return initDied, ""
-	case st == statusExecing:
-		return initExeced, ""
-	case strings.HasPrefix(st, statusFailed):
-		return initRefused, strings.TrimSpace(strings.TrimPrefix(st, statusFailed))
-	case strings.HasPrefix(st, statusApplyFailed):
-		return initApplyFailed, strings.TrimSpace(strings.TrimPrefix(st, statusApplyFailed))
-	case strings.HasPrefix(st, statusExecing+statusFailed):
-		return initRefused, strings.TrimSpace(strings.TrimPrefix(st, statusExecing+statusFailed))
-	}
-	return initGarbled, ""
-}
-
-// hostEnv is the caller's environment without this package's re-exec
-// markers, which name descriptors only the init child holds.
-func hostEnv() []string {
-	var env []string
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "_SANDBOX_") {
-			env = append(env, kv)
-		}
-	}
-	return env
-}
-
-// hostNameMax is the kernel's hostname length (__NEW_UTS_LEN).
-const hostNameMax = 64
 
 // world is the resolved shape of a run: the tree to pivot to (the
 // Strong row only), the binds to place there, the OS row's allowlist
@@ -843,88 +749,24 @@ func cloneFlags(network bool) uintptr {
 	return flags
 }
 
-// --- re-exec'd init side ---
-
-func runInit() {
-	if os.Getenv(envProbe) == "1" {
-		os.Exit(0) // a host probe: the clone succeeded, nothing else is asked
-	}
-	status := statusPipe()
-	report := func(msg string) {
-		if status != nil {
-			status.WriteString(msg)
-			status.Close()
-		} else {
-			fmt.Fprintln(os.Stderr, "sandbox-init:", msg)
-		}
-	}
-	cfg, err := composeInit()
-	if err != nil {
-		var intent intentError
-		if errors.As(err, &intent) {
-			report(statusFailed + err.Error())
-		} else {
-			report(statusApplyFailed + err.Error())
-		}
-		os.Exit(127)
-	}
-	if status != nil {
-		if _, err := status.WriteString(statusExecing); err != nil {
-			// Without the sentinel a running payload would read as a
-			// death before exec; better not to run it.
-			fmt.Fprintln(os.Stderr, "sandbox-init: status pipe:", err)
-			os.Exit(127)
-		}
-	}
-	argv := append([]string{cfg.Cmd}, cfg.Args...)
-	err = syscall.Exec(cfg.Cmd, argv, cfg.Env)
-	// Only a failed exec returns; its reason follows the sentinel.
-	report(statusFailed + fmt.Sprintf("exec %s: %v", cfg.Cmd, err))
-	os.Exit(127)
-}
-
-// statusPipe opens the composition-status pipe and marks it
-// close-on-exec, so the parent reads EOF exactly when the target has
-// been execed.
-func statusPipe() *os.File {
-	fd, err := strconv.Atoi(os.Getenv(envStatusFD))
-	if err != nil {
-		return nil
-	}
-	if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, unix.FD_CLOEXEC); err != nil {
-		return nil
-	}
-	return os.NewFile(uintptr(fd), "sandbox-status")
-}
-
-// intentError marks an init failure that is the caller's intent
-// failing on this host — a stated working directory the process
-// cannot enter, a bound the host will not set — rather than the
-// row's mechanism failing to apply; the parent reports the two apart
-// (startFailure).
-type intentError struct{ err error }
-
-func (e intentError) Error() string { return e.err.Error() }
-func (e intentError) Unwrap() error { return e.err }
-
 // composeInit reads the config and composes the row's world,
 // returning the config the exec needs. The Strong row sets the
 // hostname, composes the world, and hardens; the Minimal row enters
 // the working directory and applies the bounds, nothing else.
-func composeInit() (*initConfig, error) {
+func composeInit() (execPlan, error) {
 	fdStr := os.Getenv(envInitFD)
 	fd, err := strconv.Atoi(fdStr)
 	if err != nil {
-		return nil, fmt.Errorf("bad %s=%q: %w", envInitFD, fdStr, err)
+		return execPlan{}, fmt.Errorf("bad %s=%q: %w", envInitFD, fdStr, err)
 	}
 	f := os.NewFile(uintptr(fd), "sandbox-config")
 	if f == nil {
-		return nil, fmt.Errorf("invalid config fd %d", fd)
+		return execPlan{}, fmt.Errorf("invalid config fd %d", fd)
 	}
 	var cfg initConfig
 	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("decode config: %w", err)
+		return execPlan{}, fmt.Errorf("decode config: %w", err)
 	}
 	f.Close()
 
@@ -934,7 +776,7 @@ func composeInit() (*initConfig, error) {
 	if cfg.PidsMaxFile != "" {
 		pidsMax, err = os.OpenFile(cfg.PidsMaxFile, os.O_WRONLY, 0)
 		if err != nil {
-			return nil, fmt.Errorf("process bound: %w", err)
+			return execPlan{}, fmt.Errorf("process bound: %w", err)
 		}
 	}
 	var strong, osRow bool
@@ -947,25 +789,25 @@ func composeInit() (*initConfig, error) {
 	default:
 		// The parent names the row it selected; a name this init
 		// does not know is a protocol fault, never a row to run.
-		return nil, fmt.Errorf("unknown row %q", cfg.Row)
+		return execPlan{}, fmt.Errorf("unknown row %q", cfg.Row)
 	}
 	if strong {
 		if cfg.Hostname != "" {
 			if err := syscall.Sethostname([]byte(cfg.Hostname)); err != nil {
-				return nil, fmt.Errorf("sethostname: %w", err)
+				return execPlan{}, fmt.Errorf("sethostname: %w", err)
 			}
 		}
 		if err := composeWorld(cfg); err != nil {
-			return nil, err
+			return execPlan{}, err
 		}
 	}
 	if cfg.WorkDir != "" {
 		if err := syscall.Chdir(cfg.WorkDir); err != nil {
-			return nil, intentError{fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)}
+			return execPlan{}, intentError{fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)}
 		}
 	}
 	if err := nslinux.SetRlimits(cfg.Rlimits); err != nil {
-		return nil, intentError{err}
+		return execPlan{}, intentError{err}
 	}
 	if osRow {
 		// The OS row's allowlist over the world, which sets
@@ -974,12 +816,12 @@ func composeInit() (*initConfig, error) {
 			// A rule's path gone since the parent resolved it is the
 			// intent with nowhere to land, not the mechanism failing.
 			if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR) {
-				return nil, intentError{err}
+				return execPlan{}, intentError{err}
 			}
-			return nil, err
+			return execPlan{}, err
 		}
 		if err := harden(func(native *arch.Info) seccomp.Policy { return osSeccompPolicy(native, !cfg.DenyNetwork) }); err != nil {
-			return nil, err
+			return execPlan{}, err
 		}
 	}
 	if strong {
@@ -988,27 +830,27 @@ func composeInit() (*initConfig, error) {
 		// holds none even as the namespace's mapped root — after the
 		// mounts, which needed CAP_SYS_ADMIN — then the filters.
 		if err := nslinux.DropAllCapabilities(); err != nil {
-			return nil, err
+			return execPlan{}, err
 		}
 		if err := harden(strongSeccompPolicy); err != nil {
-			return nil, err
+			return execPlan{}, err
 		}
 	}
 	// The process-count bound, last: from here to exec nothing forks
 	// or spawns a thread.
 	if pidsMax != nil {
 		if _, err := fmt.Fprintf(pidsMax, "%d", cfg.PidsMax); err != nil {
-			return nil, fmt.Errorf("process bound: %w", err)
+			return execPlan{}, fmt.Errorf("process bound: %w", err)
 		}
 		pidsMax.Close()
 	}
 	if err := nslinux.SetRlimits(cfg.LateRlimits); err != nil {
-		return nil, intentError{err}
+		return execPlan{}, intentError{err}
 	}
 	if cfg.Env == nil {
 		cfg.Env = []string{}
 	}
-	return &cfg, nil
+	return execPlan{Cmd: cfg.Cmd, Args: cfg.Args, Env: cfg.Env}, nil
 }
 
 // harden loads the arch guard and then the native-ABI filter policy
