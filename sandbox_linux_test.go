@@ -1896,6 +1896,69 @@ func TestInitReportsApplicationFailure(t *testing.T) {
 	}
 }
 
+// TestCPUBoundKillAttributed pins the CPU bound's kill on Linux as
+// attributable: RLIMIT_CPU ends a busy payload with a kill, and the
+// account names the CPU bound by the dead process's own CPU time at
+// it, where a payload ended by anything else leaves it unnamed.
+func TestCPUBoundKillAttributed(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh available")
+	}
+	sb, err := New(Spec{Exec: "/bin/sh", Args: []string{"-c", "while :; do :; done"}, Network: true, Limits: Limits{CPUSeconds: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startOrSkip(t, sb)
+	es, err := sb.Wait()
+	if err != nil || !es.Signaled || es.Signal != syscall.SIGKILL {
+		t.Fatalf("Wait: %+v %v, want the kernel's kill at the bound", es, err)
+	}
+	if st, err := sb.Stats(); err != nil || st.CPUKills != 1 {
+		ps := sb.(*linuxSandbox).cmd.ProcessState
+		t.Fatalf("stats %+v %v (user %v, system %v), want the kill attributed to the CPU bound", st, err, ps.UserTime(), ps.SystemTime())
+	}
+	sb, err = New(Spec{Exec: "/bin/sh", Args: []string{"-c", "sleep 30"}, Network: true, Limits: Limits{CPUSeconds: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startOrSkip(t, sb)
+	if err := sb.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	if es, err := sb.Wait(); err != nil || !es.Signaled || es.Signal != syscall.SIGKILL {
+		t.Fatalf("Wait: %+v %v, want the kill by another hand", es, err)
+	}
+	if st, err := sb.Stats(); err != nil || st.CPUKills != 0 {
+		t.Fatalf("stats %+v %v, want a kill by another hand unattributed", st, err)
+	}
+	// The payload's children's time is theirs, never the payload's: a
+	// shell whose two children each spent the bound (dying at the
+	// inherited limit), killed by hand once it says so, is not the
+	// CPU bound's kill.
+	out := &output{} // read while the run's copier still writes it
+	sb, err = New(Spec{Exec: "/bin/sh", Args: []string{"-c", "for i in 1 2; do sh -c 'while :; do :; done'; done; echo children=spent; sleep 30"}, Network: true, Limits: Limits{CPUSeconds: 1}, Stdout: out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startOrSkip(t, sb)
+	deadline := time.Now().Add(20 * time.Second)
+	for !strings.Contains(out.String(), "children=spent") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(out.String(), "children=spent") {
+		t.Fatalf("the children never spent the bound: %q", out.String())
+	}
+	if err := sb.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	if es, err := sb.Wait(); err != nil || !es.Signaled || es.Signal != syscall.SIGKILL {
+		t.Fatalf("Wait: %+v %v, want the kill by another hand", es, err)
+	}
+	if st, err := sb.Stats(); err != nil || st.CPUKills != 0 {
+		t.Fatalf("stats %+v %v, want the children's time not the payload's", st, err)
+	}
+}
+
 // A nil Env without a Root inherits the host's environment minus this
 // package's own markers.
 func TestHostEnvStripsMarkers(t *testing.T) {

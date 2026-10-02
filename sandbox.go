@@ -125,10 +125,11 @@ type Limits struct {
 	// runtime that reserves more address space than the cap (a Go
 	// binary reserves well over 64 MiB) is refused at its very start,
 	// loudly; on darwin, whose kernel refuses every memory rlimit to
-	// an unprivileged process, the resident size of the run's
-	// process group sampled by the watchdog, the group killed past
-	// the bound. Which of them enforced it is reported
-	// (Stats.Accounting).
+	// an unprivileged process, the physical footprint of the run's
+	// process group sampled by the watchdog (the platform's own
+	// measure of what a process costs, anonymous and compressed pages
+	// included, file-backed pages not), the group killed past the
+	// bound. Which of them enforced it is reported (Stats.Accounting).
 	MemoryBytes uint64
 	// CPUSeconds caps CPU time: RLIMIT_CPU on every row, which Linux
 	// ends with a kill at the limit and darwin with SIGXCPU, a signal
@@ -165,11 +166,13 @@ const (
 	AccountingJobObject
 	// AccountingWatchdog: the sandbox's own sampling of the kernel's
 	// per-process readings over the run's process group, the group
-	// killed at the bound — darwin's memory bound, whose kernel
-	// refuses every memory rlimit to an unprivileged process; the
-	// bound is exceeded by at most what the group can take in one
-	// sampling interval (docs/specs/sandbox.md, "Bounded means
-	// bounded").
+	// killed at the bound — darwin's memory, CPU and process bounds,
+	// whose kernel refuses every memory rlimit to an unprivileged
+	// process, delivers the CPU limit as a signal a payload may
+	// handle, and counts the user's processes rather than the run's;
+	// the bound is exceeded by at most what the group can take in one
+	// sampling interval, and the kill is counted by the bound that
+	// made it (docs/specs/sandbox.md, "Bounded means bounded").
 	AccountingWatchdog
 )
 
@@ -309,15 +312,25 @@ type ExitStatus struct {
 // the mechanism keeps counters (cgroups, the watchdog), the peak
 // memory use and the bound enforcements that happened: processes the
 // memory bound killed (the watchdog's one kill of the group), forks
-// the process bound refused. Zero counters under rlimits mean the
+// the process bound refused, the kill by the CPU bound — the
+// watchdog's on darwin; on Linux the kernel's at RLIMIT_CPU, told
+// by the dead process's own CPU time at the bound — and the
+// watchdog's kill by the process bound, so that a bound-exceeded
+// death is attributable on every row delivered (a memory or process
+// rlimit refuses the payload alone, an allocation or a fork, and
+// kills nothing). Zero counters under rlimits otherwise mean the
 // mechanism does not count, not that nothing happened; a zero peak
 // under cgroups on a kernel before 5.19 means the kernel keeps no
-// peak.
+// peak. On darwin the peak is the group's physical footprint summed:
+// the platform's own measure of what a process costs, anonymous and
+// compressed pages included, file-backed pages not.
 type Stats struct {
 	Accounting      Accounting
 	MemoryPeakBytes uint64
 	MemoryKills     uint64
 	ForksRefused    uint64
+	CPUKills        uint64
+	ProcessKills    uint64
 }
 
 // Sandbox is a created-but-not-necessarily-started sandbox for one process.
