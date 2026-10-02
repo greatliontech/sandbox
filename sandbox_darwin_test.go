@@ -172,6 +172,10 @@ func TestMain(m *testing.M) {
 		fmt.Printf("readtree=%v\n", err)
 		_, err = os.ReadFile(outside)
 		fmt.Printf("readoutside=%v\n", err)
+		_, err = os.ReadFile("/System/Volumes/Data" + outside)
+		fmt.Printf("readalias=%v\n", err)
+		_, err = net.LookupHost("one.one.one.one")
+		fmt.Printf("lookup=%v\n", err)
 		fmt.Printf("writetree=%v\n", os.WriteFile(filepath.Join(tree, "etc", "w"), []byte("x"), 0o644))
 		if ro != "" {
 			fmt.Printf("writero=%v\n", os.WriteFile(filepath.Join(ro, "w"), []byte("x"), 0o644))
@@ -818,6 +822,7 @@ func TestRootWorld(t *testing.T) {
 	}
 	allowed("readtree")
 	denied("readoutside")
+	denied("readalias")
 	denied("writetree")
 	allowed("readro")
 	denied("writero")
@@ -827,8 +832,8 @@ func TestRootWorld(t *testing.T) {
 	denied("dialout")
 	denied("net")
 	denied("execout")
-	if f["cores"] == "<nil>" {
-		t.Errorf("cores = %q, want a refusal", f["cores"])
+	if !strings.Contains(f["cores"], "operation not permitted") {
+		t.Errorf("cores = %q, want the profile's refusal", f["cores"])
 	}
 	if !strings.HasPrefix(f["sibling"], "<nil>:hello=yes") {
 		t.Errorf("sibling = %q, want the sibling executed", f["sibling"])
@@ -849,9 +854,38 @@ func TestRootWorld(t *testing.T) {
 	if strings.Contains(f["net"], "operation not permitted") {
 		t.Errorf("net = %q under a granted network", f["net"])
 	}
+	if f["lookup"] != "<nil>" {
+		t.Errorf("lookup = %q under a granted network, want name resolution", f["lookup"])
+	}
 	denied("dialout")
 	if f["env"] != "0" {
 		t.Errorf("env = %q entries unstated, want none", f["env"])
+	}
+}
+
+// TestRootOverlappingSpellingsRefused pins the overlap judged on the
+// kernel's spelling: two grants naming one directory by two
+// spellings, one read-only and one read-write, are refused as
+// overlapping.
+func TestRootOverlappingSpellingsRefused(t *testing.T) {
+	requireSeatbelt(t)
+	tree := rootTree(t)
+	host := must(filepath.EvalSymlinks(t.TempDir()))
+	variant := strings.ToUpper(host)
+	if _, err := os.Stat(variant); err != nil {
+		t.Skipf("a case variant is no alias on this volume: %v", err)
+	}
+	for _, p := range []string{host, variant} {
+		if err := os.MkdirAll(filepath.Join(tree, p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sb, err := New(Spec{Exec: "/payload", Env: []string{childEnv + "=hello"}, Root: tree, PathGrants: []PathGrant{{Path: host, Access: ReadOnly}, {Path: variant, Access: ReadWrite}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("two spellings of one grant: %v, want refused as overlapping", err)
 	}
 }
 
@@ -935,12 +969,36 @@ func TestRootLoadsTreeLibraries(t *testing.T) {
 		other = "arm64"
 	}
 	build("-arch", other, "-o", filepath.Join(tree, "foreign"), "alone.c")
+	build("-o", filepath.Join(tree, "weak"), "main.c", "-Wl,-weak_library,"+filepath.Join(tree, "libabs.dylib"))
+	build("-o", filepath.Join(tree, "upward"), "main.c", "-Wl,-upward_library,"+filepath.Join(tree, "libabs.dylib"))
+	build("-dynamiclib", "-install_name", "@rpath/libre.dylib", "-o", filepath.Join(tree, "libre.dylib"), "x.c", "-Wl,-reexport_library,"+filepath.Join(tree, "libabs.dylib"))
+	build("-o", filepath.Join(tree, "dyldenv"), "alone.c", "-Wl,-dyld_env,DYLD_LIBRARY_PATH=/opt/elsewhere")
+	if lipo, err := exec.LookPath("lipo"); err == nil {
+		cmd := exec.Command(lipo, "-create", filepath.Join(tree, "relative"), filepath.Join(tree, "foreign"), "-output", filepath.Join(tree, "universal"))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("lipo: %v\n%s", err, out)
+		}
+	}
 	out := &output{}
 	sb, st := run(t, Spec{Exec: "/relative", Root: tree, Env: []string{}, Stdout: out, Stderr: os.Stderr})
 	if st.Code != 0 || facts(out.String())["answer"] != "42" || sb.Tier() != OS {
 		t.Fatalf("an image loading the tree's library: exit %+v, output %q", st, out.String())
 	}
-	for name, want := range map[string]string{"/hostrpath": "a run path", "/absolute": "image-absolute", "/foreign": "built for"} {
+	if _, err := os.Stat(filepath.Join(tree, "universal")); err == nil {
+		out := &output{}
+		if _, st := run(t, Spec{Exec: "/universal", Root: tree, Env: []string{}, Stdout: out, Stderr: os.Stderr}); st.Code != 0 || facts(out.String())["answer"] != "42" {
+			t.Fatalf("a universal image's native slice: exit %+v, output %q", st, out.String())
+		}
+	}
+	for name, want := range map[string]string{
+		"/hostrpath":   "a run path",
+		"/absolute":    "image-absolute",
+		"/foreign":     "built for",
+		"/weak":        "weakly linked",
+		"/upward":      "linked upward",
+		"/libre.dylib": "not an executable",
+		"/dyldenv":     "loader environment",
+	} {
 		sb, err := New(Spec{Exec: name, Root: tree, Env: []string{}})
 		if err != nil {
 			t.Fatal(err)

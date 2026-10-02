@@ -53,7 +53,10 @@ type initConfig struct {
 	Rlimits []rlimit `json:"rlimits,omitempty"`
 	// Profile is the OS row's Seatbelt profile, applied by
 	// sandbox-exec around the second stage; empty on the Minimal row.
+	// Self is this binary at the kernel's spelling, the one the
+	// profile admits and the applier execs.
 	Profile string   `json:"profile,omitempty"`
+	Self    string   `json:"self,omitempty"`
 	Cmd     string   `json:"cmd"`
 	Args    []string `json:"args,omitempty"`
 	Env     []string `json:"env"`
@@ -155,17 +158,21 @@ func resolveWorld(spec Spec, r row) (world, error) {
 		return undeliverable("root %s: %v", spec.Root, err)
 	}
 	for i, b := range t.binds {
+		what := "grant"
+		if i == t.runtime {
+			what = "runtime dir"
+		}
 		target, err := kernelPath(b.Source)
 		if err != nil {
-			return undeliverable("grant %s: %v", b.Source, err)
+			return undeliverable("%s %s: %v", what, b.Source, err)
 		}
 		switch {
 		case target == w.root:
-			return undeliverable("grant %s is the tree %s", b.Source, spec.Root)
+			return undeliverable("%s %s is the tree %s", what, b.Source, spec.Root)
 		case within(target, w.root):
-			return undeliverable("grant %s lies within the tree %s", b.Source, spec.Root)
+			return undeliverable("%s %s lies within the tree %s", what, b.Source, spec.Root)
 		case within(w.root, target):
-			return undeliverable("grant %s holds the tree %s", b.Source, spec.Root)
+			return undeliverable("%s %s holds the tree %s", what, b.Source, spec.Root)
 		}
 		for _, o := range w.binds {
 			if target == o.Target || within(target, o.Target) || within(o.Target, target) {
@@ -231,8 +238,8 @@ func kernelPath(path string) (string, error) {
 // payload; each grant read, mapped and executed as on the Linux OS
 // row, and written where read-write; the rendezvous directory read
 // and written, unix sockets within it alone; the network, where
-// granted, by address — a unix socket elsewhere on the host is not
-// the network.
+// granted, by address, with the platform's name resolution — a unix
+// socket elsewhere on the host is not the network.
 func profile(spec Spec, w world, self string) (string, error) {
 	var b strings.Builder
 	b.WriteString("(version 1)\n")
@@ -277,7 +284,11 @@ func profile(spec Spec, w world, self string) (string, error) {
 		fmt.Fprintf(&b, "(allow network-bind (local unix-socket (subpath %s)))\n(allow network-inbound (local unix-socket (subpath %s)))\n(allow network-outbound (remote unix-socket (subpath %s)))\n", rt, rt, rt)
 	}
 	if spec.Network {
+		// The network by address, and the platform's name resolution
+		// with it: the resolver's daemon and its configuration, which
+		// system.sb leaves out.
 		b.WriteString("(allow network-outbound (remote ip))\n(allow network-inbound (local ip))\n(allow network-bind (local ip))\n")
+		b.WriteString("(allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n(allow mach-lookup (global-name \"com.apple.dnssd.service\"))\n(allow file-read* (literal \"/private/var/run/resolv.conf\") (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\"))\n")
 	}
 	return b.String(), nil
 }
@@ -357,6 +368,7 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 		Env:     env,
 	}
 	if r.tier == OS {
+		cfg.Self = self
 		if cfg.Profile, err = profile(s.spec, w, self); err != nil {
 			return fmt.Errorf("%w: %v", ErrUndeliverable, err)
 		}
@@ -585,13 +597,9 @@ func composeInit() (execPlan, error) {
 	if err != nil {
 		return execPlan{}, fmt.Errorf("encode the second stage's plan: %w", err)
 	}
-	self, err := selfExecutable()
-	if err != nil {
-		return execPlan{}, err
-	}
 	return execPlan{
 		Cmd:    sandboxExec,
-		Args:   []string{"-p", cfg.Profile, self},
+		Args:   []string{"-p", cfg.Profile, cfg.Self},
 		Env:    []string{envInit + "=2", envStatusFD + "=" + os.Getenv(envStatusFD), envPlan + "=" + string(plan)},
 		Staged: true,
 	}, nil
