@@ -263,45 +263,49 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	statusW.Close()
 	// The group's identity is read, and the leader's exit watched,
 	// while the init is certainly alive: it blocks on the config until
-	// written.
-	g, groupErr := groupOf(cmd.Process)
-	if groupErr == nil {
+	// written. A failure here ends the init by its pid, which it
+	// still holds unreaped.
+	g, err := groupOf(cmd.Process)
+	var exited *exitWatch
+	if err == nil {
 		s.group.Store(&g)
+		exited, err = watchExit(g)
+	}
+	if err != nil {
+		cfgW.Close()
+		statusR.Close()
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		cmd.Wait()
+		return err
 	}
 	encodeErr := json.NewEncoder(cfgW).Encode(&cfg)
 	cfgW.Close()
 	status, readErr := io.ReadAll(statusR)
 	statusR.Close()
-	if groupErr != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		cmd.Wait()
-		return groupErr
-	}
-	if readErr != nil {
+	// On every failure past this point the init is reaped and the
+	// watch, which then fired on the init's own exit at most, halted.
+	fail := func(err error) error {
 		_ = g.kill()
 		cmd.Wait()
-		return fmt.Errorf("sandbox: read init status: %w", readErr)
+		exited.halt()
+		return err
+	}
+	if readErr != nil {
+		return fail(fmt.Errorf("sandbox: read init status: %w", readErr))
 	}
 	if encodeErr != nil {
-		waitErr := cmd.Wait()
-		return fmt.Errorf("sandbox: write init config: %v (init: %v)", encodeErr, waitErr)
+		return fail(fmt.Errorf("sandbox: write init config: %v", encodeErr))
 	}
 	outcome, reason := classifyStatus(status)
 	if outcome == initExeced {
-		s.cmd, s.row, s.bounds = cmd, r, b
-		exited, err := watchExit(g)
-		if err != nil {
-			_ = g.kill()
-			cmd.Wait()
-			return err
-		}
-		s.exited = exited
+		s.cmd, s.row, s.bounds, s.exited = cmd, r, b, exited
 		if b.watch != nil {
 			b.watch.start(g)
 		}
 		return nil
 	}
 	waitErr := cmd.Wait()
+	exited.halt()
 	return startFailure(r.tier, outcome, reason, status, ctx.Err(), waitErr)
 }
 

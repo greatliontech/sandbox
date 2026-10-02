@@ -446,6 +446,27 @@ func TestProcessBoundKillsThreads(t *testing.T) {
 	}
 }
 
+// TestWatchdogReadsPlatformBinaries pins the watchdog's readings of
+// a payload that is the platform's own binary, not this one: the
+// kernel shows it to the sandbox, so the run ends by its own exit,
+// in bounds and without a watchdog error.
+func TestWatchdogReadsPlatformBinaries(t *testing.T) {
+	sb, st := run(t, Spec{
+		Exec:   "/bin/sh",
+		Args:   []string{"-c", "/bin/sleep 0.5; echo shell=done"},
+		Limits: Limits{MemoryBytes: 256 << 20, CPUSeconds: 10},
+		Stdout: &output{},
+		Stderr: os.Stderr,
+	})
+	if st.Code != 0 || st.Signaled {
+		t.Fatalf("exit %+v, want 0", st)
+	}
+	stats, err := sb.Stats()
+	if err != nil || stats.Accounting != AccountingWatchdog || stats.MemoryKills != 0 || stats.MemoryPeakBytes == 0 {
+		t.Fatalf("stats %+v %v, want the watchdog's reading of the shell", stats, err)
+	}
+}
+
 // TestRunEndKillsRemnants pins the run's end as a kill trigger: a
 // descendant the payload leaves behind, holding the payload's
 // output, neither outlives the payload nor holds Wait open.

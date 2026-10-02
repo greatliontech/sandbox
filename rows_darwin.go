@@ -228,19 +228,30 @@ func sysProcAttr() *syscall.SysProcAttr {
 // the leader's exit, which fires before the reap, so the zombie still
 // pins the pid and the kill lands on the run's own group — and
 // before the reap frees the pipes, so a descendant holding them
-// cannot hold Wait open.
+// cannot hold Wait open. The watch is registered while the init is
+// blocked on its config, before anything has run; an exec never
+// fires it, so the in-place execs to the applier, the second stage
+// and the payload pass under it. A user event on the same queue
+// wakes the goroutine for halt, which closes the queue only once the
+// goroutine is done with its descriptor.
 type exitWatch struct {
 	kq   int
 	done chan struct{}
 }
+
+// haltIdent is the user event's identity on the watch's queue.
+const haltIdent = 1
 
 func watchExit(g group) (*exitWatch, error) {
 	kq, err := unix.Kqueue()
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: exit watch: %w", err)
 	}
-	ev := unix.Kevent_t{Ident: uint64(g.pgid), Filter: unix.EVFILT_PROC, Flags: unix.EV_ADD | unix.EV_ONESHOT, Fflags: unix.NOTE_EXIT}
-	if _, err := unix.Kevent(kq, []unix.Kevent_t{ev}, nil, nil); err != nil {
+	events := []unix.Kevent_t{
+		{Ident: uint64(g.pgid), Filter: unix.EVFILT_PROC, Flags: unix.EV_ADD | unix.EV_ONESHOT, Fflags: unix.NOTE_EXIT},
+		{Ident: haltIdent, Filter: unix.EVFILT_USER, Flags: unix.EV_ADD | unix.EV_CLEAR},
+	}
+	if _, err := unix.Kevent(kq, events, nil, nil); err != nil {
 		unix.Close(kq)
 		return nil, fmt.Errorf("sandbox: exit watch: %w", err)
 	}
@@ -254,20 +265,27 @@ func watchExit(g group) (*exitWatch, error) {
 				continue
 			}
 			if err != nil || n == 0 {
-				return // the watch closed
+				return
 			}
-			_ = g.kill()
+			if out[0].Filter == unix.EVFILT_PROC {
+				_ = g.kill()
+			}
 			return
 		}
 	}()
 	return w, nil
 }
 
-// halt closes the watch and waits for its goroutine.
+// halt wakes the watch's goroutine, waits for it and closes the
+// queue — never while the goroutine could still read it, so a
+// descriptor number reissued to another watch is never read by this
+// one.
 func (w *exitWatch) halt() {
 	if w == nil {
 		return
 	}
-	unix.Close(w.kq)
+	trigger := []unix.Kevent_t{{Ident: haltIdent, Filter: unix.EVFILT_USER, Fflags: unix.NOTE_TRIGGER}}
+	_, _ = unix.Kevent(w.kq, trigger, nil, nil)
 	<-w.done
+	unix.Close(w.kq)
 }
