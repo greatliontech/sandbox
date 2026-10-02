@@ -210,7 +210,14 @@ func finalPath(path string) (string, error) {
 			return "", err
 		}
 		if int(n) < len(buf) {
-			return strings.TrimPrefix(windows.UTF16ToString(buf[:n]), `\\?\`), nil
+			// The kernel's spelling carries the long-path prefix: a
+			// drive's path with "\\?\", a share's with "\\?\UNC\"
+			// for the "\\" a share is spelled with.
+			p := windows.UTF16ToString(buf[:n])
+			if rest, ok := strings.CutPrefix(p, `\\?\UNC\`); ok {
+				return `\\` + rest, nil
+			}
+			return strings.TrimPrefix(p, `\\?\`), nil
 		}
 		buf = make([]uint16, n+1)
 	}
