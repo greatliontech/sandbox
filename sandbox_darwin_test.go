@@ -979,49 +979,22 @@ func TestRootLoadsTreeLibraries(t *testing.T) {
 	build("-o", filepath.Join(tree, "upward"), "main.c", "-Wl,-upward_library,"+filepath.Join(tree, "libabs.dylib"))
 	build("-dynamiclib", "-install_name", "@rpath/libre.dylib", "-o", filepath.Join(tree, "libre.dylib"), "x.c", "-Wl,-reexport_library,"+filepath.Join(tree, "libabs.dylib"))
 	build("-o", filepath.Join(tree, "dyldenv"), "alone.c", "-Wl,-dyld_env,DYLD_LIBRARY_PATH=/opt/elsewhere")
-	// Universal images whose slices disagree: the native slice is the
-	// one judged — clean beside a bad foreign one runs, bad beside a
-	// clean foreign one is refused.
-	if lipo, err := exec.LookPath("lipo"); err == nil {
-		// The foreign slice first in one image: the native slice is
-		// found by its machine, never by its place.
-		for name, slices := range map[string][]string{"universal": {"foreign-bad", "relative"}, "universal-bad": {"hostrpath", "foreign"}} {
-			cmd := exec.Command(lipo, "-create", filepath.Join(tree, slices[0]), filepath.Join(tree, slices[1]), "-output", filepath.Join(tree, name))
-			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("lipo: %v\n%s", err, out)
-			}
-		}
-		// lipo orders slices its own way: the pin against a selection
-		// by place holds only where the native slice sits at different
-		// places in the two images, which is reported either way.
-		nativeAt := func(name string) int {
-			fat, err := macho.OpenFat(filepath.Join(tree, name))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer fat.Close()
-			want := map[string]macho.Cpu{"arm64": macho.CpuArm64, "amd64": macho.CpuAmd64}[runtime.GOARCH]
-			for i, a := range fat.Arches {
-				if a.Cpu == want {
-					return i
-				}
-			}
-			return -1
-		}
-		if a, b := nativeAt("universal"), nativeAt("universal-bad"); a == b {
-			t.Logf("lipo placed the native slice at %d in both images: the selection by machine is pinned, a selection by place is not", a)
-		}
-	}
+	// Universal images whose slices disagree, assembled here so the
+	// slices' order is the test's: the native slice is the one judged
+	// — clean beside a bad foreign one runs, bad beside a clean
+	// foreign one is refused — found by its machine, never by its
+	// place, the native slice last in one image and first in the
+	// other.
+	universal(t, filepath.Join(tree, "universal"), filepath.Join(tree, "foreign-bad"), filepath.Join(tree, "relative"))
+	universal(t, filepath.Join(tree, "universal-bad"), filepath.Join(tree, "hostrpath"), filepath.Join(tree, "foreign"))
 	out := &output{}
 	sb, st := run(t, Spec{Exec: "/relative", Root: tree, Env: []string{}, Stdout: out, Stderr: os.Stderr})
 	if st.Code != 0 || facts(out.String())["answer"] != "42" || sb.Tier() != OS {
 		t.Fatalf("an image loading the tree's library: exit %+v, output %q", st, out.String())
 	}
-	if _, err := os.Stat(filepath.Join(tree, "universal")); err == nil {
-		out := &output{}
-		if _, st := run(t, Spec{Exec: "/universal", Root: tree, Env: []string{}, Stdout: out, Stderr: os.Stderr}); st.Code != 0 || facts(out.String())["answer"] != "42" {
-			t.Fatalf("a universal image's native slice: exit %+v, output %q", st, out.String())
-		}
+	out = &output{}
+	if _, st := run(t, Spec{Exec: "/universal", Root: tree, Env: []string{}, Stdout: out, Stderr: os.Stderr}); st.Code != 0 || facts(out.String())["answer"] != "42" {
+		t.Fatalf("a universal image's native slice: exit %+v, output %q", st, out.String())
 	}
 	refusals := map[string]string{
 		"/hostrpath":   "a run path",
@@ -1032,9 +1005,7 @@ func TestRootLoadsTreeLibraries(t *testing.T) {
 		"/libre.dylib": "not an executable",
 		"/dyldenv":     "loader environment",
 	}
-	if _, err := os.Stat(filepath.Join(tree, "universal-bad")); err == nil {
-		refusals["/universal-bad"] = "a run path"
-	}
+	refusals["/universal-bad"] = "a run path"
 	for name, want := range refusals {
 		sb, err := New(Spec{Exec: name, Root: tree, Env: []string{}})
 		if err != nil {
@@ -1175,5 +1146,38 @@ func TestLoadPath(t *testing.T) {
 		if _, _, ok := loadPath(f, command(order, 0x1d, 12, "x")); ok {
 			t.Errorf("%v a command naming nothing read as a path", order)
 		}
+	}
+}
+
+// universal writes a universal image holding the thin images in the
+// order given: the fat header and one entry per slice, each slice at
+// an offset aligned to its page.
+func universal(t *testing.T, out string, slices ...string) {
+	t.Helper()
+	const align = 14 // 2^14, the arm64 slice's page
+	var header bytes.Buffer
+	binary.Write(&header, binary.BigEndian, uint32(0xcafebabe))
+	binary.Write(&header, binary.BigEndian, uint32(len(slices)))
+	offset := uint32(8 + 20*len(slices))
+	var body [][]byte
+	for _, p := range slices {
+		b := must(os.ReadFile(p))
+		f := must(macho.Open(p))
+		f.Close()
+		offset = (offset + (1 << align) - 1) &^ ((1 << align) - 1)
+		for _, v := range []uint32{uint32(f.Cpu), f.SubCpu, offset, uint32(len(b)), align} {
+			binary.Write(&header, binary.BigEndian, v)
+		}
+		body = append(body, b)
+		offset += uint32(len(b))
+	}
+	file := header.Bytes()
+	for _, b := range body {
+		pad := (len(file) + (1 << align) - 1) &^ ((1 << align) - 1)
+		file = append(file, make([]byte, pad-len(file))...)
+		file = append(file, b...)
+	}
+	if err := os.WriteFile(out, file, 0o755); err != nil {
+		t.Fatal(err)
 	}
 }
