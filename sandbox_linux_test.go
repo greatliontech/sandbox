@@ -1320,7 +1320,9 @@ func TestDestroyRetriesRelease(t *testing.T) {
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}
-	s := &linuxSandbox{cmd: cmd, waited: true, bounds: bounds{accounting: AccountingCgroups, cgroup: cg}}
+	s := &linuxSandbox{cmd: cmd, bounds: bounds{accounting: AccountingCgroups, cgroup: cg}}
+	s.outcome.begin()
+	s.outcome.end(ExitStatus{}, nil) // reaped already
 	if err := s.Destroy(); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
@@ -1893,6 +1895,38 @@ func TestInitReportsApplicationFailure(t *testing.T) {
 	status = runInitProtocol(t, initConfig{initCommon: initCommon{Row: "bogus", Cmd: "/bin/true", Env: []string{}}}, sysProcAttr(minimalRow, true))
 	if outcome, reason := classifyStatus(status); outcome != initApplyFailed || !strings.Contains(reason, "unknown row") {
 		t.Fatalf("an unknown row reported as %v %q (status %q)", outcome, reason, status)
+	}
+}
+
+// TestDestroyDuringWait pins Destroy against a Wait in progress on
+// every row: the run is killed and both callers see its end.
+func TestDestroyDuringWait(t *testing.T) {
+	requireTree(t)
+	sb, err := New(Spec{Exec: "/world", Args: []string{"sleep"}, Root: worldTree})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startOrSkip(t, sb)
+	type reaped struct {
+		st  ExitStatus
+		err error
+	}
+	waited := make(chan reaped, 1)
+	go func() {
+		st, err := sb.Wait()
+		waited <- reaped{st, err}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if err := sb.Destroy(); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	select {
+	case r := <-waited:
+		if r.err != nil || !r.st.Signaled {
+			t.Fatalf("Wait = %+v %v, want the kill", r.st, r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Wait outlived Destroy")
 	}
 }
 

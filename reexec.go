@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/greatliontech/sandbox/internal/rlimit"
@@ -329,20 +328,6 @@ func hostProbeEnv() []string {
 	return []string{envInit + "=1", envProbe + "=1"}
 }
 
-// payloadEnv is the payload's environment: the stated one; where
-// none is stated, empty under a Root — a restricted world carries
-// nothing of the host unstated (docs/specs/sandbox.md, "Root is
-// world-restriction") — and the host's own otherwise.
-func payloadEnv(spec Spec) []string {
-	switch {
-	case spec.Env != nil:
-		return spec.Env
-	case spec.Root != "":
-		return []string{}
-	}
-	return hostEnv()
-}
-
 // launchInit runs cmd as the init through the protocol: the config
 // and status pipes made and handed over as descriptors 3 and 4, the
 // init's environment the markers alone, cmd started, started called
@@ -457,55 +442,7 @@ func reaped(cmd *exec.Cmd, err error) (ExitStatus, error) {
 	return ExitStatus{}, err
 }
 
-// hostEnv is the caller's environment without this package's re-exec
-// markers, which name descriptors only the init child holds.
-func hostEnv() []string {
-	var env []string
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "_SANDBOX_") {
-			env = append(env, kv)
-		}
-	}
-	return env
-}
-
 // hostNameMax is the longest hostname a row presents: the Linux
 // kernel's (__NEW_UTS_LEN), which darwin's rows, presenting none,
 // never reach.
 const hostNameMax = 64
-
-// probeCache holds once-per-process answers to host probes, keyed
-// by what was probed. A probe's outcome is a fact for the process's
-// lifetime — an anomaly included: a consumer init that breaches the
-// re-exec contract breaches it every time — but a probe the caller's
-// context ended is not an answer and is not remembered. Callers
-// racing for the first answer wait on the lock, bounded by the
-// prober's own deadline. A host that changes underneath a running
-// caller is not modelled.
-type probeCache[T any] struct {
-	mu      sync.Mutex
-	results map[string]probeResult[T]
-}
-
-type probeResult[T any] struct {
-	value T
-	err   error
-}
-
-func (c *probeCache[T]) get(ctx context.Context, key string, probe func(context.Context) (T, error)) (T, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.results == nil {
-		c.results = map[string]probeResult[T]{}
-	}
-	if r, ok := c.results[key]; ok {
-		return r.value, r.err
-	}
-	v, err := probe(ctx)
-	if ctx.Err() != nil {
-		var zero T
-		return zero, ctx.Err()
-	}
-	c.results[key] = probeResult[T]{value: v, err: err}
-	return v, err
-}
