@@ -1196,6 +1196,9 @@ func TestProfileRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(p), "\n")
+	if len(lines) < 4 {
+		t.Fatalf("the profile is %d lines: %q", len(lines), p)
+	}
 	if lines[0] != "(version 1)" || lines[1] != "(deny default)" || lines[2] != `(import "system.sb")` {
 		t.Fatalf("the profile opens %q", lines[:3])
 	}
@@ -1203,8 +1206,10 @@ func TestProfileRules(t *testing.T) {
 		t.Fatalf("the cores denial not right after the import: %q", lines[3])
 	}
 	for _, l := range lines[4:] {
-		if strings.Contains(l, "/cores") {
-			t.Fatalf("a later rule names /cores: %q", l)
+		// A later rule re-admits /cores by naming it or by allowing an
+		// ancestor: the root is its only one.
+		if strings.Contains(l, "/cores") || strings.Contains(l, `"/"`) {
+			t.Fatalf("a later rule reaches /cores: %q", l)
 		}
 	}
 }
