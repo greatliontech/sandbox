@@ -1124,7 +1124,7 @@ func TestLoadPath(t *testing.T) {
 		return macho.LoadBytes(raw)
 	}
 	for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
-		f := &macho.File{FileHeader: macho.FileHeader{ByteOrder: order}}
+		f := &macho.File{ByteOrder: order}
 		for _, c := range []struct {
 			cmd    uint32
 			header int
