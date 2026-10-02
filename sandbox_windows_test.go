@@ -296,10 +296,13 @@ func entries(t *testing.T, path string) int {
 }
 
 // TestNetworkDeniedUnlessGranted pins the network: a container dials
-// nothing unless the network is granted.
+// nothing unless the network is granted — and never the loopback,
+// which the platform keeps from every package, so the listener sits
+// on an address of the host's own.
 func TestNetworkDeniedUnlessGranted(t *testing.T) {
 	requireAppContainer(t)
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	addr := hostAddress(t)
+	l, err := net.Listen("tcp", net.JoinHostPort(addr, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,6 +325,30 @@ func TestNetworkDeniedUnlessGranted(t *testing.T) {
 			t.Fatalf("network=%v: exit %+v, dial %q", network, st, facts(out.String())["dial"])
 		}
 	}
+}
+
+// hostAddress is an IPv4 address of the host's own that is no
+// loopback, which a container may reach where the network is
+// granted.
+func hostAddress(t *testing.T) string {
+	t.Helper()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, i := range ifaces {
+		if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil {
+				return n.IP.String()
+			}
+		}
+	}
+	t.Skip("no address of the host's own but the loopback")
+	return ""
 }
 
 // TestMemoryBoundKillsHog pins the memory bound: a payload past it is
