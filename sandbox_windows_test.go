@@ -441,6 +441,13 @@ func TestOverlapJudgedByIdentity(t *testing.T) {
 	if short, err := shortPath(d); err == nil && !strings.EqualFold(short, d) {
 		variants["a short name"] = short
 	}
+	// A junction onto the grant's directory: its own parents are not
+	// the grant's, its target's are.
+	junction := filepath.Join(t.TempDir(), "j")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junction, d).CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J: %v %s", err, out)
+	}
+	variants["a junction"] = junction
 	for name, alias := range variants {
 		spec, _ := payload("hello")
 		spec.PathGrants = []PathGrant{{Path: inner, Access: ReadOnly}, {Path: alias, Access: ReadWrite}}
@@ -452,6 +459,31 @@ func TestOverlapJudgedByIdentity(t *testing.T) {
 			t.Errorf("%s of a grant over another: %v, want refused as overlapping", name, err)
 			sb.Destroy()
 		}
+	}
+}
+
+// TestInheritanceStopsAtJunction pins the entries' propagation: a
+// junction a payload could plant beneath a read-write grant, onto a
+// directory outside the grants, carries no entry for the container
+// while the run goes on.
+func TestInheritanceStopsAtJunction(t *testing.T) {
+	requireAppContainer(t)
+	rw, outside := t.TempDir(), t.TempDir()
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", filepath.Join(rw, "j"), outside).CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J: %v %s", err, out)
+	}
+	spec, _ := payload("sleep")
+	spec.PathGrants = []PathGrant{{Path: rw, Access: ReadWrite}}
+	sb, err := New(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer sb.Destroy()
+	if n := entries(t, outside); n != 0 {
+		t.Fatalf("the directory beyond the junction carries %d container entries during the run", n)
 	}
 }
 

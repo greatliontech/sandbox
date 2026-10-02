@@ -8,11 +8,12 @@ import "sync"
 // nothing; Destroy reads whether the reaping has ended to know
 // whether a kill still has anything to end.
 type outcome struct {
-	mu       sync.Mutex
-	done     chan struct{}
-	finished bool
-	status   ExitStatus
-	err      error
+	mu        sync.Mutex
+	releaseMu sync.Mutex
+	done      chan struct{}
+	finished  bool
+	status    ExitStatus
+	err       error
 }
 
 // begin claims the reaping: true for the first caller, who must end
@@ -56,12 +57,12 @@ func (o *outcome) ended() bool {
 	return o.finished
 }
 
-// fail records a failure to wait a later caller must see, where the
-// reaping ended with one.
-func (o *outcome) fail(err error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.err == nil {
-		o.err = err
-	}
+// release runs the row's release of what the run held — the reaper's
+// own, and every later Wait's retry of what failed — one at a time:
+// the release must leave what it released marked so, and keep what
+// failed for the next.
+func (o *outcome) release(f func() error) error {
+	o.releaseMu.Lock()
+	defer o.releaseMu.Unlock()
+	return f()
 }

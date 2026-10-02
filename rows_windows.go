@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"unsafe"
@@ -116,8 +115,7 @@ func hostFactsFor(ctx context.Context) (hostFacts, error) {
 // refuses either (an edition without the API, a policy denying this
 // user) is the fact that the OS row is out of reach; a failure to
 // take back what was made is an anomaly, not an answer.
-func probeHost(ctx context.Context) (hostFacts, error) {
-	var f hostFacts
+func probeHost(ctx context.Context) (f hostFacts, err error) {
 	if err := userenv.Load(); err != nil {
 		f.appContainer = fmt.Errorf("appcontainer: %v", err)
 		return f, nil
@@ -132,7 +130,11 @@ func probeHost(ctx context.Context) (hostFacts, error) {
 			err = fmt.Errorf("sandbox: appcontainer probe: %w", derr)
 		}
 	}()
-	pi, lerr := createUnder(filepath.Join(os.Getenv("SystemRoot"), "System32", "cmd.exe"), &securityCapabilities{AppContainerSid: p.sid})
+	system, err := windows.GetSystemDirectory()
+	if err != nil {
+		return f, fmt.Errorf("sandbox: appcontainer probe: %w", err)
+	}
+	pi, lerr := createUnder(filepath.Join(system, "cmd.exe"), &securityCapabilities{AppContainerSid: p.sid})
 	if lerr != nil {
 		f.appContainer = fmt.Errorf("appcontainer: a process under a container: %v", lerr)
 		return f, nil

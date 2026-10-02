@@ -39,7 +39,8 @@ type bounds struct {
 	memKills  uint64
 	cpuKills  uint64
 	refused   uint64
-	killed    bool
+	killed    bool // a bound's kill made: no second
+	finished  bool // the run ended by the payload's exit or a kill from outside the bounds
 	err       error
 	stop      chan struct{}
 	done      chan struct{}
@@ -174,12 +175,15 @@ func (b *bounds) messages() {
 		case jobMsgActiveProcessLimit:
 			b.refused++
 		case jobMsgJobMemoryLimit:
-			if !b.killed {
+			// The bound's enforcement, counted whether the run was
+			// ended already — the payload dead of the refused commit
+			// before the report was read — or not.
+			if b.memKills+b.cpuKills == 0 {
 				b.memKills++
 				b.end()
 			}
 		case jobMsgEndOfJobTime:
-			if !b.killed {
+			if b.memKills+b.cpuKills == 0 {
 				b.cpuKills++
 				b.end()
 			}
@@ -210,7 +214,7 @@ func (b *bounds) watch() {
 				b.mu.Unlock()
 				return
 			case time.Duration(a.TotalUserTime+a.TotalKernelTime)*100 > b.cpu:
-				if !b.killed {
+				if !b.killed && !b.finished && b.memKills+b.cpuKills == 0 {
 					b.cpuKills++
 					b.end()
 				}
@@ -222,7 +226,8 @@ func (b *bounds) watch() {
 	}
 }
 
-// end terminates the Job, once; called with the lock held.
+// end terminates the Job as a bound's kill, once; called with the
+// lock held.
 func (b *bounds) end() {
 	b.killed = true
 	if b.job != 0 {
@@ -230,44 +235,53 @@ func (b *bounds) end() {
 	}
 }
 
-// account reads the Job's basic accounting.
+// finish terminates the Job at the run's end — the payload's exit,
+// Destroy, cancellation — which is no bound's kill: a report the
+// port still holds is the bound's enforcement all the same.
+func (b *bounds) finish() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.finished = true
+	if b.job != 0 {
+		_ = windows.TerminateJobObject(b.job, killExitCode)
+	}
+}
+
+// account reads the Job's basic accounting, the handle held under
+// the lock through the read.
 func (b *bounds) account() (jobBasicAccounting, error) {
 	var a jobBasicAccounting
 	var n uint32
 	b.mu.Lock()
-	job := b.job
-	b.mu.Unlock()
-	if job == 0 {
+	defer b.mu.Unlock()
+	if b.job == 0 {
 		return a, fmt.Errorf("the job is closed")
 	}
-	if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&a)), uint32(unsafe.Sizeof(a)), &n); err != nil {
+	if err := windows.QueryInformationJobObject(b.job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&a)), uint32(unsafe.Sizeof(a)), &n); err != nil {
 		return a, err
 	}
 	return a, nil
 }
 
-// peak reads the peak committed memory the Job saw.
+// peak reads the peak committed memory the Job saw, the handle held
+// under the lock through the read.
 func (b *bounds) peak() (uint64, error) {
 	var x windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	var n uint32
 	b.mu.Lock()
-	job := b.job
-	b.mu.Unlock()
-	if job == 0 {
+	defer b.mu.Unlock()
+	if b.job == 0 {
 		return 0, fmt.Errorf("the job is closed")
 	}
-	if err := windows.QueryInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&x)), uint32(unsafe.Sizeof(x)), &n); err != nil {
+	if err := windows.QueryInformationJobObject(b.job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&x)), uint32(unsafe.Sizeof(x)), &n); err != nil {
 		return 0, err
 	}
 	return uint64(x.PeakJobMemoryUsed), nil
 }
 
-// kill ends every process of the run, where the Job is still open.
-func (b *bounds) kill() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.end()
-}
+// kill ends every process of the run from outside the bounds —
+// cancellation, Destroy — where the Job is still open.
+func (b *bounds) kill() { b.finish() }
 
 // halt ends the readers and waits for them, the port's remaining
 // messages read on the way out; the Job's handles stay open for the

@@ -341,10 +341,8 @@ func (s *linuxSandbox) Wait() (ExitStatus, error) {
 		// it is still reaping); a release that failed earlier is
 		// retried, not forgotten, the outcome itself what it was.
 		status, err := s.outcome.result()
-		if s.bounds.cgroup != nil {
-			if rerr := s.release(); rerr != nil {
-				return status, errors.Join(err, rerr)
-			}
+		if rerr := s.outcome.release(s.release); rerr != nil {
+			return status, errors.Join(err, rerr)
 		}
 		return status, err
 	}
@@ -356,7 +354,7 @@ func (s *linuxSandbox) Wait() (ExitStatus, error) {
 	status, err := reaped(s.cmd, s.cmd.Wait())
 	if err != nil {
 		s.outcome.end(ExitStatus{}, err)
-		return ExitStatus{}, errors.Join(err, s.release())
+		return ExitStatus{}, errors.Join(err, s.outcome.release(s.release))
 	}
 	// RLIMIT_CPU ends the run with a kill at the limit, its soft and
 	// hard limits one; the kill is the bound's where the dead
@@ -381,10 +379,8 @@ func (s *linuxSandbox) Wait() (ExitStatus, error) {
 		}
 	}
 	s.outcome.end(status, waitErr)
-	if s.bounds.cgroup != nil {
-		if rerr := s.release(); rerr != nil {
-			return status, errors.Join(waitErr, rerr)
-		}
+	if rerr := s.outcome.release(s.release); rerr != nil {
+		return status, errors.Join(waitErr, rerr)
 	}
 	return status, waitErr
 }

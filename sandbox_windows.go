@@ -165,10 +165,17 @@ func resolveWorld(spec Spec, r row) (world, error) {
 type identity struct{ volume, index uint64 }
 
 // lineage is the identities of an entry and of every directory above
-// it, the entry's own first.
+// it, the entry's own first — above the entry where it stands, not
+// where it was spelled: a junction's or symbolic link's spelling is
+// resolved first (finalPath), so that a grant through one is judged
+// against the directories over its target.
 type lineage []identity
 
 func lineageOf(path string) (lineage, error) {
+	path, err := finalPath(path)
+	if err != nil {
+		return nil, err
+	}
 	var l lineage
 	for {
 		id, err := identityOf(path)
@@ -181,6 +188,31 @@ func lineageOf(path string) (lineage, error) {
 			return l, nil
 		}
 		path = parent
+	}
+}
+
+// finalPath is the path an entry stands at, every junction and
+// symbolic link on the way resolved, as the kernel spells it.
+func finalPath(path string) (string, error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return "", err
+	}
+	h, err := windows.CreateFile(p, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return "", err
+	}
+	defer windows.CloseHandle(h)
+	buf := make([]uint16, windows.MAX_PATH)
+	for {
+		n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+		if err != nil {
+			return "", err
+		}
+		if int(n) < len(buf) {
+			return strings.TrimPrefix(windows.UTF16ToString(buf[:n]), `\\?\`), nil
+		}
+		buf = make([]uint16, n+1)
 	}
 }
 
@@ -271,6 +303,9 @@ func (s *windowsSandbox) Start(ctx context.Context) error {
 	if err != nil {
 		return fail(err)
 	}
+	// A process abandoned before it ran: ended and its streams closed;
+	// the copiers end on their own as the pipes do (a stated reader
+	// that never ends keeps its copier, as it would keep Wait).
 	abandon := func(err error) error {
 		windows.TerminateProcess(pi.Process, killExitCode)
 		windows.CloseHandle(pi.Thread)
@@ -278,7 +313,6 @@ func (s *windowsSandbox) Start(ctx context.Context) error {
 		for _, c := range closers {
 			c.Close()
 		}
-		s.copiers.Wait()
 		return fail(err)
 	}
 	if err := b.assign(pi.Process); err != nil {
@@ -547,7 +581,7 @@ func (s *windowsSandbox) Wait() (ExitStatus, error) {
 	}
 	if !s.outcome.begin() {
 		status, err := s.outcome.result()
-		if rerr := s.release(); rerr != nil {
+		if rerr := s.outcome.release(s.release); rerr != nil {
 			return status, errors.Join(err, rerr)
 		}
 		return status, err
@@ -564,7 +598,7 @@ func (s *windowsSandbox) Wait() (ExitStatus, error) {
 	status := ExitStatus{Code: int(code)}
 	// The run's remnants end with the payload, before the port is
 	// drained: a descendant left running would keep it busy.
-	s.bounds.kill()
+	s.bounds.finish()
 	s.bounds.halt()
 	st, serr := s.bounds.stats()
 	if serr != nil && waitErr == nil {
@@ -575,12 +609,13 @@ func (s *windowsSandbox) Wait() (ExitStatus, error) {
 		c.Close()
 	}
 	s.copiers.Wait()
-	windows.CloseHandle(s.process)
+	// The handle is closed only once no Signal can reach it.
 	s.mu.Lock()
 	s.final, s.running = &st, false
+	windows.CloseHandle(s.process)
 	s.mu.Unlock()
 	s.outcome.end(status, waitErr)
-	if rerr := s.release(); rerr != nil {
+	if rerr := s.outcome.release(s.release); rerr != nil {
 		return status, errors.Join(waitErr, rerr)
 	}
 	return status, waitErr
