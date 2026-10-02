@@ -304,7 +304,7 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	// A config write refused for want of a reader is the init dead
 	// before reading it, which the empty status pipe reports as the
 	// death it is (startFailure); any other write failure is its own.
-	if encodeErr != nil && !(errors.Is(encodeErr, syscall.EPIPE) && len(status) == 0) {
+	if encodeErr != nil && !initUnread(encodeErr, status) {
 		return fail(fmt.Errorf("sandbox: write init config: %v", encodeErr))
 	}
 	outcome, reason := classifyStatus(status)

@@ -242,7 +242,7 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 		_ = cmd.Wait()
 		return fail(fmt.Errorf("sandbox: read init status: %w", readErr))
 	}
-	if encodeErr != nil && !(errors.Is(encodeErr, syscall.EPIPE) && len(status) == 0) {
+	if encodeErr != nil && !initUnread(encodeErr, status) {
 		// The init never received a whole config; whatever it reported
 		// is the consequence of this fault, not of the intent. A write
 		// refused for want of a reader with nothing reported is the

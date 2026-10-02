@@ -169,6 +169,16 @@ func statusPipe() *os.File {
 	return os.NewFile(uintptr(fd), "sandbox-status")
 }
 
+// initUnread reports whether a config write's failure is the init dead
+// before reading it: the write refused for want of a reader, with
+// nothing reported on the status pipe. Such a death is the empty
+// status pipe's report (startFailure's initDied, the Re-exec
+// clause's contract breach), never the write's; any other write
+// failure is its own.
+func initUnread(encodeErr error, status []byte) bool {
+	return errors.Is(encodeErr, syscall.EPIPE) && len(status) == 0
+}
+
 // readInitConfig decodes the config the parent wrote for the init
 // from the pipe the environment names, closing it: nothing of the
 // parent's view is left open for the payload to find.
