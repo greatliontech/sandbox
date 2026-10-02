@@ -62,3 +62,17 @@ jobs:
       - run: go test ./... -count=1 -race -timeout=20m
         env:
           SANDBOX_TEST_REQUIRE_SEATBELT: "1"
+
+  # A spike on the windows runner: the facts the windows row is built
+  # on, printed as key=value lines (cmd/winspike).
+  spike-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go run ./cmd/winspike
