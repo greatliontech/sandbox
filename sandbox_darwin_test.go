@@ -5,6 +5,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"debug/macho"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -831,6 +833,9 @@ func TestRootWorld(t *testing.T) {
 	denied("unixout")
 	denied("dialout")
 	denied("net")
+	if f["lookup"] == "<nil>" {
+		t.Errorf("lookup = %q under a denied network, want no name resolution", f["lookup"])
+	}
 	denied("execout")
 	if !strings.Contains(f["cores"], "operation not permitted") {
 		t.Errorf("cores = %q, want the profile's refusal", f["cores"])
@@ -969,14 +974,20 @@ func TestRootLoadsTreeLibraries(t *testing.T) {
 		other = "arm64"
 	}
 	build("-arch", other, "-o", filepath.Join(tree, "foreign"), "alone.c")
+	build("-arch", other, "-o", filepath.Join(tree, "foreign-bad"), "alone.c", "-Wl,-rpath,/opt/elsewhere")
 	build("-o", filepath.Join(tree, "weak"), "main.c", "-Wl,-weak_library,"+filepath.Join(tree, "libabs.dylib"))
 	build("-o", filepath.Join(tree, "upward"), "main.c", "-Wl,-upward_library,"+filepath.Join(tree, "libabs.dylib"))
 	build("-dynamiclib", "-install_name", "@rpath/libre.dylib", "-o", filepath.Join(tree, "libre.dylib"), "x.c", "-Wl,-reexport_library,"+filepath.Join(tree, "libabs.dylib"))
 	build("-o", filepath.Join(tree, "dyldenv"), "alone.c", "-Wl,-dyld_env,DYLD_LIBRARY_PATH=/opt/elsewhere")
+	// Universal images whose slices disagree: the native slice is the
+	// one judged — clean beside a bad foreign one runs, bad beside a
+	// clean foreign one is refused.
 	if lipo, err := exec.LookPath("lipo"); err == nil {
-		cmd := exec.Command(lipo, "-create", filepath.Join(tree, "relative"), filepath.Join(tree, "foreign"), "-output", filepath.Join(tree, "universal"))
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("lipo: %v\n%s", err, out)
+		for name, slices := range map[string][]string{"universal": {"relative", "foreign-bad"}, "universal-bad": {"hostrpath", "foreign"}} {
+			cmd := exec.Command(lipo, "-create", filepath.Join(tree, slices[0]), filepath.Join(tree, slices[1]), "-output", filepath.Join(tree, name))
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("lipo: %v\n%s", err, out)
+			}
 		}
 	}
 	out := &output{}
@@ -990,7 +1001,7 @@ func TestRootLoadsTreeLibraries(t *testing.T) {
 			t.Fatalf("a universal image's native slice: exit %+v, output %q", st, out.String())
 		}
 	}
-	for name, want := range map[string]string{
+	refusals := map[string]string{
 		"/hostrpath":   "a run path",
 		"/absolute":    "image-absolute",
 		"/foreign":     "built for",
@@ -998,7 +1009,11 @@ func TestRootLoadsTreeLibraries(t *testing.T) {
 		"/upward":      "linked upward",
 		"/libre.dylib": "not an executable",
 		"/dyldenv":     "loader environment",
-	} {
+	}
+	if _, err := os.Stat(filepath.Join(tree, "universal-bad")); err == nil {
+		refusals["/universal-bad"] = "a run path"
+	}
+	for name, want := range refusals {
 		sb, err := New(Spec{Exec: name, Root: tree, Env: []string{}})
 		if err != nil {
 			t.Fatal(err)
@@ -1090,6 +1105,53 @@ func TestSBPLString(t *testing.T) {
 	for _, in := range []string{"/control\x01", "/bad\xff"} {
 		if _, err := sbplString(in); err == nil {
 			t.Errorf("sbplString(%q) accepted", in)
+		}
+	}
+}
+
+// TestLoadPath pins the reading of the loader commands debug/macho
+// leaves raw: each command's name at the offset its header names, in
+// either byte order, and an offset past the command read as no name.
+func TestLoadPath(t *testing.T) {
+	command := func(order binary.ByteOrder, cmd uint32, header int, name string) macho.LoadBytes {
+		size := header + len(name) + 1
+		size += (8 - size%8) % 8
+		raw := make([]byte, size)
+		order.PutUint32(raw[0:4], cmd)
+		order.PutUint32(raw[4:8], uint32(size))
+		order.PutUint32(raw[8:12], uint32(header))
+		copy(raw[header:], name)
+		return macho.LoadBytes(raw)
+	}
+	for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		f := &macho.File{FileHeader: macho.FileHeader{ByteOrder: order}}
+		for _, c := range []struct {
+			cmd    uint32
+			header int
+			what   string
+		}{
+			{loadWeakDylib, 24, "weakly linked against"},
+			{loadReexport, 24, "re-exporting"},
+			{loadLazyDylib, 24, "lazily linked against"},
+			{loadUpwardDylib, 24, "linked upward against"},
+			{loadDylinker, 12, "loaded by"},
+			{loadDyldEnv, 12, "a loader environment"},
+		} {
+			name, what, ok := loadPath(f, command(order, c.cmd, c.header, "/opt/x"))
+			if !ok || what != c.what || name != "/opt/x" {
+				t.Errorf("%v command %#x: %q %q %v", order, c.cmd, name, what, ok)
+			}
+		}
+		if name, _, ok := loadPath(f, macho.LoadBytes([]byte{0, 0, 0, 0})); ok || name != "" {
+			t.Errorf("%v a short command read as %q %v", order, name, ok)
+		}
+		raw := command(order, loadWeakDylib, 24, "/opt/x")
+		order.PutUint32(raw[8:12], 1000)
+		if name, _, ok := loadPath(f, raw); !ok || name != "" {
+			t.Errorf("%v an offset past the command read as %q %v", order, name, ok)
+		}
+		if _, _, ok := loadPath(f, command(order, 0x1d, 12, "x")); ok {
+			t.Errorf("%v a command naming nothing read as a path", order)
 		}
 	}
 }
