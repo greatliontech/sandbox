@@ -3,9 +3,12 @@
 package sandbox
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -129,34 +132,75 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 			t.hostWorkDir = filepath.Join(root, spec.WorkDir)
 		}
 	}
-	// A grant whose host path lies within the tree, or holds it — the
-	// host's root over the tree's included — would make the tree
-	// writable through the grant, which "never written" forbids;
-	// judged on the host paths before anything else is asked of them.
-	if root != "" {
-		type stated struct{ path, what string }
-		var paths []stated
-		for _, g := range spec.PathGrants {
-			paths = append(paths, stated{g.Path, "grant"})
+	// The host entries the stated paths name, read once: a grant
+	// whose host entry lies within the tree, or holds it — the host's
+	// root over the tree's included — would make the tree writable
+	// through the grant, which "never written" forbids; judged by
+	// identity on the host entries before anything else is asked of
+	// them, and again for overlap once the binds are resolved. The
+	// paths are resolved before the mount table is read: resolving
+	// walks through every directory on the way, which triggers an
+	// automount there, and the mount it attaches must be in the table.
+	type stated struct{ path, what, host string }
+	var paths []stated
+	for _, g := range spec.PathGrants {
+		paths = append(paths, stated{path: g.Path, what: "grant"})
+	}
+	if spec.RuntimeDir != "" {
+		paths = append(paths, stated{path: spec.RuntimeDir, what: "runtime dir"})
+	}
+	for i, p := range paths {
+		if !filepath.IsAbs(p.path) || filepath.Clean(p.path) != p.path {
+			continue // resolveGrant refuses it by name
 		}
-		if spec.RuntimeDir != "" {
-			paths = append(paths, stated{spec.RuntimeDir, "runtime dir"})
+		if host, err := filepath.EvalSymlinks(p.path); err == nil {
+			paths[i].host = host
+		} // else resolveGrant refuses it by name
+	}
+	var m *mounts
+	if len(paths) > 0 {
+		var err error
+		if m, err = readMounts(); err != nil {
+			return undeliverable("the host's mounts: %v", err)
+		}
+	}
+	hosts := map[string]named{}
+	for _, p := range paths {
+		if p.host == "" {
+			continue
+		}
+		e, unread, err := hostEntry(m, p.host, true)
+		if err != nil {
+			return undeliverable("%s %s: %v", p.what, p.path, err)
+		}
+		if len(e) == 0 {
+			return undeliverable("%s %s: cannot be read", p.what, p.path)
+		}
+		hosts[p.path] = named{e, unread}
+	}
+	if root != "" && len(paths) > 0 {
+		tree, treeUnread, err := hostEntry(m, root, false)
+		if err != nil {
+			return undeliverable("root %s: %v", spec.Root, err)
 		}
 		for _, p := range paths {
-			if !filepath.IsAbs(p.path) || filepath.Clean(p.path) != p.path {
-				continue // resolveGrant refuses it by name
+			h, ok := hosts[p.path]
+			if !ok {
+				continue
 			}
-			host, err := filepath.EvalSymlinks(p.path)
-			if err != nil {
-				continue // resolveGrant refuses it by name
+			switch rel, via := h.entry.judge(tree); rel {
+			case sameEntry:
+				return undeliverable("%s %s is the tree %s%s", p.what, p.path, spec.Root, via)
+			case withinEntry:
+				return undeliverable("%s %s lies within the tree %s%s", p.what, p.path, spec.Root, via)
+			case holdsEntry:
+				return undeliverable("%s %s holds the tree %s%s", p.what, p.path, spec.Root, via)
 			}
-			switch {
-			case host == root:
-				return undeliverable("%s %s is the tree %s", p.what, p.path, spec.Root)
-			case within(host, root):
-				return undeliverable("%s %s lies within the tree %s", p.what, p.path, spec.Root)
-			case within(root, host):
-				return undeliverable("%s %s holds the tree %s", p.what, p.path, spec.Root)
+			if len(h.unread) > 0 {
+				return undeliverable("%s %s: its spelling %s, so what it names is not judged against the tree", p.what, p.path, h.unread[0])
+			}
+			if len(treeUnread) > 0 {
+				return undeliverable("root %s: its spelling %s, so %s %s is not judged against it", spec.Root, treeUnread[0], p.what, p.path)
 			}
 		}
 	}
@@ -180,18 +224,242 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 		t.runtime = len(binds)
 		binds = append(binds, b)
 	}
-	// Overlap is judged on the canonical targets, where two stated
-	// spellings of one directory — or a symlink into another grant's
-	// subtree — meet.
-	for i, a := range binds {
-		for _, b := range binds[i+1:] {
-			if a.Target == b.Target || strings.HasPrefix(a.Target, b.Target+"/") || strings.HasPrefix(b.Target, a.Target+"/") {
-				return undeliverable("grants %s and %s overlap", a.Source, b.Source)
+	// Overlap is judged by identity on the host entries and on the
+	// entries they land on, where two stated spellings of one
+	// directory — or a symlink into another grant's subtree — meet:
+	// two intents over one host entry have no single delivery under
+	// an allowlist, which unites their rights on the one inode, and
+	// two over one entry of the tree none under binds.
+	type placed struct {
+		bind           bind
+		source, target named
+	}
+	var placements []placed
+	for i, b := range binds {
+		what := "grant"
+		if i == t.runtime {
+			what = "runtime dir"
+		}
+		p := placed{bind: b}
+		var ok bool
+		if p.source, ok = hosts[b.Source]; !ok {
+			return undeliverable("%s %s: cannot be read", what, b.Source)
+		}
+		p.target = p.source
+		if root != "" {
+			e, unread, err := hostEntry(m, b.Target, true)
+			if err != nil {
+				return undeliverable("%s %s: %v", what, b.Source, err)
+			}
+			p.target = named{e, unread}
+		}
+		placements = append(placements, p)
+	}
+	for i, a := range placements {
+		for _, b := range placements[i+1:] {
+			if rel, via := a.source.entry.judge(b.source.entry); rel != apart {
+				return undeliverable("grants %s and %s overlap%s", a.bind.Source, b.bind.Source, via)
+			}
+			if rel, via := a.target.entry.judge(b.target.entry); rel != apart {
+				return undeliverable("grants %s and %s overlap in the tree%s", a.bind.Source, b.bind.Source, via)
+			}
+			for _, n := range []struct {
+				own   string
+				other string
+				where named
+			}{{a.bind.Source, b.bind.Source, a.source}, {b.bind.Source, a.bind.Source, b.source}, {a.bind.Source, b.bind.Source, a.target}, {b.bind.Source, a.bind.Source, b.target}} {
+				if len(n.where.unread) > 0 {
+					return undeliverable("grant %s: its spelling %s, so what it names is not judged against grant %s", n.own, n.where.unread[0], n.other)
+				}
 			}
 		}
 	}
 	t.binds = binds
 	return t, nil
+}
+
+// identity is an entry's identity on the host: the device and inode
+// every spelling of one entry shares — a bind mount's, a firmlink's,
+// a case variant's, a symlink's. Containment and overlap are judged
+// on it, never on spelling alone: a canonical spelling unifies
+// symlinks and nothing else, and a bind mount has no canonical
+// spelling at all.
+type identity struct{ dev, ino uint64 }
+
+// lineage is one spelling of an entry with the identities of the
+// entry and of every directory above it along that spelling, the
+// entry's own first: what a rule over a directory reaches.
+type lineage struct {
+	path string
+	ids  []identity
+}
+
+// lineageOf reads the lineage of the canonical path p.
+func lineageOf(p string) (lineage, error) {
+	l := lineage{path: p}
+	for {
+		fi, err := os.Stat(p)
+		if err != nil {
+			return lineage{}, err
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			return lineage{}, fmt.Errorf("%s: no inode", p)
+		}
+		l.ids = append(l.ids, identity{dev: uint64(st.Dev), ino: st.Ino})
+		if p == "/" {
+			return l, nil
+		}
+		p = filepath.Dir(p)
+	}
+}
+
+// entry is a host entry as a path rule reaches it: one lineage for
+// each spelling under which the entry, or what lies beneath it, can
+// be named — the entry's canonical path; its origin's spellings,
+// where a mount grafts a subtree of one filesystem onto another path
+// (a bind mount of a directory) or a firmlink does, so that a rule
+// over the origin's ancestor reaches the entry too; and, where the
+// mounts beneath count, the spellings of every mount beneath it, a
+// rule over a directory reaching every mount beneath. The first
+// lineage is the entry's own canonical spelling.
+type entry []lineage
+
+// hostEntry reads the entry of the canonical path p, with the mounts
+// beneath it where beneath is set — a grant's, which a rule covers
+// whole; never the tree's, whose own mounts are the caller's shape.
+// A spelling the caller cannot read — an origin's, a mount's beneath
+// — is unread where a directory the caller owns bars it: the
+// payload, running as the caller, may open that directory from
+// within a grant, so what the spelling names is unjudged, which a
+// judgement that finds nothing else must refuse. One barred by
+// another's directory, or naming nothing, is left out: the payload
+// cannot reach it either.
+func hostEntry(m *mounts, p string, beneath bool) (e entry, unread []string, err error) {
+	if e, unread, err = spellingsOf(m, p); err != nil {
+		return nil, nil, err
+	}
+	if beneath {
+		for _, mb := range m.beneath(p) {
+			spellings := append([]string{mb.point}, mb.origins...)
+			if mb.err != nil {
+				if barred(mb.point, mb.err) {
+					unread = append(unread, unreadable(mb.point, mb.err))
+				}
+				spellings = nil
+			}
+			for _, s := range spellings {
+				l, err := lineageOf(s)
+				if err != nil {
+					if barred(s, err) {
+						unread = append(unread, unreadable(s, err))
+					}
+					continue
+				}
+				e = append(e, l)
+			}
+		}
+	}
+	slices.Sort(unread)
+	return e, unread, nil
+}
+
+// unreadable spells an unread spelling with why it is: "<path>
+// cannot be read (<reason>)".
+func unreadable(s string, err error) string {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		err = pe.Err
+	}
+	return fmt.Sprintf("%s cannot be read (%v)", s, err)
+}
+
+// errUntriggered is an automount point not yet triggered: what a
+// lookup there would mount is the map's to say, and the resolution
+// fires none, so the entry is unjudged.
+var errUntriggered = errors.New("an automount not yet triggered, which the resolution does not fire")
+
+// mountBeneath is a mount beneath a directory: its mount point and
+// the spellings its origin has, or the failure to read them.
+type mountBeneath struct {
+	point   string
+	origins []string
+	err     error
+}
+
+// spellingsOf reads the lineages of the canonical path p and of its
+// origin spellings, p's own first, p itself readable or the error
+// its own; an origin the caller cannot read is unread where a
+// directory the caller owns bars it (barred), left out otherwise;
+// p an automount point not yet triggered is unread as such.
+func spellingsOf(m *mounts, p string) (e entry, unread []string, err error) {
+	l, err := lineageOf(p)
+	if err != nil {
+		return nil, nil, err
+	}
+	e = entry{l}
+	if m.untriggered(p) {
+		// Its origins are not asked for: reading them would open the
+		// point, which is what fires it.
+		return e, []string{unreadable(p, errUntriggered)}, nil
+	}
+	origins, err := m.origins(p)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, s := range origins {
+		l, err := lineageOf(s)
+		if err != nil {
+			if barred(s, err) {
+				unread = append(unread, unreadable(s, err))
+			}
+			continue
+		}
+		e = append(e, l)
+	}
+	return e, unread, nil
+}
+
+// barred reports whether the spelling s, unreadable for err, is
+// barred by a directory the caller owns — the deepest one on the way
+// that can still be reached, which the payload, running as the
+// caller, could open — rather than naming nothing or lying behind a
+// directory another user closed, which stays closed to the payload.
+// A failure of another kind, on the spelling or on the way to it, is
+// a spelling that cannot be judged.
+func barred(s string, err error) bool {
+	switch {
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.ELOOP), errors.Is(err, syscall.ENAMETOOLONG):
+		return false
+	case !errors.Is(err, fs.ErrPermission):
+		return true
+	}
+	dir := "/"
+	for _, seg := range strings.Split(strings.TrimPrefix(s, "/"), "/") {
+		next := filepath.Join(dir, seg)
+		if _, err := os.Lstat(next); err != nil {
+			if !errors.Is(err, fs.ErrPermission) {
+				return true
+			}
+			break
+		}
+		dir = next
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return true
+	}
+	// Ownership is the effective user's: the one permission checks
+	// are made for, and the one a chmod is allowed to.
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	return !ok || int(st.Uid) == os.Geteuid()
+}
+
+// named is what a stated path names: its entry, and the mounts
+// beneath it the caller could not read under any spelling.
+type named struct {
+	entry  entry
+	unread []string
 }
 
 // within reports whether the canonical path p lies strictly beneath
@@ -201,6 +469,43 @@ func within(p, dir string) bool {
 		return p != "/"
 	}
 	return strings.HasPrefix(p, dir+"/")
+}
+
+// relation is how one entry stands to another.
+type relation int
+
+const (
+	apart       relation = iota
+	sameEntry            // one entry
+	holdsEntry           // a directory strictly above the other
+	withinEntry          // strictly beneath the other
+)
+
+// judge reports how e stands to o, and the spellings it found the
+// relation through where they are not the entries' own: "" where
+// both are, " through <e's> (<o's>)" otherwise.
+func (e entry) judge(o entry) (relation, string) {
+	for _, l := range e {
+		for _, k := range o {
+			var rel relation
+			switch {
+			case l.ids[0] == k.ids[0]:
+				rel = sameEntry
+			case slices.Contains(k.ids[1:], l.ids[0]):
+				rel = holdsEntry
+			case slices.Contains(l.ids[1:], k.ids[0]):
+				rel = withinEntry
+			default:
+				continue
+			}
+			via := ""
+			if l.path != e[0].path || k.path != o[0].path {
+				via = fmt.Sprintf(" through %s (%s)", l.path, k.path)
+			}
+			return rel, via
+		}
+	}
+	return apart, ""
 }
 
 // resolveGrant validates one stated path and computes its bind.

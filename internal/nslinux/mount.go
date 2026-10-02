@@ -3,6 +3,7 @@
 package nslinux
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -114,7 +115,7 @@ func RemountReadOnlyTree(path, mountinfo string) error {
 	if err != nil {
 		return fmt.Errorf("read-only %s: %w", path, err)
 	}
-	mounts, err := readOnlySubtree(info, path)
+	mounts, err := readOnlySubtree(info, path, MountID)
 	if err != nil {
 		return err
 	}
@@ -144,34 +145,36 @@ func remountReadOnly(mountpoint string) error {
 // must cover, refusing — never silently covering nothing — when the
 // listing shows no mount at path: the self-bind guarantees one at
 // the canonical path, so its absence means path was not canonical.
-func readOnlySubtree(mountinfo []byte, path string) ([]string, error) {
-	mounts := mountSubtree(mountinfo, path)
+func readOnlySubtree(mountinfo []byte, path string, mountID func(string) (int, error)) ([]string, error) {
+	mounts := mountSubtree(mountinfo, path, mountID)
 	if len(mounts) == 0 {
 		return nil, fmt.Errorf("read-only %s: the bind is not listed at that path (a symlink on the way?)", path)
 	}
 	return mounts, nil
 }
 
-// mountSubtree lists, from a mountinfo listing, the topmost mount at
-// path — the last record naming it: mountinfo is emitted in attach
-// order (the namespace list's tail before kernel 6.8, the rbtree of
-// unique, monotonic mount ids since), so the last record at a path
-// is the mount most recently attached there — and every mount
-// beneath it by parent id, shallowest first. Mounts
-// the top one shadows (older mounts at or under the same path) are
-// not its descendants and are left out: they are no longer reachable
-// by path. Empty when no mount is recorded at path. Fields 1 and 2
-// of a record are the mount id and its parent's; field 5 is the
-// mount point, with octal escapes for the characters mountinfo
-// cannot print.
-func mountSubtree(mountinfo []byte, path string) []string {
-	path = filepath.Clean(path)
-	type rec struct {
-		id, parent int
-		mp         string
-	}
-	var recs []rec
-	top := -1
+// Mount is one record of a mountinfo listing: the mount's id and its
+// parent's (fields 1 and 2), the mounted filesystem's device as
+// major:minor (field 3), the root of the mount within that
+// filesystem (field 4, "/" for the whole of it, a directory's path
+// for a bind of that directory), the mount point (field 5), the
+// paths with mountinfo's octal escapes decoded, and the filesystem
+// type (the field after the separator).
+type Mount struct {
+	ID, Parent int
+	Dev        string
+	Root       string
+	Point      string
+	Type       string
+}
+
+// ParseMountinfo reads a mountinfo listing's records in their listed
+// order — attach order: the namespace list's tail before kernel 6.8,
+// the rbtree of unique, monotonic mount ids since — so the last
+// record at a path is the mount most recently attached there.
+// Records it cannot read are left out.
+func ParseMountinfo(mountinfo []byte) []Mount {
+	var recs []Mount
 	for _, line := range strings.Split(string(mountinfo), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 5 {
@@ -182,28 +185,219 @@ func mountSubtree(mountinfo []byte, path string) []string {
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		r := rec{id: id, parent: parent, mp: unescapeMountinfo(f[4])}
-		if r.mp == path {
-			top = len(recs)
+		r := Mount{ID: id, Parent: parent, Dev: f[2], Root: unescapeMountinfo(f[3]), Point: unescapeMountinfo(f[4])}
+		for i := 6; i+1 < len(f); i++ {
+			if f[i] == "-" {
+				r.Type = f[i+1]
+				break
+			}
 		}
 		recs = append(recs, r)
 	}
-	if top < 0 {
+	return recs
+}
+
+// Mounts is a mountinfo listing read as the mount tree it describes,
+// with the kernel's own word on which mount a path reaches (MountID):
+// the listing alone cannot tell, a mount moved under another keeping
+// its place in it, and a mount mounted over hides what it covers.
+type Mounts struct {
+	recs    []Mount
+	index   map[int]int // mount id to its record
+	mountID func(path string) (int, error)
+}
+
+// NewMounts reads the listing's records into the tree; mountID
+// tells the id of the mount a path reaches (MountID on a live
+// host).
+func NewMounts(recs []Mount, mountID func(path string) (int, error)) *Mounts {
+	m := &Mounts{recs: recs, index: map[int]int{}, mountID: mountID}
+	for i, r := range recs {
+		m.index[r.ID] = i
+	}
+	return m
+}
+
+// Records lists every record, in listed order.
+func (m *Mounts) Records() []Mount { return m.recs }
+
+// At is the mount the path p reaches, as the kernel reports it; the
+// error says where p cannot be read, or where the kernel names a
+// mount the listing lacks (one attached since the listing was read,
+// which is ErrUnlisted).
+func (m *Mounts) At(p string) (*Mount, error) {
+	id, err := m.mountID(p)
+	if err != nil {
+		return nil, err
+	}
+	i, ok := m.index[id]
+	if !ok {
+		return nil, &os.PathError{Op: "mount", Path: p, Err: ErrUnlisted}
+	}
+	return &m.recs[i], nil
+}
+
+// ErrUnlisted is the kernel naming, for a path, a mount the listing
+// read for the resolution lacks.
+var ErrUnlisted = errors.New("reaches a mount not in the listing")
+
+// Beneath lists the mounts strictly beneath the canonical directory
+// dir that their own mount points reach — a mount covered by another
+// is not among them, no path reaching it — and, apart, those whose
+// mount points could not be read, which may reach their mounts.
+func (m *Mounts) Beneath(dir string) (visible, unread []Mount) {
+	for _, r := range m.recs {
+		if !beneathPath(r.Point, dir) {
+			continue
+		}
+		at, err := m.At(r.Point)
+		if err != nil {
+			unread = append(unread, r)
+			continue
+		}
+		if at.ID == r.ID {
+			visible = append(visible, r)
+		}
+	}
+	return visible, unread
+}
+
+// Covers reports whether the path p, spelled through the mount o
+// (p at or beneath o's point), reaches another mount instead: one
+// covering o itself — a mount stacked on o, or one hanging from a
+// member A of o's ancestor chain at or above the point of the next
+// member below A, which cannot have been there before that member
+// was attached beneath it (it would hang beneath the newcomer) and
+// so lies over it, where one strictly inside that member's region
+// is hidden by it instead — or a listed mount descending from o by
+// parent ids whose point lies on the way from o's point to p, p
+// itself included. Parent ids are the kernel's own word on where a
+// mount hangs, moves included, so no path need be walked.
+func (m *Mounts) Covers(o Mount, p string) bool {
+	chain := []Mount{o} // o first, then each ancestor
+	below := map[int]Mount{}
+	seen := map[int]bool{o.ID: true}
+	for r := o; ; {
+		i, ok := m.index[r.Parent]
+		if !ok || seen[r.Parent] {
+			break
+		}
+		seen[r.Parent] = true
+		below[r.Parent] = r
+		r = m.recs[i]
+		chain = append(chain, r)
+	}
+	for _, c := range m.recs {
+		if seen[c.ID] {
+			continue
+		}
+		if c.Parent == o.ID {
+			if c.Point == o.Point {
+				return true // stacked on o
+			}
+			if (c.Point == p || beneathPath(p, c.Point)) && beneathPath(c.Point, o.Point) {
+				return true // beneath o, on the way
+			}
+			continue
+		}
+		if b, ok := below[c.Parent]; ok && (c.Point == b.Point || beneathPath(b.Point, c.Point)) {
+			return true // over a member of o's chain
+		}
+		if (c.Point == p || beneathPath(p, c.Point)) && beneathPath(c.Point, o.Point) && m.descends(c, o.ID) {
+			return true // beneath o, on the way
+		}
+	}
+	return false
+}
+
+// descends reports whether r lies under the mount with id ancestor
+// in the tree by parent ids.
+func (m *Mounts) descends(r Mount, ancestor int) bool {
+	seen := map[int]bool{}
+	for r.ID != ancestor {
+		i, ok := m.index[r.Parent]
+		if !ok || seen[r.ID] {
+			return false
+		}
+		seen[r.ID] = true
+		r = m.recs[i]
+	}
+	return true
+}
+
+// subtree lists the mount at path, where the mount path reaches is
+// mounted exactly there, and every mount beneath it by parent id,
+// shallowest first.
+func (m *Mounts) subtree(path string) []string {
+	top, err := m.At(path)
+	if err != nil || top.Point != path {
 		return nil
 	}
-	children := map[int][]rec{}
-	for _, r := range recs {
-		children[r.parent] = append(children[r.parent], r)
+	children := map[int][]Mount{}
+	for _, r := range m.recs {
+		children[r.Parent] = append(children[r.Parent], r)
 	}
 	var out []string
-	queue := []rec{recs[top]}
+	queue := []Mount{*top}
 	for len(queue) > 0 {
 		r := queue[0]
 		queue = queue[1:]
-		out = append(out, r.mp)
-		queue = append(queue, children[r.id]...)
+		out = append(out, r.Point)
+		queue = append(queue, children[r.ID]...)
 	}
 	return out
+}
+
+// beneathPath reports whether the canonical path p lies strictly
+// beneath the canonical directory dir — every path but "/" lies
+// beneath "/".
+func beneathPath(p, dir string) bool {
+	if dir == "/" {
+		return p != "/"
+	}
+	return strings.HasPrefix(p, dir+"/")
+}
+
+// MountID is the id, as mountinfo lists it, of the mount the path
+// reaches: statx's mount id where the kernel reports one (5.8), the
+// mount id in the fdinfo of a path descriptor otherwise. Neither
+// triggers an automount at the path: statx honours AT_NO_AUTOMOUNT
+// only when asked (stat always passes it), and a path descriptor
+// carries no intent to open.
+func MountID(path string) (int, error) {
+	var stx unix.Statx_t
+	err := unix.Statx(unix.AT_FDCWD, path, unix.AT_NO_AUTOMOUNT, unix.STATX_MNT_ID, &stx)
+	if err == nil && stx.Mask&unix.STATX_MNT_ID != 0 {
+		return int(stx.Mnt_id), nil
+	}
+	if err != nil && !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EINVAL) {
+		return 0, &os.PathError{Op: "statx", Path: path, Err: err}
+	}
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	defer unix.Close(fd)
+	info, err := os.ReadFile(fmt.Sprintf("/proc/self/fdinfo/%d", fd))
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(info), "\n") {
+		if v, ok := strings.CutPrefix(line, "mnt_id:"); ok {
+			return strconv.Atoi(strings.TrimSpace(v))
+		}
+	}
+	return 0, fmt.Errorf("%s: no mount id in its fdinfo", path)
+}
+
+// mountSubtree lists, from a mountinfo listing, the mount at path —
+// the one path reaches, which a self-bind has just made the newest
+// there — and every mount beneath it by parent id, shallowest
+// first. Mounts the top one covers are not its descendants and are
+// left out: no path reaches them. Empty when no mount is recorded
+// at path; mountID tells the mount a path reaches.
+func mountSubtree(mountinfo []byte, path string, mountID func(string) (int, error)) []string {
+	return NewMounts(ParseMountinfo(mountinfo), mountID).subtree(filepath.Clean(path))
 }
 
 // unescapeMountinfo decodes mountinfo's octal escapes (\040 for a
