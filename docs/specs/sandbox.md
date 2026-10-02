@@ -80,7 +80,10 @@ independent by design.
   cache, reads under `/System`, `/usr/lib`, `/usr/share` and
   `/Library/Apple`, the timezone database, the passwd and services
   files, the basic devices, the kernel's sysctl facts, the system
-  logger's socket, a fixed set of mach services — together, on
+  logger's socket, a fixed set of mach services; on windows what the
+  platform grants every package (the system's own directory and
+  what else it opens to `ALL APPLICATION PACKAGES`, its services
+  among them) — together, on
   darwin alone, with the sandbox's own calling binary, whose second
   stage runs under the profile before the payload, so the payload
   may read and execute that binary; it writes only where a
@@ -102,20 +105,27 @@ independent by design.
   (`ErrUndeliverable`): the tier grades exposure, and an intent
   nothing delivers is a refusal, never an omission. Grants and the
   rendezvous directory land on entries the caller placed in the tree
-  at their own paths — an
-  absent or wrong-kind target, or one reached through a symlink at
-  any component, is an undeliverable intent, never an omission; so is
+  at their own paths — a host path, which a row presenting the tree
+  at `/` binds there and a row presenting the tree at its host path
+  reaches at the same spelling, so one tree serves every unix row —
+  an absent or wrong-kind target, or one reached through a symlink
+  at any component, is an undeliverable intent, never an omission
+  (on windows, whose host paths have no spelling inside a tree, they
+  land at their host paths and the tree holds no entry for them); so
+  is
   a grant overlapping another grant or the rendezvous directory, two
   intents over one entry having no single delivery, a rendezvous
   directory that is no directory, and a file grant with more than
   one name on the host, which could be the tree's own file under
   another (a hard link, which no path can see) — a read-write
   directory grant holding such a link is the caller's own doing, the
-  tree being the caller's to shape — and a read-only grant is
-  read-only throughout, submounts included. Containment and overlap
+  tree being the caller's to shape (where grants land in the tree) —
+  and a read-only grant is read-only throughout, submounts
+  included. Containment and overlap
   are judged by the entries named, never by their spellings: every
   spelling the kernel resolves to one entry (a bind mount's, a
-  firmlink's, a case variant's, a symlink's) names that entry; a
+  firmlink's, a case variant's, a symlink's, a junction's) names
+  that entry; a
   grant names, besides its own entry, every mount beneath it, which
   a rule over the grant reaches; and an entry reached through a
   mount grafting a directory of one filesystem onto another path (a
@@ -141,7 +151,12 @@ independent by design.
   another's files under their own identity (an overlay's, before a
   copy-up) is that entry, a refusal never an admission. The tree itself
   is never written, not even transiently: a shared, read-only tree is
-  a valid `Root`. The environment is caller-supplied state: under a
+  a valid `Root` — its contents, that is: the windows row writes the
+  tree's entries' descriptors for the run as it does a grant's, the
+  one platform where presenting the world writes descriptors, so a
+  tree whose descriptors the caller may not write is undeliverable
+  there unless the platform grants every package what the tree's
+  grant would. The environment is caller-supplied state: under a
   `Root` an unstated environment is empty, never the host's.
 - **Re-exec is part of the mechanism.** A pure-Go backend creating
   namespaces at clone time runs the calling binary as the sandbox's
@@ -249,7 +264,7 @@ independent by design.
 | linux, unprivileged user namespaces available | namespaces (user, mount, pid, uts, ipc; net unless granted), pivoted read-only root repeating locked mount flags, capability drop, seccomp holding for every syscall ABI the kernel exposes (a foreign-ABI call is killed, never let through unfiltered), `no_new_privs`, cgroup-or-rlimit bounds | `Strong` |
 | linux, user namespaces unavailable, Landlock available | Landlock filesystem allowlist over the world at its host paths (the caller's whole world where no `Root` is stated), seccomp network denial at the socket (Landlock ABI 4's TCP restrictions are supplementary, never the sole arm — UDP and raw sockets stay open without seccomp; an ABI that also multiplexes the socket calls through `socketcall` refuses that route whole, the local family reached by the direct calls), Landlock's IPC scoping where the kernel has it (ABI 6), `no_new_privs`, cgroup-or-rlimit bounds; static entrypoints only under a `Root` — an ELF the kernel loads whole, native, with no interpreter; a script, a dynamically linked executable, or a file the check cannot read is refused | `OS` |
 | darwin, Seatbelt available (`sandbox-exec` applies a profile) | Seatbelt profile: under a `Root`, nothing by default but the platform's execution substrate as Apple's own `system.sb` states it (dyld, the system libraries and frameworks, the services every process reaches, name resolution not among them) less the one place it lets a process create files (`/cores`), the tree read, mapped and executed at its host path so an entrypoint may load the tree's own libraries and execute a sibling of the tree, the calling binary read and executed (its second stage runs under the profile before the payload: an exposure of that binary's bytes and its execution to the payload), grants read, mapped and executed as on the Linux `OS` row and read-write ones written, the rendezvous directory read and written with unix sockets within it alone, the network by address where granted, the platform's name resolution with it (a unix socket elsewhere on the host is not the network); the entrypoint an executable Mach-O image for the machine — the machine being the one the calling binary runs for; an image for another machine the host could translate is refused all the same — whose dynamic linker, libraries and run paths are the substrate's or relative to the image and which sets no loader environment, a script or an image linked at an image-absolute path refused; a grant's two spellings of one directory (a firmlink's, a case variant's) judged one, by identity as everywhere; without a `Root`, the whole world with the network denied at the socket — the platform's mach services stay reachable, name resolution among them, as a row without namespaces leaves IPC — and a read-only grant refused, the profile over the whole world having no rule a renamed ancestor cannot carry a grant out of; the profile matching the kernel's own spelling of every path; rlimit bounds with the watchdog behind them | `OS` |
-| windows, an AppContainer available (the platform makes a profile for the user) | an AppContainer of the run's own: a package identity the payload's process carries, which reaches nothing the platform does not grant every package (the system's own files and services) or the run's grants do not name — the entrypoint's own directory read and executed (the platform loads a program's libraries from beside it), each grant read and executed and read-write ones written, the rendezvous directory read and written, each carrying an entry for the run's identity in its security descriptor for the run's duration — the one platform where presenting the world writes the entries' descriptors, which the sandbox serializes within its process and nothing serializes between processes; an entry the caller may not write to is an undeliverable grant, unless the platform already grants every package what the entry would (its own directories, the system's) — a read-write grant's entry carrying the data's writing and the entries' making, renaming and deleting, never the permissions or the owner; the run's identity drawn at random and never reused, so what a crashed run left behind serves no later one; the package's own directory, which the platform gives every package to write and deletes with the profile, the payload's temporary directory redirected into it; the network withheld unless granted, when the internet and the private network open as client and server — never an address of the host's own, loopback or interface, which the platform keeps from every package short of an administrator's exemption; the launch demanding `LOCALAPPDATA` and the platform's own libraries resolving their paths from `SystemRoot`, both carried from the host where the stated environment lacks them, the launch adding the temporary directory's two variables redirected into the package's directory; no hostname, no `Root` until its world under one is delivered, no open-file bound; Job Object bounds, every process of the run born into the Job and ended with its last handle | `OS` |
+| windows, an AppContainer available (the platform makes a profile for the user) | an AppContainer of the run's own: a package identity the payload's process carries, which reaches nothing the platform does not grant every package (the system's own files and services) or the run's grants do not name — the entrypoint's own directory read and executed (the platform loads a program's libraries from beside it), each grant read and executed and read-write ones written, the rendezvous directory read and written, each carrying an entry for the run's identity in its security descriptor for the run's duration — the one platform where presenting the world writes the entries' descriptors, which the sandbox serializes within its process and nothing serializes between processes; an entry the caller may not write to is an undeliverable grant, unless the platform already grants every package what the entry would (its own directories, the system's) — a read-write grant's entry carrying the data's writing and the entries' making, renaming and deleting, never the permissions or the owner; the run's identity drawn at random and never reused, so what a crashed run left behind serves no later one; the package's own directory, which the platform gives every package to write and deletes with the profile, the payload's temporary directory redirected into it; the network withheld unless granted, when the internet and the private network open as client and server — never an address of the host's own, loopback or interface, which the platform keeps from every package short of an administrator's exemption; the launch demanding `LOCALAPPDATA` and the platform's own libraries resolving their paths from `SystemRoot`, both carried from the host where the stated environment lacks them, the launch adding the temporary directory's two variables redirected into the package's directory; under a `Root`, the tree read and executed at its host path, its entries' descriptors carrying the run's identity as a grant's do (a tree whose descriptors the caller cannot write is undeliverable unless the platform grants every package what the tree's grant would; its contents never written), the entrypoint and the working directory paths in the tree the platform resolves as it resolves any — a link in the tree followed on the host, one leading out of the tree refused — and grants and the rendezvous directory at their host paths with no entry in the tree; the entrypoint, under a `Root` or not, a PE executable image, a library, a script or a file of another format refused before anything runs; the tree, each granted entry and every entry beneath them held, by the platform's own access check for the run's identity, to allowing what the grant carries (an entry's deleting, by its directory) — one that does not (a protected descriptor, which inherits nothing; a denying entry the run's user matches, the granted one's own ahead of the entry written for the run — the platform heeds no denial naming every package for a package's identity; a narrowed inheritance) is an undeliverable grant, and a directory the caller cannot list is unjudged, a refusal — a link or junction beneath leading where its target's own descriptor allows, the grant not reaching through it; no hostname, no open-file bound; Job Object bounds, every process of the run born into the Job and ended with its last handle | `OS` |
 | any platform where no security boundary is available but resource bounds are | resource bounds (rlimits, a Job Object, darwin's watchdog) | `Minimal` |
 | anything else | refused (`ErrUnsupported`) | — |
 

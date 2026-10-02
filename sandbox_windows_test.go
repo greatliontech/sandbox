@@ -28,7 +28,13 @@ const childEnv = "SANDBOX_TEST_CHILD"
 // TestMain runs this binary as the payload where the marker names a
 // mode, the tests' own process otherwise.
 func TestMain(m *testing.M) {
-	if mode := os.Getenv(childEnv); mode != "" {
+	mode := os.Getenv(childEnv)
+	// The world mode rides the arguments: its run states no
+	// environment, under a Root, and sees what the launch carries.
+	if len(os.Args) > 1 && os.Args[1] == "world" {
+		mode = "world"
+	}
+	if mode != "" {
 		child(mode)
 		os.Exit(0)
 	}
@@ -119,6 +125,38 @@ func child(mode string) {
 		say("repermission", err)
 	case "sleep":
 		time.Sleep(20 * time.Second)
+	case "world":
+		// The Root world: the tree read and executed at its host path,
+		// never written; a grant and the rendezvous directory at
+		// their host paths; the host beyond unread.
+		tree, ro, rw, rt, outside := os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6]
+		wd, _ := os.Getwd()
+		say("cwd", wd)
+		say("env", len(os.Environ()))
+		_, err := os.ReadFile(filepath.Join(tree, "etc", "tree-marker"))
+		say("readtree", err)
+		_, err = os.ReadFile(filepath.Join(tree, "etc", "link-marker"))
+		say("readlink", err)
+		say("writetree", os.WriteFile(filepath.Join(tree, "etc", "w"), []byte("x"), 0o644))
+		_, err = os.ReadFile(filepath.Join(outside, "secret"))
+		say("readoutside", err)
+		_, err = os.ReadFile(filepath.Join(ro, "f"))
+		say("readro", err)
+		say("writero", os.WriteFile(filepath.Join(ro, "w"), []byte("x"), 0o644))
+		say("writerw", os.WriteFile(filepath.Join(rw, "w"), []byte("x"), 0o644))
+		say("writert", os.WriteFile(filepath.Join(rt, "w"), []byte("x"), 0o644))
+		runs := func(exe string) string {
+			cmd := exec.Command(exe)
+			cmd.Env = append(os.Environ(), childEnv+"=hello")
+			// The child's input is this process's own: a package may
+			// not open the null device by name, which os/exec would
+			// for an unstated input.
+			cmd.Stdin = os.Stdin
+			out, err := cmd.Output()
+			return fmt.Sprintf("%v:%s", err, strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0]))
+		}
+		say("sibling", runs(filepath.Join(tree, "sibling.exe")))
+		say("execout", runs(filepath.Join(outside, "payload.exe")))
 	}
 }
 
@@ -275,8 +313,7 @@ func TestGrantsRespected(t *testing.T) {
 }
 
 // entries counts the entries of a path's descriptor for a package
-// identity (an AppContainer's SID, S-1-15-2-...), walking the ACL's
-// own layout: the header, then each ACE with its SID after the mask.
+// identity (an AppContainer's SID, S-1-15-2-...).
 func entries(t *testing.T, path string) int {
 	t.Helper()
 	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
@@ -287,22 +324,16 @@ func entries(t *testing.T, path string) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if acl == nil {
-		return 0
-	}
 	n := 0
-	p := unsafe.Pointer(acl)
-	ace := unsafe.Add(p, unsafe.Sizeof(*acl))
-	for i := 0; i < int(acl.AceCount); i++ {
-		h := (*windows.ACE_HEADER)(ace)
-		if h.AceType == windows.ACCESS_ALLOWED_ACE_TYPE {
-			a := (*windows.ACCESS_ALLOWED_ACE)(ace)
-			sid := (*windows.SID)(unsafe.Pointer(&a.SidStart))
-			if strings.HasPrefix(sid.String(), "S-1-15-2-") {
-				n++
-			}
+	for h, ace := range aces(acl) {
+		if h.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+			continue
 		}
-		ace = unsafe.Add(ace, h.AceSize)
+		a := (*windows.ACCESS_ALLOWED_ACE)(ace)
+		sid := (*windows.SID)(unsafe.Pointer(&a.SidStart))
+		if strings.HasPrefix(sid.String(), "S-1-15-2-") {
+			n++
+		}
 	}
 	return n
 }
@@ -339,7 +370,7 @@ func TestRunReleasesWhatItHeld(t *testing.T) {
 // run is killed and both callers see its end.
 func TestDestroyDuringWait(t *testing.T) {
 	requireAppContainer(t)
-	spec, _ := payload("sleep")
+	spec, out := payload("sleep")
 	sb, err := New(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -363,7 +394,7 @@ func TestDestroyDuringWait(t *testing.T) {
 	select {
 	case r := <-waited:
 		if r.err != nil || r.st.Code != killExitCode {
-			t.Fatalf("Wait = %+v %v, want the kill", r.st, r.err)
+			t.Fatalf("Wait = %+v %v, want the kill; the payload said %q", r.st, r.err, out.String())
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Wait outlived Destroy")
@@ -701,6 +732,7 @@ func TestMinimalRowRefusesBoundaries(t *testing.T) {
 		"a denied network":  func(s *Spec) { s.Network = false },
 		"a read-only grant": func(s *Spec) { s.PathGrants = []PathGrant{{Path: t.TempDir(), Access: ReadOnly}} },
 		"no limits":         func(s *Spec) { s.Limits = Limits{} },
+		"a root":            func(s *Spec) { s.Root, s.Exec = rootTree(t), "/payload.exe" },
 	} {
 		spec, _ := payload("hello")
 		change(&spec)
@@ -749,3 +781,382 @@ func TestMinTierRefusesBeforeExec(t *testing.T) {
 }
 
 var _ = syscall.EscapeArg
+
+// rootTree lays out a tree for a Root: this binary as the payload
+// and as a sibling, a marker to read, directories to grant.
+func rootTree(t *testing.T) string {
+	t.Helper()
+	tree := must(filepath.EvalSymlinks(t.TempDir()))
+	b := must(os.ReadFile(must(os.Executable())))
+	for _, name := range []string{"payload.exe", "sibling.exe"} {
+		if err := os.WriteFile(filepath.Join(tree, name), b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, d := range []string{"etc", "grant-rw"} {
+		if err := os.Mkdir(filepath.Join(tree, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(tree, "etc", "tree-marker"), []byte("tree"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return tree
+}
+
+// link makes a symbolic link, or says the host lets this process
+// make none (a privilege the platform grants administrators and
+// developer mode).
+func link(t *testing.T, target, name string) bool {
+	t.Helper()
+	if err := os.Symlink(target, name); err != nil {
+		t.Logf("no symbolic link: %v", err)
+		return false
+	}
+	return true
+}
+
+// TestRootWorld pins the OS row's world under a Root on this platform
+// (docs/specs/sandbox.md, "Root is world-restriction"): the tree
+// readable and executable at its host path, a link in it followed
+// on the host, and nothing else of the host but what the platform
+// grants every package; the tree never written; a read-only grant
+// read, a read-write grant and the rendezvous directory written, at
+// their host paths with no entry in the tree; the working directory
+// the tree; the environment the stated one and what the launch
+// carries.
+func TestRootWorld(t *testing.T) {
+	requireAppContainer(t)
+	tree := rootTree(t)
+	linked := link(t, filepath.Join("..", "etc", "tree-marker"), filepath.Join(tree, "etc", "link-marker"))
+	outside := must(filepath.EvalSymlinks(t.TempDir()))
+	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("s"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "payload.exe"), must(os.ReadFile(must(os.Executable()))), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ro, rw, rt := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(ro, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := &output{}
+	spec := Spec{
+		Exec:       "/payload.exe",
+		Args:       []string{"world", tree, ro, rw, rt, outside},
+		Env:        []string{"ONE=1", "TWO=2"},
+		Root:       tree,
+		PathGrants: []PathGrant{{Path: ro, Access: ReadOnly}, {Path: rw, Access: ReadWrite}},
+		RuntimeDir: rt,
+		Limits:     Limits{CPUSeconds: 60},
+		Stdout:     out,
+		Stderr:     os.Stderr,
+	}
+	sb, st := run(t, spec)
+	if st.Code != 0 || sb.Tier() != OS {
+		t.Fatalf("exit %+v, tier %v, output %q", st, sb.Tier(), out.String())
+	}
+	f := facts(out.String())
+	denied := func(key string) {
+		t.Helper()
+		if f[key] == "<nil>" {
+			t.Errorf("%s = %q, want denied", key, f[key])
+		}
+	}
+	allowed := func(key string) {
+		t.Helper()
+		if f[key] != "<nil>" {
+			t.Errorf("%s = %q, want allowed", key, f[key])
+		}
+	}
+	if !strings.EqualFold(f["cwd"], tree) {
+		t.Errorf("cwd = %q, want the tree %q", f["cwd"], tree)
+	}
+	// The two stated, LOCALAPPDATA and SystemRoot carried, and at
+	// most the temporary directory's two.
+	if n, _ := strconv.Atoi(f["env"]); n < 4 || n > 6 {
+		t.Errorf("env = %q entries, want the two stated and the launch's", f["env"])
+	}
+	allowed("readtree")
+	if linked {
+		allowed("readlink")
+	}
+	denied("writetree")
+	denied("readoutside")
+	allowed("readro")
+	denied("writero")
+	allowed("writerw")
+	allowed("writert")
+	if !strings.HasPrefix(f["sibling"], "<nil>:hello=world") {
+		t.Errorf("sibling = %q, want the sibling executed", f["sibling"])
+	}
+	if strings.HasPrefix(f["execout"], "<nil>") {
+		t.Errorf("execout = %q, want the host's binary refused", f["execout"])
+	}
+	if _, err := os.Stat(filepath.Join(tree, "etc", "w")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the tree was written: %v", err)
+	}
+	for _, p := range []string{tree, ro, rw, rt} {
+		if entries(t, p) != 0 {
+			t.Errorf("%s still carries the container after the run", p)
+		}
+	}
+	// An unstated environment under a Root: empty but for what the
+	// launch carries.
+	out = &output{}
+	spec.Env = nil
+	spec.Stdout = out
+	if _, st := run(t, spec); st.Code != 0 {
+		t.Fatalf("unstated environment: exit %+v, output %q", st, out.String())
+	}
+	if n, _ := strconv.Atoi(facts(out.String())["env"]); n < 2 || n > 4 {
+		t.Errorf("env = %q entries unstated, want the launch's alone", facts(out.String())["env"])
+	}
+	// A working directory stated with "..": clamped at the tree, the
+	// directory delivered the tree's own under that name, never the
+	// host's beside the tree.
+	if err := os.Mkdir(filepath.Join(filepath.Dir(tree), "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out = &output{}
+	spec.WorkDir = "/../etc"
+	spec.Stdout = out
+	if _, st := run(t, spec); st.Code != 0 {
+		t.Fatalf("workdir: exit %+v, output %q", st, out.String())
+	}
+	if cwd, want := facts(out.String())["cwd"], filepath.Join(tree, "etc"); !strings.EqualFold(cwd, want) {
+		t.Errorf("cwd = %q, want %q", cwd, want)
+	}
+}
+
+// TestRootJunctionsJudgedByTarget pins the judgement over a junction
+// under a Root: a junction is its target's spelling, so a grant
+// through one onto the tree lies within the tree, one onto another
+// grant's subtree overlaps it, a working directory through one out
+// of the tree leads out of it, and a Root spelled through one is the
+// tree it leads to.
+func TestRootJunctionsJudgedByTarget(t *testing.T) {
+	requireAppContainer(t)
+	tree := rootTree(t)
+	junction := func(target string) string {
+		t.Helper()
+		j := filepath.Join(t.TempDir(), "j")
+		if out, err := exec.Command("cmd", "/c", "mklink", "/J", j, target).CombinedOutput(); err != nil {
+			t.Fatalf("mklink /J: %v %s", err, out)
+		}
+		return j
+	}
+	refused := func(name string, spec Spec, want string) {
+		t.Helper()
+		spec.Env = []string{childEnv + "=hello"}
+		sb, err := New(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want refused as %q", name, err, want)
+			sb.Destroy()
+		}
+	}
+	refused("a grant through a junction onto the tree", Spec{Exec: "/payload.exe", Root: tree, PathGrants: []PathGrant{{Path: junction(filepath.Join(tree, "grant-rw")), Access: ReadWrite}}}, "lies within the tree")
+	d := t.TempDir()
+	inner := filepath.Join(d, "inner")
+	if err := os.Mkdir(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	refused("a grant through a junction into another's subtree", Spec{Exec: "/payload.exe", Root: tree, PathGrants: []PathGrant{{Path: d, Access: ReadOnly}, {Path: junction(inner), Access: ReadWrite}}}, "overlap")
+	outside := t.TempDir()
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", filepath.Join(tree, "w"), outside).CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J: %v %s", err, out)
+	}
+	refused("a working directory through a junction out of the tree", Spec{Exec: "/payload.exe", Root: tree, WorkDir: "/w"}, "leads out of the tree")
+	spec, out := payload("hello")
+	spec.Exec, spec.Root = "/payload.exe", filepath.Join(junction(filepath.Dir(tree)), filepath.Base(tree))
+	if sb, st := run(t, spec); st.Code != 0 || facts(out.String())["hello"] != "world" || sb.Tier() != OS {
+		t.Errorf("a Root through a junction: exit %+v, output %q, tier %v; want the tree it leads to", st, out.String(), sb.Tier())
+	}
+}
+
+// TestRootRefusals pins what the Root world refuses before anything
+// runs: a script or a library as the entrypoint, a missing one, one
+// spelled as a host path, a link leading out of the tree, a
+// hostname, a Root that is a file, a grant within the tree or
+// holding it.
+func TestRootRefusals(t *testing.T) {
+	requireAppContainer(t)
+	tree := rootTree(t)
+	parent := filepath.Dir(tree)
+	if err := os.WriteFile(filepath.Join(tree, "script.bat"), []byte("@echo hi\r\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree, "lib.dll"), must(os.ReadFile(filepath.Join(os.Getenv("SystemRoot"), "System32", "kernel32.dll"))), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(must(filepath.EvalSymlinks(t.TempDir())), "payload.exe")
+	if err := os.WriteFile(outside, must(os.ReadFile(must(os.Executable()))), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]Spec{
+		"a script":                 {Exec: "/script.bat", Root: tree},
+		"a library":                {Exec: "/lib.dll", Root: tree},
+		"a missing entrypoint":     {Exec: "/nope.exe", Root: tree},
+		"a host path":              {Exec: filepath.Join(tree, "payload.exe"), Root: tree},
+		"a hostname":               {Exec: "/payload.exe", Root: tree, Hostname: "box"},
+		"a root that is a file":    {Exec: "/payload.exe", Root: filepath.Join(tree, "etc", "tree-marker")},
+		"a grant within the tree":  {Exec: "/payload.exe", Root: tree, PathGrants: []PathGrant{{Path: filepath.Join(tree, "grant-rw"), Access: ReadWrite}}},
+		"a grant holding the tree": {Exec: "/payload.exe", Root: tree, PathGrants: []PathGrant{{Path: parent, Access: ReadWrite}}},
+	}
+	if link(t, outside, filepath.Join(tree, "out.exe")) {
+		cases["a link out of the tree"] = Spec{Exec: "/out.exe", Root: tree}
+	}
+	for name, spec := range cases {
+		spec.Env = []string{childEnv + "=hello"}
+		sb, err := New(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) {
+			t.Errorf("%s: %v, want ErrUndeliverable", name, err)
+			sb.Destroy()
+		}
+	}
+}
+
+// TestRootAliasedGrantsRefused pins the containment judged by
+// identity under a Root: a grant of the tree's parent under another
+// spelling (a case variant's, a junction's) holds the tree.
+func TestRootAliasedGrantsRefused(t *testing.T) {
+	requireAppContainer(t)
+	parent := must(filepath.EvalSymlinks(t.TempDir()))
+	tree := filepath.Join(parent, "tree")
+	if err := os.Mkdir(tree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree, "payload.exe"), must(os.ReadFile(must(os.Executable()))), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	junction := filepath.Join(t.TempDir(), "j")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junction, parent).CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J: %v %s", err, out)
+	}
+	for name, alias := range map[string]string{"a case variant": strings.ToUpper(parent), "a junction": junction} {
+		sb, err := New(Spec{Exec: "/payload.exe", Env: []string{childEnv + "=hello"}, Root: tree, PathGrants: []PathGrant{{Path: alias, Access: ReadWrite}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "holds the tree") {
+			t.Errorf("%s %s granted over the tree's parent: %v, want refused as holding the tree", name, alias, err)
+			sb.Destroy()
+		}
+	}
+}
+
+// TestReachJudged pins the reach of a granted entry and beneath it,
+// judged by the platform's own access check for the run's identity,
+// against what the run can then do: a grant accepted is one whose
+// entries the payload reads, and writes where read-write; an entry
+// that keeps its own permissions is accepted where it allows every
+// package what the grant carries and refused where it does not, or
+// inherits nothing to what lies beneath it, or allows reading alone
+// under a read-write grant; a grant's own entry denying the run
+// (everyone's execution: what the grant carries) is refused ahead of
+// the entry written for the run; a refused grant leaves no entry
+// behind. An entry denied to every package is the kernel's to judge
+// either way — it heeds no such denial for a package's identity, as
+// the windows row witnessed — and the judgement must agree with the
+// payload's reading.
+func TestReachJudged(t *testing.T) {
+	requireAppContainer(t)
+	const allPackages = "*S-1-15-2-1"
+	accepted, refused := true, false
+	for name, c := range map[string]struct {
+		under  string // "ro": the read-only grant's subdirectory; "rw": the read-write grant's; "grant": the read-only grant itself
+		icacls []string
+		want   *bool
+	}{
+		"a protected entry allowing every package":              {"ro", []string{"/inheritance:r", "/grant:r", allPackages + ":(OI)(CI)(RX)"}, &accepted},
+		"a protected entry allowing nothing of it":              {"ro", []string{"/inheritance:r", "/grant:r", "*S-1-3-4:(OI)(CI)F"}, &refused},
+		"a protected directory inheriting nothing":              {"ro", []string{"/inheritance:r", "/grant:r", allPackages + ":(RX)"}, &refused},
+		"a protected directory inheriting only":                 {"ro", []string{"/inheritance:r", "/grant:r", allPackages + ":(OI)(CI)(IO)(RX)"}, &refused},
+		"an entry denied to every package":                      {"ro", []string{"/deny", allPackages + ":(OI)(CI)(R)"}, nil},
+		"a read-write grant holding entries":                    {"rw", nil, &accepted},
+		"a protected entry read alone under a read-write grant": {"rw", []string{"/inheritance:r", "/grant:r", allPackages + ":(OI)(CI)(RX)"}, &refused},
+		"a grant's own entry denied to everyone":                {"grant", []string{"/deny", "*S-1-1-0:(X)"}, &refused},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ro, rw := t.TempDir(), t.TempDir()
+			target := map[string]string{"ro": filepath.Join(ro, "kept"), "rw": filepath.Join(rw, "kept"), "grant": ro}[c.under]
+			if c.under != "grant" {
+				if err := os.Mkdir(target, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(target, "f"), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if c.icacls != nil {
+				if out, err := exec.Command("icacls", append([]string{target}, c.icacls...)...).CombinedOutput(); err != nil {
+					t.Fatalf("icacls: %v %s", err, out)
+				}
+				// The owner may always change a descriptor: the entry is
+				// restored for the temporary directory's removal.
+				t.Cleanup(func() { exec.Command("icacls", target, "/reset").Run() })
+			}
+			spec, out := payload("grants", "SANDBOX_TEST_RO="+filepath.Join(ro, "kept"), "SANDBOX_TEST_RW="+filepath.Join(rw, "kept"), "SANDBOX_TEST_OUTSIDE="+t.TempDir())
+			if c.under == "grant" {
+				spec.Env[1] = "SANDBOX_TEST_RO=" + ro
+			}
+			for _, d := range []string{filepath.Join(ro, "kept"), filepath.Join(rw, "kept")} {
+				if err := os.MkdirAll(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(d, "f"), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			spec.PathGrants = []PathGrant{{Path: ro, Access: ReadOnly}, {Path: rw, Access: ReadWrite}}
+			sb, err := New(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = sb.Start(context.Background())
+			switch {
+			case err == nil && c.want != nil && !*c.want:
+				t.Errorf("Start accepted the grant, want it refused as not delivered whole")
+				sb.Destroy()
+			case err == nil:
+				st, err := sb.Wait()
+				if f := facts(out.String()); err != nil || st.Code != 0 || f["read-ro"] != "<nil>" || f["write-rw"] != "<nil>" {
+					t.Errorf("the grants judged delivered, but the payload: exit %+v %v, read-ro %q, write-rw %q", st, err, f["read-ro"], f["write-rw"])
+				}
+			case c.want != nil && *c.want:
+				t.Errorf("Start: %v, want the grants delivered", err)
+			case !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "not delivered whole"):
+				t.Errorf("Start: %v, want refused as not delivered whole", err)
+			}
+			for _, d := range []string{ro, rw} {
+				if entries(t, d) != 0 {
+					t.Errorf("%s still carries the container after the run", d)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckPE pins the entrypoint check: this binary admitted, a
+// library and a script refused.
+func TestCheckPE(t *testing.T) {
+	if err := checkPE(must(os.Executable())); err != nil {
+		t.Fatalf("this binary: %v", err)
+	}
+	if err := checkPE(filepath.Join(os.Getenv("SystemRoot"), "System32", "kernel32.dll")); err == nil || !strings.Contains(err.Error(), "library") {
+		t.Fatalf("a library: %v", err)
+	}
+	script := filepath.Join(t.TempDir(), "s.bat")
+	if err := os.WriteFile(script, []byte("@echo hi\r\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkPE(script); err == nil || !strings.Contains(err.Error(), "not a PE image") {
+		t.Fatalf("a script: %v", err)
+	}
+}

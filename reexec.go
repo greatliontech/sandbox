@@ -441,8 +441,3 @@ func reaped(cmd *exec.Cmd, err error) (ExitStatus, error) {
 	}
 	return ExitStatus{}, err
 }
-
-// hostNameMax is the longest hostname a row presents: the Linux
-// kernel's (__NEW_UTS_LEN), which darwin's rows, presenting none,
-// never reach.
-const hostNameMax = 64

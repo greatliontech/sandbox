@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"iter"
 	"os"
 	"path/filepath"
 	"slices"
@@ -76,174 +78,57 @@ type world struct {
 }
 
 // grantee is one host path the container is granted: read and
-// executed, written too where read-write.
+// executed, written too where read-write; whole where the grant is
+// a stated intent — the tree, a grant, the rendezvous directory —
+// delivered to every entry beneath or refused, judged by the
+// platform's own access check for the run's identity (reached),
+// never where it is the row's own loading substrate, the
+// entrypoint's directory without a Root, which the platform's
+// loader reads from beside the image.
 type grantee struct {
 	path  string
 	write bool
+	whole bool
 }
 
-// resolveWorld checks, before anything runs, that every stated
-// intent has somewhere to land on row r (docs/specs/sandbox.md,
-// "Intent is portable; delivery is all-or-nothing"): the spelling
-// checks, the row's own refusals, the entrypoint an executable file
-// on the host, each grant and the rendezvous directory an entry on
-// the host, no two of them one entry or one within another — judged
-// by the entries' identities, never their spellings, which the
-// platform folds and aliases (a case variant, a short name, a
-// junction). On the OS row the world is what the container is
-// granted: the entrypoint's own directory read and executed — the
-// platform loads a program's libraries from beside it — each grant
-// read and executed, and written where read-write, the rendezvous
-// directory read and written; the platform grants every package the
-// system's own files besides.
+// resolveWorld resolves the spec to the world the row presents: the
+// entrypoint and the working directory as the host spells them, and
+// the host paths the container is granted — under a Root, the tree
+// read and executed at its host path, the entrypoint resolved in it
+// as the platform resolves a path (resolveInTree); otherwise the
+// entrypoint's own directory, read and executed, the platform
+// loading a program's libraries from beside it — each grant read and
+// executed, and written where read-write, the rendezvous directory
+// read and written, every one at its canonical host path; the
+// platform grants every package the system's own files besides. The
+// entrypoint is a PE executable image (checkPE). The tree
+// resolution's containment and overlap judgements hold here as
+// everywhere (resolveTree).
 func resolveWorld(spec Spec, r row) (world, error) {
-	undeliverable := func(format string, a ...any) (world, error) {
-		return world{}, fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
-	}
-	if !filepath.IsAbs(spec.Exec) {
-		return undeliverable("exec %q is not an absolute path", spec.Exec)
-	}
-	if spec.WorkDir != "" && !filepath.IsAbs(spec.WorkDir) {
-		return undeliverable("workdir %q is not an absolute path", spec.WorkDir)
+	if err := checkSpelling(spec); err != nil {
+		return world{}, err
 	}
 	if err := r.refuses(spec); err != nil {
 		return world{}, err
 	}
-	fi, err := os.Stat(spec.Exec)
+	t, err := resolveTree(spec, checkPE)
 	if err != nil {
-		return undeliverable("exec %s: %v", spec.Exec, err)
+		return world{}, err
 	}
-	if fi.IsDir() {
-		return undeliverable("exec %s: is a directory", spec.Exec)
-	}
-	w := world{cmd: spec.Exec, workDir: spec.WorkDir}
+	w := world{cmd: t.hostCmd, workDir: t.hostWorkDir}
 	if r.tier != OS {
 		return w, nil
 	}
-	w.grants = append(w.grants, grantee{path: filepath.Dir(spec.Exec)})
-	type stated struct {
-		path, what string
-		write      bool
+	if t.root != "" {
+		w.grants = append(w.grants, grantee{path: t.root, whole: true})
+	} else {
+		w.grants = append(w.grants, grantee{path: filepath.Dir(t.hostCmd)})
 	}
-	var paths []stated
-	for _, g := range spec.PathGrants {
-		paths = append(paths, stated{g.Path, "grant", g.Access != ReadOnly})
-	}
-	if spec.RuntimeDir != "" {
-		paths = append(paths, stated{spec.RuntimeDir, "runtime dir", true})
-	}
-	var lines []lineage
-	for _, p := range paths {
-		if !filepath.IsAbs(p.path) || filepath.Clean(p.path) != p.path {
-			return undeliverable("%s %q is not a clean absolute path", p.what, p.path)
-		}
-		fi, err := os.Stat(p.path)
-		if err != nil {
-			return undeliverable("%s %s: %v", p.what, p.path, err)
-		}
-		if p.what == "runtime dir" && !fi.IsDir() {
-			return undeliverable("runtime dir %s is not a directory", p.path)
-		}
-		l, err := lineageOf(p.path)
-		if err != nil {
-			return undeliverable("%s %s: %v", p.what, p.path, err)
-		}
-		for i, o := range lines {
-			if l.same(o) || l.holds(o) || o.holds(l) {
-				return undeliverable("grants %s and %s overlap", paths[i].path, p.path)
-			}
-		}
-		lines = append(lines, l)
-		w.grants = append(w.grants, grantee{path: p.path, write: p.write})
+	for _, b := range t.binds {
+		w.grants = append(w.grants, grantee{path: b.Target, write: !b.ReadOnly, whole: true})
 	}
 	return w, nil
 }
-
-// identity is an entry's identity on the host: the volume's serial
-// and the file's index on it, which every spelling of one entry
-// shares — a case variant's, a short name's, a junction's.
-type identity struct{ volume, index uint64 }
-
-// lineage is the identities of an entry and of every directory above
-// it, the entry's own first — above the entry where it stands, not
-// where it was spelled: a junction's or symbolic link's spelling is
-// resolved first (finalPath), so that a grant through one is judged
-// against the directories over its target.
-type lineage []identity
-
-func lineageOf(path string) (lineage, error) {
-	path, err := finalPath(path)
-	if err != nil {
-		return nil, err
-	}
-	var l lineage
-	for {
-		id, err := identityOf(path)
-		if err != nil {
-			return nil, err
-		}
-		l = append(l, id)
-		parent := filepath.Dir(path)
-		if parent == path {
-			return l, nil
-		}
-		path = parent
-	}
-}
-
-// finalPath is the path an entry stands at, every junction and
-// symbolic link on the way resolved, as the kernel spells it.
-func finalPath(path string) (string, error) {
-	p, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return "", err
-	}
-	h, err := windows.CreateFile(p, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
-	if err != nil {
-		return "", err
-	}
-	defer windows.CloseHandle(h)
-	buf := make([]uint16, windows.MAX_PATH)
-	for {
-		n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
-		if err != nil {
-			return "", err
-		}
-		if int(n) < len(buf) {
-			// The kernel's spelling carries the long-path prefix: a
-			// drive's path with "\\?\", a share's with "\\?\UNC\"
-			// for the "\\" a share is spelled with.
-			p := windows.UTF16ToString(buf[:n])
-			if rest, ok := strings.CutPrefix(p, `\\?\UNC\`); ok {
-				return `\\` + rest, nil
-			}
-			return strings.TrimPrefix(p, `\\?\`), nil
-		}
-		buf = make([]uint16, n+1)
-	}
-}
-
-// identityOf reads an entry's identity through a handle opened for
-// no access, a directory included (FILE_FLAG_BACKUP_SEMANTICS).
-func identityOf(path string) (identity, error) {
-	p, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return identity{}, err
-	}
-	h, err := windows.CreateFile(p, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
-	if err != nil {
-		return identity{}, err
-	}
-	defer windows.CloseHandle(h)
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
-		return identity{}, err
-	}
-	return identity{volume: uint64(info.VolumeSerialNumber), index: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)}, nil
-}
-
-func (l lineage) same(o lineage) bool  { return l[0] == o[0] }
-func (l lineage) holds(o lineage) bool { return slices.Contains(o[1:], l[0]) }
 
 // Start selects the row this host's facts satisfy, refuses below
 // MinTier before anything runs, resolves the world and the bounds,
@@ -321,6 +206,15 @@ func (s *windowsSandbox) Start(ctx context.Context) error {
 			c.Close()
 		}
 		return fail(err)
+	}
+	// The grants are judged whole with the run's own identity, which
+	// exists only as the suspended process's token: what the entries
+	// beneath each grant allow it is the platform's own access check
+	// to say.
+	if p != nil {
+		if err := deliveredWhole(pi.Process, w.grants); err != nil {
+			return abandon(err)
+		}
 	}
 	if err := b.assign(pi.Process); err != nil {
 		return abandon(err)
@@ -772,7 +666,8 @@ func admit(path string, sid *windows.SID, write bool) error {
 		return err
 	}
 	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
-		if errors.Is(err, windows.ERROR_ACCESS_DENIED) && !write && allPackagesAllowed(old, access) {
+		fi, statErr := os.Stat(path)
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) && !write && statErr == nil && allows(old, access, fi.IsDir()) {
 			return errReachedAlready
 		}
 		return err
@@ -780,28 +675,143 @@ func admit(path string, sid *windows.SID, write bool) error {
 	return nil
 }
 
-// allPackagesAllowed reports whether the ACL allows every package
-// (ALL APPLICATION PACKAGES) the access, in an inheriting entry.
-func allPackagesAllowed(acl *windows.ACL, access windows.ACCESS_MASK) bool {
-	if acl == nil {
-		return false
+// deliveredWhole holds every whole grant to being delivered whole to
+// the process's identity (reached), its token impersonated for the
+// platform's access check.
+func deliveredWhole(process windows.Handle, grants []grantee) error {
+	var primary, token windows.Token
+	if err := windows.OpenProcessToken(process, windows.TOKEN_QUERY|windows.TOKEN_DUPLICATE, &primary); err != nil {
+		return fmt.Errorf("sandbox: the run's token: %w", err)
 	}
+	defer primary.Close()
+	if err := windows.DuplicateTokenEx(primary, windows.TOKEN_QUERY, nil, windows.SecurityImpersonation, windows.TokenImpersonation, &token); err != nil {
+		return fmt.Errorf("sandbox: the run's token: %w", err)
+	}
+	defer token.Close()
+	for _, g := range grants {
+		if !g.whole {
+			continue
+		}
+		if err := reached(g.path, token, g.write); err != nil {
+			return fmt.Errorf("%w: grant %s is not delivered whole: %v", ErrUndeliverable, g.path, err)
+		}
+	}
+	return nil
+}
+
+// reached holds a granted entry and every entry beneath it to
+// allowing the identity what the grant carries, by the platform's
+// own access check against the entry's descriptor: the grant's own
+// entry may deny the identity ahead of the entry written for it, and
+// an inheriting entry reaches each one beneath but an entry that
+// keeps its own permissions (a protected descriptor, which inherits
+// nothing), one denying the identity, or one whose inheritance was
+// narrowed, each of which the check refuses. A link or junction
+// beneath is not walked: what it leads to carries its own
+// descriptor, which the grant does not reach through it. A directory
+// the caller cannot list is unjudged, a refusal. A directory is held
+// to its entries' deleting and renaming as well, which the platform
+// grants through the directory (FILE_DELETE_CHILD) or the entry's
+// own DELETE; an entry beneath is held to its data alone, its
+// directory's right covering it.
+func reached(path string, token windows.Token, write bool) error {
+	return filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p != path && d.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0 {
+			return nil
+		}
+		sd, err := windows.GetNamedSecurityInfo(p, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.LABEL_SECURITY_INFORMATION)
+		if err != nil {
+			return &os.PathError{Op: "security", Path: p, Err: err}
+		}
+		desired := windows.ACCESS_MASK(windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE)
+		if write {
+			desired |= windows.FILE_GENERIC_WRITE
+			if d.IsDir() {
+				desired |= fileDeleteChild
+			}
+		}
+		allowed, err := accessCheck(sd, token, desired)
+		if err != nil {
+			return &os.PathError{Op: "access", Path: p, Err: err}
+		}
+		if !allowed {
+			return fmt.Errorf("%s does not allow the run what the grant carries", p)
+		}
+		return nil
+	})
+}
+
+var (
+	advapi32        = windows.NewLazySystemDLL("advapi32.dll")
+	procAccessCheck = advapi32.NewProc("AccessCheck")
+)
+
+// accessCheck asks the platform whether the descriptor allows the
+// impersonation token the access, under the file rights' generic
+// mapping.
+func accessCheck(sd *windows.SECURITY_DESCRIPTOR, token windows.Token, desired windows.ACCESS_MASK) (bool, error) {
+	const fileAllAccess = 0x1F01FF // FILE_ALL_ACCESS
+	mapping := [4]uint32{windows.FILE_GENERIC_READ, windows.FILE_GENERIC_WRITE, windows.FILE_GENERIC_EXECUTE, fileAllAccess}
+	// A privilege set the check may fill: its header and one entry,
+	// which no file access needs.
+	var privileges [64]byte
+	privilegesLen := uint32(len(privileges))
+	var granted uint32
+	var status int32
+	r, _, e := procAccessCheck.Call(uintptr(unsafe.Pointer(sd)), uintptr(token), uintptr(desired), uintptr(unsafe.Pointer(&mapping[0])), uintptr(unsafe.Pointer(&privileges[0])), uintptr(unsafe.Pointer(&privilegesLen)), uintptr(unsafe.Pointer(&granted)), uintptr(unsafe.Pointer(&status)))
+	if r == 0 {
+		return false, e
+	}
+	return status != 0, nil
+}
+
+// aces walks an ACL's entries, each by its header and its start: a
+// pointer formed only at an entry, one formed past the last pointing
+// past the descriptor's own allocation.
+func aces(acl *windows.ACL) iter.Seq2[*windows.ACE_HEADER, unsafe.Pointer] {
+	return func(yield func(*windows.ACE_HEADER, unsafe.Pointer) bool) {
+		if acl == nil {
+			return
+		}
+		off := unsafe.Sizeof(*acl)
+		for i := 0; i < int(acl.AceCount); i++ {
+			ace := unsafe.Add(unsafe.Pointer(acl), off)
+			h := (*windows.ACE_HEADER)(ace)
+			if !yield(h, ace) {
+				return
+			}
+			off += uintptr(h.AceSize)
+		}
+	}
+}
+
+// allows reports whether the ACL allows every package (ALL
+// APPLICATION PACKAGES) the access in an entry that applies to the
+// object itself, inheriting to what lies beneath where inherit says
+// so: the reading of a descriptor the caller may not write, where
+// the platform's own directories grant every package already.
+func allows(acl *windows.ACL, access windows.ACCESS_MASK, inherit bool) bool {
 	all, err := windows.CreateWellKnownSid(windows.WinBuiltinAnyPackageSid)
 	if err != nil {
 		return false
 	}
-	ace := unsafe.Add(unsafe.Pointer(acl), unsafe.Sizeof(*acl))
-	for i := 0; i < int(acl.AceCount); i++ {
-		h := (*windows.ACE_HEADER)(ace)
-		if h.AceType == windows.ACCESS_ALLOWED_ACE_TYPE {
-			a := (*windows.ACCESS_ALLOWED_ACE)(ace)
-			sid := (*windows.SID)(unsafe.Pointer(&a.SidStart))
-			generic := windows.ACCESS_MASK(windows.GENERIC_READ | windows.GENERIC_EXECUTE)
-			if sid.Equals(all) && h.AceFlags&windows.CONTAINER_INHERIT_ACE != 0 && (a.Mask&access == access || a.Mask&generic == generic || a.Mask&windows.GENERIC_ALL != 0) {
-				return true
-			}
+	generic := windows.ACCESS_MASK(windows.GENERIC_READ | windows.GENERIC_EXECUTE)
+	if access&windows.FILE_WRITE_DATA != 0 {
+		generic |= windows.GENERIC_WRITE
+	}
+	for h, ace := range aces(acl) {
+		if h.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || h.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+			continue
 		}
-		ace = unsafe.Add(ace, h.AceSize)
+		a := (*windows.ACCESS_ALLOWED_ACE)(ace)
+		holder := (*windows.SID)(unsafe.Pointer(&a.SidStart))
+		inherits := !inherit || h.AceFlags&windows.CONTAINER_INHERIT_ACE != 0 && h.AceFlags&windows.OBJECT_INHERIT_ACE != 0
+		if holder.Equals(all) && inherits && (a.Mask&access == access || a.Mask&generic == generic || a.Mask&windows.GENERIC_ALL != 0) {
+			return true
+		}
 	}
 	return false
 }
