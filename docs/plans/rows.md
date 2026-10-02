@@ -42,7 +42,7 @@ darwin row)
         Object's bounds (memory, CPU time, the process count) with
         its kill-on-close as the kill tie; the accounting reported;
         the windows CI row demanding the `OS` row.
-  - [ ] 3.3. The AppContainer row's world: the tree, the grants and
+  - [x] 3.3. The AppContainer row's world: the tree, the grants and
         the rendezvous directory granted to the container's
         capability at their host paths, the network denied or
         granted whole, the entrypoint held to what the row can load,
