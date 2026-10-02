@@ -161,16 +161,35 @@ func parent() {
 	// The kill tie: a sleeper in a job dies when the job's last handle closes.
 	fact("kill-on-close", killOnClose(payload, sid))
 
-	for _, mode := range []string{"probe", "envempty", "dll", "exec-sibling", "net", "hog", "jobhog", "spin", "spawn"} {
+	// The least environment a container launch needs.
+	for name, vars := range map[string][]string{
+		"none":                {},
+		"systemroot":          {"SystemRoot=" + os.Getenv("SystemRoot")},
+		"userprofile":         {"USERPROFILE=" + os.Getenv("USERPROFILE")},
+		"localappdata":        {"LOCALAPPDATA=" + os.Getenv("LOCALAPPDATA")},
+		"systemroot-profile":  {"SystemRoot=" + os.Getenv("SystemRoot"), "USERPROFILE=" + os.Getenv("USERPROFILE")},
+		"systemroot-localapp": {"SystemRoot=" + os.Getenv("SystemRoot"), "LOCALAPPDATA=" + os.Getenv("LOCALAPPDATA")},
+		"one-foreign":         {"SANDBOX_X=1"},
+	} {
+		childEnv = vars
+		out, code, _, err := run(payload, sid, nil, []string{"envempty"}, 10*time.Second)
+		childEnv = nil
+		fact("env-"+name, fmt.Sprintf("err=%v exit=%d out=%s", err, code, strings.ReplaceAll(strings.TrimSpace(out), "\n", " ")))
+	}
+
+	for _, mode := range []string{"probe", "dll", "exec-sibling", "net", "hog", "jobhog", "jobhog-kill", "spin", "proctime", "spawn"} {
 		limits := &windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 		limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 		switch mode {
 		case "hog":
 			limits.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_PROCESS_MEMORY
 			limits.ProcessMemoryLimit = 128 << 20
-		case "jobhog":
+		case "jobhog", "jobhog-kill":
 			limits.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_JOB_MEMORY
 			limits.JobMemoryLimit = 128 << 20
+		case "proctime":
+			limits.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_PROCESS_TIME
+			limits.BasicLimitInformation.PerProcessUserTimeLimit = 2 * 10_000_000
 		case "spin":
 			limits.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_JOB_TIME
 			limits.BasicLimitInformation.PerJobUserTimeLimit = 2 * 10_000_000 // 100ns units: two seconds
@@ -179,12 +198,14 @@ func parent() {
 			limits.BasicLimitInformation.ActiveProcessLimit = 3
 		}
 		args := []string{mode, tree, addr, sibling, other}
-		if mode == "jobhog" {
+		switch mode {
+		case "jobhog", "jobhog-kill":
 			args[0] = "hog"
+		case "proctime":
+			args[0] = "spin"
 		}
-		emptyEnv = mode == "envempty"
+		killOnMemory = mode == "jobhog-kill"
 		out, code, acct, err := run(payload, sid, limits, args, 15*time.Second)
-		emptyEnv = false
 		fact(mode+"-err", err)
 		fact(mode+"-exit", code)
 		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -196,8 +217,25 @@ func parent() {
 	}
 }
 
-// emptyEnv runs the next child with an empty environment block.
-var emptyEnv bool
+// killOnMemory terminates the job on its memory limit's message.
+var killOnMemory bool
+
+// childEnv is the next child's environment block, nil for the
+// parent's own.
+var childEnv []string
+
+func envBlock(vars []string) *uint16 {
+	var block []uint16
+	for _, v := range vars {
+		u, _ := windows.UTF16FromString(v)
+		block = append(block, u...)
+	}
+	block = append(block, 0)
+	if len(vars) == 0 {
+		block = append(block, 0)
+	}
+	return &block[0]
+}
 
 func icacls(path string) string {
 	out, _ := exec.Command("icacls", path).CombinedOutput()
@@ -317,8 +355,8 @@ func start(exe string, sid *windows.SID, args []string, out windows.Handle, _ in
 	cmdP, _ := windows.UTF16PtrFromString(cmdline)
 	flags := uint32(windows.CREATE_SUSPENDED | windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT)
 	var env *uint16
-	if emptyEnv {
-		env = &[]uint16{0, 0}[0]
+	if childEnv != nil {
+		env = envBlock(childEnv)
 	}
 	err = windows.CreateProcess(exeP, cmdP, nil, nil, out != 0, flags, env, nil, &si.StartupInfo, &pi)
 	if err != nil {
@@ -361,6 +399,24 @@ func run(exe string, sid *windows.SID, limits *windows.JOBOBJECT_EXTENDED_LIMIT_
 		if err := windows.AssignProcessToJobObject(job, pi.Process); err != nil {
 			return "", 0, "", fmt.Errorf("assign: %w", err)
 		}
+	}
+	started := time.Now()
+	if killOnMemory && port != 0 {
+		go func() {
+			for {
+				var qty uint32
+				var key uintptr
+				var ov *windows.Overlapped
+				if err := windows.GetQueuedCompletionStatus(port, &qty, &key, &ov, 20000); err != nil {
+					return
+				}
+				if qty == 10 {
+					windows.TerminateJobObject(job, 137)
+					fmt.Printf("memory-kill-after=%v\n", time.Since(started))
+					return
+				}
+			}
+		}()
 	}
 	windows.ResumeThread(pi.Thread)
 	windows.CloseHandle(pi.Thread)
@@ -478,7 +534,7 @@ func child(mode string, args []string) {
 	case "hog":
 		fact("hog", "start")
 		bufs := make([][]byte, 0)
-		for i := 0; i < 4; i++ {
+		for i := 0; i < 8; i++ {
 			b := make([]byte, 64<<20)
 			for j := range b {
 				b[j] = byte(j)
