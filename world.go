@@ -1,3 +1,5 @@
+//go:build linux || darwin || windows
+
 package sandbox
 
 import (
@@ -70,6 +72,20 @@ func checkSpelling(spec Spec) error {
 		return undeliverable("hostname %q is longer than %d bytes", spec.Hostname, hostNameMax)
 	}
 	return nil
+}
+
+// resolveWorldTree is the resolution every row begins with: the
+// spec's spelling checked, the row's refusals applied, the tree
+// resolved with the row's entrypoint check; the row then maps the
+// tree world onto its mechanism.
+func resolveWorldTree(spec Spec, r row, checkEntry func(hostPath string) error) (treeWorld, error) {
+	if err := checkSpelling(spec); err != nil {
+		return treeWorld{}, err
+	}
+	if err := r.refuses(spec); err != nil {
+		return treeWorld{}, err
+	}
+	return resolveTree(spec, checkEntry)
 }
 
 // resolveTree checks, before anything runs, that every stated intent

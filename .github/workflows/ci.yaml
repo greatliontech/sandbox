@@ -34,6 +34,7 @@ jobs:
             echo "no AppArmor user-namespace restriction on this host"
           fi
       - run: go build ./...
+      - run: GOOS=freebsd go vet ./... # the fallback of a platform with no row, its tests included
       - run: go vet ./...
       - run: go test ./... -count=1 -timeout=20m
       # The Strong row's arms, and the cgroup arms — placement, the

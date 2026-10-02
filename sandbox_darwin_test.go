@@ -226,17 +226,6 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// facts parses the payload's "key=value" lines.
-func facts(out string) map[string]string {
-	m := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if k, v, ok := strings.Cut(line, "="); ok {
-			m[k] = v
-		}
-	}
-	return m
-}
-
 // requireSeatbelt skips an OS-row arm where the host has no
 // sandbox-exec to apply a profile — unless SANDBOX_TEST_REQUIRE_SEATBELT
 // demands the row, in which case a host that was meant to deliver it
@@ -276,22 +265,6 @@ func payload(mode string, env ...string) (Spec, *output) {
 		Stdout: out,
 		Stderr: os.Stderr,
 	}, out
-}
-
-func run(t *testing.T, spec Spec) (Sandbox, ExitStatus) {
-	t.Helper()
-	sb, err := New(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := sb.Start(context.Background()); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	st, err := sb.Wait()
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
-	}
-	return sb, st
 }
 
 func TestSelectRow(t *testing.T) {

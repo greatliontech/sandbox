@@ -146,17 +146,6 @@ func requireTree(t *testing.T) {
 	}
 }
 
-// facts parses the probe's "key=value" lines.
-func facts(out string) map[string]string {
-	m := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if k, v, ok := strings.Cut(line, "="); ok {
-			m[k] = v
-		}
-	}
-	return m
-}
-
 // TestNamespaceIsolation is the core spike: a pure-Go, create-only sandbox must
 // run a process in fresh PID and UTS namespaces with no cgo.
 //

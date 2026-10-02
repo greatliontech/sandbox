@@ -105,13 +105,7 @@ type grantee struct {
 // resolution's containment and overlap judgements hold here as
 // everywhere (resolveTree).
 func resolveWorld(spec Spec, r row) (world, error) {
-	if err := checkSpelling(spec); err != nil {
-		return world{}, err
-	}
-	if err := r.refuses(spec); err != nil {
-		return world{}, err
-	}
-	t, err := resolveTree(spec, checkPE)
+	t, err := resolveWorldTree(spec, r, checkPE)
 	if err != nil {
 		return world{}, err
 	}
