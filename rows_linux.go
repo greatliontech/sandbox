@@ -190,7 +190,7 @@ func probeHost(ctx context.Context) (hostFacts, error) {
 // the init proper (docs/specs/sandbox.md, Re-exec).
 func probeReexec(ctx context.Context, attr *syscall.SysProcAttr, refusals ...syscall.Errno) (refused error, err error) {
 	cmd := exec.CommandContext(ctx, "/proc/self/exe")
-	cmd.Env = append(os.Environ(), envInit+"=1", envProbe+"=1")
+	cmd.Env = hostProbeEnv()
 	cmd.SysProcAttr = attr
 	err = cmd.Run()
 	if err == nil {
@@ -201,7 +201,7 @@ func probeReexec(ctx context.Context, attr *syscall.SysProcAttr, refusals ...sys
 	}
 	var exit *exec.ExitError
 	if errors.As(err, &exit) {
-		return nil, fmt.Errorf("the re-exec'd init died (%v): a package init of this binary must not act under %s", err, envInit)
+		return nil, errors.New(initBreach("the re-exec'd init died", err))
 	}
 	return nil, err
 }

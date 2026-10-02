@@ -149,7 +149,9 @@ independent by design.
   inside the fresh namespaces. Every package init of the calling
   binary runs in that child before the takeover; a consumer's init
   must be free of side effects that the marker environment would make
-  wrong, and an init child that dies before exec is reported by
+  wrong — the init child's environment is the internal markers
+  alone, nothing of the host's, the payload's environment riding the
+  config — and an init child that dies before exec is reported by
   `Start` as such — never as the payload's own exit.
 - **Bounded means bounded.** `Limits` map to the strongest accounting
   the selected row admits on its platform (cgroups where a delegated

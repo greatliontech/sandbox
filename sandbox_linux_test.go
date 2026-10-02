@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"debug/elf"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -537,8 +536,10 @@ func TestStartReturnsAtExec(t *testing.T) {
 		t.Fatal("Start did not return while the payload was still running")
 	}
 	cancel()
-	if es, err := sb.Wait(); err != nil || !es.Signaled {
-		t.Fatalf("Wait after cancel: %v %+v", err, es)
+	// A signal death reports the code 128 plus the signal, as a shell
+	// would, on every row.
+	if es, err := sb.Wait(); err != nil || !es.Signaled || es.Code != 128+int(es.Signal.(syscall.Signal)) {
+		t.Fatalf("Wait after cancel: %v %+v, want a signal death with its code 128 plus the signal", err, es)
 	}
 }
 
@@ -1849,33 +1850,13 @@ func TestStartFailureClasses(t *testing.T) {
 // wrote.
 func runInitProtocol(t *testing.T, cfg initConfig, attr *syscall.SysProcAttr) []byte {
 	t.Helper()
-	cfgR, cfgW, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	statusR, statusW, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
 	cmd := exec.Command("/proc/self/exe")
-	cmd.Env = append(os.Environ(), envInit+"=1", envInitFD+"=3", envStatusFD+"=4")
-	cmd.ExtraFiles = []*os.File{cfgR, statusW}
 	cmd.SysProcAttr = attr
-	if err := cmd.Start(); err != nil {
+	_, _, status, err := launchInit(cmd, &cfg, nil, func() { cmd.Process.Kill() })
+	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	cfgR.Close()
-	statusW.Close()
-	if err := json.NewEncoder(cfgW).Encode(&cfg); err != nil {
-		t.Fatal(err)
-	}
-	cfgW.Close()
-	status, err := io.ReadAll(statusR)
-	statusR.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd.Wait()
+	cmd.Wait() // the payloads these configs name end on their own
 	return status
 }
 
@@ -1893,25 +1874,23 @@ func TestInitReportsApplicationFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	attr := sysProcAttr(strongRow, false)
-	status := runInitProtocol(t, initConfig{Row: Strong.String(), Root: filepath.Join(tree, "etc", "tree-marker"), Cmd: "/world", Env: []string{}}, attr)
+	status := runInitProtocol(t, initConfig{initCommon: initCommon{Row: Strong.String(), Cmd: "/world", Env: []string{}}, Root: filepath.Join(tree, "etc", "tree-marker")}, attr)
 	if outcome, reason := classifyStatus(status); outcome != initApplyFailed || !strings.Contains(reason, "pivot") {
 		t.Fatalf("a pivot onto a file reported as %v %q (status %q)", outcome, reason, status)
 	}
 	status = runInitProtocol(t, initConfig{
-		Row:   Strong.String(),
-		Root:  tree,
-		Binds: []bind{{Source: "/nonexistent-source-for-this-test", Target: filepath.Join(tree, "grant-ro")}},
-		Cmd:   "/world",
-		Env:   []string{},
+		initCommon: initCommon{Row: Strong.String(), Cmd: "/world", Env: []string{}},
+		Root:       tree,
+		Binds:      []bind{{Source: "/nonexistent-source-for-this-test", Target: filepath.Join(tree, "grant-ro")}},
 	}, attr)
 	if outcome, reason := classifyStatus(status); outcome != initRefused || !strings.Contains(reason, "bind") {
 		t.Fatalf("a vanished bind source reported as %v %q (status %q)", outcome, reason, status)
 	}
-	status = runInitProtocol(t, initConfig{Row: Strong.String(), Root: tree, WorkDir: "/nonexistent-dir", Cmd: "/world", Env: []string{}}, attr)
+	status = runInitProtocol(t, initConfig{initCommon: initCommon{Row: Strong.String(), WorkDir: "/nonexistent-dir", Cmd: "/world", Env: []string{}}, Root: tree}, attr)
 	if outcome, reason := classifyStatus(status); outcome != initRefused || !strings.Contains(reason, "chdir") {
 		t.Fatalf("an unenterable workdir reported as %v %q (status %q)", outcome, reason, status)
 	}
-	status = runInitProtocol(t, initConfig{Row: "bogus", Cmd: "/bin/true", Env: []string{}}, sysProcAttr(minimalRow, true))
+	status = runInitProtocol(t, initConfig{initCommon: initCommon{Row: "bogus", Cmd: "/bin/true", Env: []string{}}}, sysProcAttr(minimalRow, true))
 	if outcome, reason := classifyStatus(status); outcome != initApplyFailed || !strings.Contains(reason, "unknown row") {
 		t.Fatalf("an unknown row reported as %v %q (status %q)", outcome, reason, status)
 	}

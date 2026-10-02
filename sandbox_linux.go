@@ -5,21 +5,19 @@ package sandbox
 import (
 	"context"
 	"debug/elf"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"syscall"
 
 	seccomp "github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
 
 	"github.com/greatliontech/sandbox/internal/nslinux"
+	"github.com/greatliontech/sandbox/internal/rlimit"
 )
 
 // initConfig is the JSON payload handed to the re-exec'd init process.
@@ -28,27 +26,22 @@ import (
 // validation, the bind, and the mountinfo listing (which records
 // canonical mount points) agree on one string.
 type initConfig struct {
-	Row      string           `json:"row"`
-	Hostname string           `json:"hostname,omitempty"`
-	Root     string           `json:"root,omitempty"`
-	WorkDir  string           `json:"workdir,omitempty"`
-	Binds    []bind           `json:"binds,omitempty"`
-	Rlimits  []nslinux.Rlimit `json:"rlimits,omitempty"`
+	initCommon
+	Hostname string `json:"hostname,omitempty"`
+	Root     string `json:"root,omitempty"`
+	Binds    []bind `json:"binds,omitempty"`
 	// LateRlimits and PidsMax land right before exec: the process-count
 	// and address-space bounds that fit the payload do not fit the
 	// multithreaded init and its runtime's reservations.
-	LateRlimits []nslinux.Rlimit `json:"late_rlimits,omitempty"`
-	PidsMaxFile string           `json:"pids_max_file,omitempty"`
-	PidsMax     uint64           `json:"pids_max,omitempty"`
+	LateRlimits []rlimit.Limit `json:"late_rlimits,omitempty"`
+	PidsMaxFile string         `json:"pids_max_file,omitempty"`
+	PidsMax     uint64         `json:"pids_max,omitempty"`
 	// Landlock is the OS row's allowlist over the world at its host
 	// paths, its rights those of ABI LandlockABI; DenyNetwork is that
 	// row's network denial.
 	Landlock    []nslinux.LandlockRule `json:"landlock,omitempty"`
 	LandlockABI int                    `json:"landlock_abi,omitempty"`
 	DenyNetwork bool                   `json:"deny_network,omitempty"`
-	Cmd         string                 `json:"cmd"`
-	Args        []string               `json:"args,omitempty"`
-	Env         []string               `json:"env"`
 }
 
 type linuxSandbox struct {
@@ -132,130 +125,59 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 		return err
 	}
 
-	env := s.spec.Env
-	if env == nil {
-		if s.spec.Root != "" {
-			// A restricted world carries nothing of the host unstated.
-			env = []string{}
-		} else {
-			env = hostEnv()
-		}
-	}
 	cfg := initConfig{
-		Row:         r.tier.String(),
+		initCommon:  initCommon{Row: r.tier.String(), WorkDir: w.workDir, Rlimits: b.rlimits, Cmd: w.cmd, Args: s.spec.Args, Env: payloadEnv(s.spec)},
 		Hostname:    s.spec.Hostname,
 		Root:        w.root,
-		WorkDir:     w.workDir,
 		Binds:       w.binds,
-		Rlimits:     b.rlimits,
 		LateRlimits: b.late,
 		PidsMax:     b.pidsMax,
 		Landlock:    w.landlock,
 		LandlockABI: facts.landlockABI,
 		DenyNetwork: r.tier == OS && !s.spec.Network,
-		Cmd:         w.cmd,
-		Args:        s.spec.Args,
-		Env:         env,
 	}
 	if b.cgroup != nil && b.pidsMax > 0 {
 		cfg.PidsMaxFile = filepath.Join(b.cgroup.Dir, "pids.max")
 	}
-
-	cfgR, cfgW, err := os.Pipe()
-	if err != nil {
-		return fail(fmt.Errorf("sandbox: config pipe: %w", err))
-	}
-	statusR, statusW, err := os.Pipe()
-	if err != nil {
-		cfgR.Close()
-		cfgW.Close()
-		return fail(fmt.Errorf("sandbox: status pipe: %w", err))
-	}
-
 	cmd := exec.CommandContext(ctx, "/proc/self/exe")
 	// Cancellation kills by the strongest tie the run holds (killRun).
 	cmd.Cancel = func() error { return killRun(r, b, cmd.Process) }
 	cmd.Stdin = s.spec.Stdin
 	cmd.Stdout = s.spec.Stdout
 	cmd.Stderr = s.spec.Stderr
-	cmd.ExtraFiles = []*os.File{cfgR, statusW} // fds 3 and 4 in the child
-	cmd.Env = append(os.Environ(),
-		envInit+"=1",
-		envInitFD+"=3",
-		envStatusFD+"=4",
-	)
 	cmd.SysProcAttr = sysProcAttr(r, s.spec.Network)
 	// Born bounded: the child is cloned straight into its cgroup, so
 	// no instruction of it runs unaccounted and nothing migrates
 	// later (rootless placement could not migrate across the
-	// delegation boundary anyway).
+	// delegation boundary anyway). The descriptor is closed once the
+	// clone has it.
 	var cgroupFD *os.File
 	if b.cgroup != nil {
 		cgroupFD, err = b.cgroup.OpenFD()
 		if err != nil {
-			cfgR.Close()
-			cfgW.Close()
-			statusR.Close()
-			statusW.Close()
 			return fail(err)
 		}
 		cmd.SysProcAttr.UseCgroupFD = true
 		cmd.SysProcAttr.CgroupFD = int(cgroupFD.Fd())
 	}
-
-	startErr := cmd.Start()
-	if cgroupFD != nil {
-		runtime.KeepAlive(cgroupFD)
-		cgroupFD.Close()
-	}
-	if startErr != nil {
-		cfgR.Close()
-		cfgW.Close()
-		statusR.Close()
-		statusW.Close()
-		return fail(fmt.Errorf("sandbox: start: %w", startErr))
-	}
-	s.bounds = b
-	// The child holds its own copies; close ours so EOF can reach us.
-	cfgR.Close()
-	statusW.Close()
-
-	// The config write cannot block on a child that died: the pipe
-	// buffer holds it whole, and a dead reader turns the write into
-	// EPIPE, which the status read below explains.
-	if beforeConfigWrite != nil {
-		beforeConfigWrite()
-	}
-	encodeErr := json.NewEncoder(cfgW).Encode(&cfg)
-	cfgW.Close()
-
-	status, readErr := io.ReadAll(statusR)
-	statusR.Close()
-	if readErr != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return fail(fmt.Errorf("sandbox: read init status: %w", readErr))
-	}
-	if encodeErr != nil && !initUnread(encodeErr, status) {
-		// The init never received a whole config; whatever it reported
-		// is the consequence of this fault, not of the intent. A write
-		// refused for want of a reader with nothing reported is the
-		// init dead before reading, which the empty status pipe
-		// reports as the death it is (startFailure).
-		_ = cmd.Process.Kill()
-		waitErr := cmd.Wait()
-		return fail(fmt.Errorf("sandbox: write init config: %v (init: %v)", encodeErr, waitErr))
-	}
-	outcome, reason := classifyStatus(status)
-	if outcome == initExeced {
-		s.cmd = cmd
-		s.row = r
+	started := func() error {
+		if cgroupFD != nil {
+			runtime.KeepAlive(cgroupFD)
+			cgroupFD.Close()
+		}
 		return nil
 	}
-	// Every other shape means the init has exited: reap it so Start's
-	// failure is the whole story.
-	waitErr := cmd.Wait()
-	return fail(startFailure(r.tier, outcome, reason, status, ctx.Err(), waitErr))
+	err = startInit(ctx, r.tier, cmd, &cfg, started, func() { _ = cmd.Process.Kill() })
+	if cgroupFD != nil {
+		cgroupFD.Close() // a start that never ran started
+	}
+	if err != nil {
+		return fail(err)
+	}
+	s.bounds = b
+	s.cmd = cmd
+	s.row = r
+	return nil
 }
 
 // world is the resolved shape of a run: the tree to pivot to (the
@@ -420,19 +342,12 @@ func (s *linuxSandbox) Wait() (ExitStatus, error) {
 		return s.status, s.waitErr
 	}
 	s.waited = true
-	err := s.cmd.Wait()
-	var ee *exec.ExitError
-	if err != nil && !errors.As(err, &ee) {
+	status, err := reaped(s.cmd, s.cmd.Wait())
+	if err != nil {
 		s.waitErr = err
 		return ExitStatus{}, errors.Join(err, s.release())
 	}
-	ps := s.cmd.ProcessState
-	s.status = ExitStatus{Code: ps.ExitCode()}
-	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-		s.status.Signaled = true
-		s.status.Signal = ws.Signal()
-		s.status.Code = 128 + int(ws.Signal())
-	}
+	s.status = status
 	if s.bounds.cgroup != nil {
 		st, serr := s.bounds.stats()
 		if serr != nil {
@@ -511,21 +426,10 @@ func cloneFlags(network bool) uintptr {
 // hostname, composes the world, and hardens; the Minimal row enters
 // the working directory and applies the bounds, nothing else.
 func composeInit() (execPlan, error) {
-	fdStr := os.Getenv(envInitFD)
-	fd, err := strconv.Atoi(fdStr)
+	cfg, err := readInitConfig[initConfig]()
 	if err != nil {
-		return execPlan{}, fmt.Errorf("bad %s=%q: %w", envInitFD, fdStr, err)
+		return execPlan{}, err
 	}
-	f := os.NewFile(uintptr(fd), "sandbox-config")
-	if f == nil {
-		return execPlan{}, fmt.Errorf("invalid config fd %d", fd)
-	}
-	var cfg initConfig
-	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
-		f.Close()
-		return execPlan{}, fmt.Errorf("decode config: %w", err)
-	}
-	f.Close()
 
 	// The cgroup's pids.max is opened while the host view is still
 	// here and written last (see initConfig.PidsMaxFile).
@@ -563,7 +467,7 @@ func composeInit() (execPlan, error) {
 			return execPlan{}, intentError{fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)}
 		}
 	}
-	if err := nslinux.SetRlimits(cfg.Rlimits); err != nil {
+	if err := rlimit.Set(cfg.Rlimits); err != nil {
 		return execPlan{}, intentError{err}
 	}
 	if osRow {
@@ -601,11 +505,8 @@ func composeInit() (execPlan, error) {
 		}
 		pidsMax.Close()
 	}
-	if err := nslinux.SetRlimits(cfg.LateRlimits); err != nil {
+	if err := rlimit.Set(cfg.LateRlimits); err != nil {
 		return execPlan{}, intentError{err}
-	}
-	if cfg.Env == nil {
-		cfg.Env = []string{}
 	}
 	return execPlan{Cmd: cfg.Cmd, Args: cfg.Args, Env: cfg.Env}, nil
 }

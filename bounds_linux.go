@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/greatliontech/sandbox/internal/nslinux"
+	"github.com/greatliontech/sandbox/internal/rlimit"
 )
 
 // bounds is one run's resource accounting as selected for this host
@@ -37,10 +38,10 @@ import (
 // early rlimits.
 type bounds struct {
 	accounting Accounting
-	cgroup     *nslinux.Cgroup  // nil under rlimits
-	rlimits    []nslinux.Rlimit // applied early in the init
-	late       []nslinux.Rlimit // applied by the init right before exec
-	pidsMax    uint64           // written to the cgroup's pids.max right before exec
+	cgroup     *nslinux.Cgroup // nil under rlimits
+	rlimits    []rlimit.Limit  // applied early in the init
+	late       []rlimit.Limit  // applied by the init right before exec
+	pidsMax    uint64          // written to the cgroup's pids.max right before exec
 }
 
 // selectBounds maps l onto the strongest accounting this host
@@ -53,10 +54,10 @@ type bounds struct {
 func selectBounds(ctx context.Context, l Limits, hierarchy *nslinux.Hierarchy) (bounds, error) {
 	b := bounds{accounting: AccountingNone}
 	if l.CPUSeconds > 0 {
-		b.rlimits = append(b.rlimits, nslinux.Rlimit{Resource: unix.RLIMIT_CPU, Cur: l.CPUSeconds, Max: l.CPUSeconds})
+		b.rlimits = append(b.rlimits, rlimit.Limit{Resource: unix.RLIMIT_CPU, Cur: l.CPUSeconds, Max: l.CPUSeconds})
 	}
 	if l.MaxFiles > 0 {
-		b.rlimits = append(b.rlimits, nslinux.Rlimit{Resource: unix.RLIMIT_NOFILE, Cur: l.MaxFiles, Max: l.MaxFiles})
+		b.rlimits = append(b.rlimits, rlimit.Limit{Resource: unix.RLIMIT_NOFILE, Cur: l.MaxFiles, Max: l.MaxFiles})
 	}
 	if l.MemoryBytes == 0 && l.MaxProcs == 0 {
 		if len(b.rlimits) > 0 {
@@ -66,10 +67,10 @@ func selectBounds(ctx context.Context, l Limits, hierarchy *nslinux.Hierarchy) (
 	}
 	fallback := func() (bounds, error) {
 		if l.MemoryBytes > 0 {
-			b.late = append(b.late, nslinux.Rlimit{Resource: unix.RLIMIT_AS, Cur: l.MemoryBytes, Max: l.MemoryBytes})
+			b.late = append(b.late, rlimit.Limit{Resource: unix.RLIMIT_AS, Cur: l.MemoryBytes, Max: l.MemoryBytes})
 		}
 		if l.MaxProcs > 0 {
-			b.late = append(b.late, nslinux.Rlimit{Resource: unix.RLIMIT_NPROC, Cur: l.MaxProcs, Max: l.MaxProcs})
+			b.late = append(b.late, rlimit.Limit{Resource: unix.RLIMIT_NPROC, Cur: l.MaxProcs, Max: l.MaxProcs})
 		}
 		b.accounting = AccountingRlimits
 		return b, nil

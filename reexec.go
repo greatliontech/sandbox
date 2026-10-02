@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 
+	"github.com/greatliontech/sandbox/internal/rlimit"
 	"golang.org/x/sys/unix"
 )
 
@@ -59,6 +62,19 @@ func init() {
 	case "2":
 		runStage() // never returns
 	}
+}
+
+// initCommon is what every platform's init config carries: the row
+// the parent selected, the working directory to enter, the limits
+// the init applies to itself for the payload to inherit, and the
+// payload's command, arguments and environment.
+type initCommon struct {
+	Row     string         `json:"row"`
+	WorkDir string         `json:"workdir,omitempty"`
+	Rlimits []rlimit.Limit `json:"rlimits,omitempty"`
+	Cmd     string         `json:"cmd"`
+	Args    []string       `json:"args,omitempty"`
+	Env     []string       `json:"env"`
 }
 
 // execPlan is what the init execs once the row's world is composed.
@@ -228,7 +244,7 @@ func startFailure(tier Isolation, outcome initOutcome, reason string, status []b
 		if ctxErr != nil {
 			return fmt.Errorf("sandbox: the init was ended before exec: %w", ctxErr)
 		}
-		return fmt.Errorf("sandbox: the init died before exec (%v): a package init of this binary must not act under %s", waitErr, envInit)
+		return fmt.Errorf("sandbox: %s", initBreach("the init died before exec", waitErr))
 	case initApplierDied:
 		if ctxErr != nil {
 			return fmt.Errorf("sandbox: the init was ended before exec: %w", ctxErr)
@@ -241,6 +257,14 @@ func startFailure(tier Isolation, outcome initOutcome, reason string, status []b
 		return fmt.Errorf("sandbox: the second stage died before exec (%v)", waitErr)
 	}
 	return fmt.Errorf("sandbox: unreadable init status %q", status)
+}
+
+// initBreach is the report of a re-exec'd init that died on its own
+// — a package init of the calling binary acting under the marker,
+// the Re-exec clause's contract breached (docs/specs/sandbox.md) —
+// opening with what died, as the caller tells it.
+func initBreach(what string, waitErr error) string {
+	return fmt.Sprintf("%s (%v): a package init of this binary must not act under %s", what, waitErr, envInit)
 }
 
 // initOutcome is what the status pipe's content says happened in the
@@ -290,6 +314,147 @@ func classifyStatus(status []byte) (initOutcome, string) {
 		return initRefused, strings.TrimSpace(strings.TrimPrefix(st, statusExecing+statusFailed))
 	}
 	return initGarbled, ""
+}
+
+// initEnv is the re-exec'd init's environment: the markers it reads
+// and nothing of the host's — the payload's environment is the
+// config's to carry, and the init's own composition needs none.
+func initEnv() []string {
+	return []string{envInit + "=1", envInitFD + "=3", envStatusFD + "=4"}
+}
+
+// hostProbeEnv is a host probe's environment: the re-exec marker and the
+// probe marker, under which the init exits at once.
+func hostProbeEnv() []string {
+	return []string{envInit + "=1", envProbe + "=1"}
+}
+
+// payloadEnv is the payload's environment: the stated one; where
+// none is stated, empty under a Root — a restricted world carries
+// nothing of the host unstated (docs/specs/sandbox.md, "Root is
+// world-restriction") — and the host's own otherwise.
+func payloadEnv(spec Spec) []string {
+	switch {
+	case spec.Env != nil:
+		return spec.Env
+	case spec.Root != "":
+		return []string{}
+	}
+	return hostEnv()
+}
+
+// launchInit runs cmd as the init through the protocol: the config
+// and status pipes made and handed over as descriptors 3 and 4, the
+// init's environment the markers alone, cmd started, started called
+// while the init is certainly alive — it blocks on its config until
+// written — then the config written and the status read to its end.
+// A failure of the protocol itself — a pipe, the start, started, the
+// read, a write the init's own death does not explain — ends the
+// init by kill, reaps it and is the error returned; otherwise the
+// outcome the status says and the status itself are returned, the
+// init running the payload where the outcome is initExeced and
+// exited otherwise, the caller's to reap. The config write cannot
+// block on a child that died: the pipe buffer holds it whole, and a
+// dead reader turns the write into EPIPE, which the status read
+// explains (initUnread).
+func launchInit(cmd *exec.Cmd, cfg any, started func() error, kill func()) (initOutcome, string, []byte, error) {
+	cfgR, cfgW, err := os.Pipe()
+	if err != nil {
+		return initDied, "", nil, fmt.Errorf("sandbox: config pipe: %w", err)
+	}
+	statusR, statusW, err := os.Pipe()
+	if err != nil {
+		cfgR.Close()
+		cfgW.Close()
+		return initDied, "", nil, fmt.Errorf("sandbox: status pipe: %w", err)
+	}
+	cmd.Env = initEnv()
+	cmd.ExtraFiles = []*os.File{cfgR, statusW}
+	if err := cmd.Start(); err != nil {
+		cfgR.Close()
+		cfgW.Close()
+		statusR.Close()
+		statusW.Close()
+		return initDied, "", nil, fmt.Errorf("sandbox: start: %w", err)
+	}
+	// The child holds its own copies; close ours so EOF can reach us.
+	cfgR.Close()
+	statusW.Close()
+	ended := func(err error) (initOutcome, string, []byte, error) {
+		cfgW.Close()
+		statusR.Close()
+		kill()
+		waitErr := cmd.Wait()
+		if waitErr != nil {
+			err = fmt.Errorf("%w (init: %v)", err, waitErr)
+		}
+		return initDied, "", nil, err
+	}
+	if started != nil {
+		if err := started(); err != nil {
+			return ended(err)
+		}
+	}
+	if beforeConfigWrite != nil {
+		beforeConfigWrite()
+	}
+	encodeErr := json.NewEncoder(cfgW).Encode(cfg)
+	cfgW.Close()
+	status, readErr := io.ReadAll(statusR)
+	statusR.Close()
+	if readErr != nil {
+		return ended(fmt.Errorf("sandbox: read init status: %w", readErr))
+	}
+	if encodeErr != nil && !initUnread(encodeErr, status) {
+		// The init never received a whole config; whatever it reported
+		// is the consequence of this fault, not of the intent. A write
+		// refused for want of a reader with nothing reported is the
+		// init dead before reading, which the empty status pipe
+		// reports as the death it is (startFailure).
+		return ended(fmt.Errorf("sandbox: write init config: %v", encodeErr))
+	}
+	outcome, reason := classifyStatus(status)
+	return outcome, reason, status, nil
+}
+
+// startInit launches the init (launchInit) and reads its outcome:
+// nil with the payload running, or the failure — the protocol's own,
+// or the init's as startFailure reads it, the init reaped.
+func startInit(ctx context.Context, tier Isolation, cmd *exec.Cmd, cfg any, started func() error, kill func()) error {
+	outcome, reason, status, err := launchInit(cmd, cfg, started, kill)
+	if err != nil {
+		return err
+	}
+	if outcome == initExeced {
+		return nil
+	}
+	// Every other shape means the init has exited: reap it so Start's
+	// failure is the whole story.
+	waitErr := cmd.Wait()
+	return startFailure(tier, outcome, reason, status, ctx.Err(), waitErr)
+}
+
+// exitStatusOf reads how a reaped process ended: a signal death with
+// the code 128 plus the signal, as a shell reports it.
+func exitStatusOf(ps *os.ProcessState) ExitStatus {
+	st := ExitStatus{Code: ps.ExitCode()}
+	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		st.Signaled = true
+		st.Signal = ws.Signal()
+		st.Code = 128 + int(ws.Signal())
+	}
+	return st
+}
+
+// reaped reads a reaped payload's end from Wait's error: its exit
+// status where the process ran and ended, by exit or by signal; the
+// failure to wait otherwise.
+func reaped(cmd *exec.Cmd, err error) (ExitStatus, error) {
+	var exit *exec.ExitError
+	if err == nil || errors.As(err, &exit) {
+		return exitStatusOf(cmd.ProcessState), nil
+	}
+	return ExitStatus{}, err
 }
 
 // hostEnv is the caller's environment without this package's re-exec
