@@ -134,9 +134,11 @@ func (b *bounds) start() {
 	}
 }
 
-// messages reads the Job's completion port until the run is halted:
-// a refused process counted, the memory limit's message answered
-// with the run's kill, counted once.
+// messages reads the Job's completion port until the run is halted,
+// then what the port still holds: a refused process counted; the
+// memory limit's message — the bound's enforcement, the commit
+// refused — answered with the run's kill and counted once, whether
+// or not the payload outlives its refused commit to be killed.
 func (b *bounds) messages() {
 	defer close(b.done)
 	for {
@@ -144,12 +146,16 @@ func (b *bounds) messages() {
 		var key uintptr
 		var ov *windows.Overlapped
 		err := windows.GetQueuedCompletionStatus(b.port, &msg, &key, &ov, 100)
+		stopped := false
 		select {
 		case <-b.stop:
-			return
+			stopped = true
 		default:
 		}
 		if err != nil {
+			if stopped {
+				return // the port drained
+			}
 			continue // the wait timed out
 		}
 		b.mu.Lock()
@@ -157,9 +163,9 @@ func (b *bounds) messages() {
 		case jobMsgActiveProcessLimit:
 			b.refused++
 		case jobMsgJobMemoryLimit:
-			if !b.killed {
-				b.killed = true
+			if b.memKills == 0 {
 				b.memKills++
+				b.killed = true
 				_ = windows.TerminateJobObject(b.job, killExitCode)
 			}
 		}
@@ -231,8 +237,9 @@ func (b *bounds) kill() error {
 	return windows.TerminateJobObject(b.job, killExitCode)
 }
 
-// halt ends the readers and waits for them; the Job's handles stay
-// open for the account until close.
+// halt ends the readers and waits for them, the port's remaining
+// messages read on the way out; the Job's handles stay open for the
+// account until close.
 func (b *bounds) halt() {
 	if b.stop == nil {
 		return

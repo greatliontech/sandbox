@@ -259,22 +259,37 @@ func (s *windowsSandbox) Start(ctx context.Context) error {
 }
 
 // containerEnv is the payload's environment on this platform: the
-// stated one, or the host's own without a Root — with the one
-// variable a container's launch demands, LOCALAPPDATA, which the
-// platform redirects to the package's own directory along with the
-// temporary directory, carried from the host where the stated
-// environment lacks it.
+// stated one, or the host's own without a Root — with the two
+// variables the platform's own machinery reads, carried from the
+// host where the stated environment lacks them: LOCALAPPDATA, which
+// a container's launch demands and redirects to the package's own
+// directory, adding the temporary directory's variables (TEMP, TMP)
+// redirected there; and SystemRoot, from which the platform's own
+// libraries resolve their paths (the network's providers among
+// them).
 func containerEnv(spec Spec, r row) []string {
 	env := payloadEnv(spec)
 	if r.tier != OS {
 		return env
 	}
-	for _, kv := range env {
-		if len(kv) > 13 && strings.EqualFold(kv[:13], "LOCALAPPDATA=") {
-			return env
+	env = append([]string{}, env...)
+	for _, name := range []string{"LOCALAPPDATA", "SystemRoot"} {
+		if !hasVar(env, name) {
+			env = append(env, name+"="+os.Getenv(name))
 		}
 	}
-	return append(append([]string{}, env...), "LOCALAPPDATA="+os.Getenv("LOCALAPPDATA"))
+	return env
+}
+
+// hasVar reports whether env states the variable, the platform
+// folding case.
+func hasVar(env []string, name string) bool {
+	for _, kv := range env {
+		if len(kv) > len(name) && kv[len(name)] == '=' && strings.EqualFold(kv[:len(name)], name) {
+			return true
+		}
+	}
+	return false
 }
 
 // create makes the payload's process, suspended: the command line

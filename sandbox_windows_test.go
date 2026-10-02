@@ -39,6 +39,8 @@ func child(mode string) {
 	case "hello":
 		say("hello", "world")
 		say("env", len(os.Environ()))
+		say("host-only", os.Getenv("SANDBOX_TEST_HOST_ONLY"))
+		say("systemroot", os.Getenv("SystemRoot"))
 		wd, _ := os.Getwd()
 		say("cwd", wd)
 	case "exit7":
@@ -197,18 +199,24 @@ func TestReachIsStartsSelection(t *testing.T) {
 }
 
 // TestHelloUnderTheContainer pins the OS row's run: the payload runs
-// under an AppContainer with the stated environment and the one
-// variable the launch demands, in the stated working directory,
+// under an AppContainer with the stated environment and the
+// variables the platform's own machinery reads (LOCALAPPDATA and
+// SystemRoot, with the temporary directory's two the launch adds)
+// and nothing else of the host's, in the stated working directory,
 // reads its own directory and the system's files and nothing of the
 // user's, and reports the row.
 func TestHelloUnderTheContainer(t *testing.T) {
 	requireAppContainer(t)
+	t.Setenv("SANDBOX_TEST_HOST_ONLY", "leaked")
 	spec, out := payload("hello")
 	spec.WorkDir = os.TempDir()
 	sb, st := run(t, spec)
 	f := facts(out.String())
-	if st.Code != 0 || f["hello"] != "world" || f["env"] != "2" || !strings.EqualFold(f["cwd"], os.TempDir()) || sb.Tier() != OS {
+	if st.Code != 0 || f["hello"] != "world" || f["host-only"] != "" || f["systemroot"] == "" || !strings.EqualFold(f["cwd"], os.TempDir()) || sb.Tier() != OS {
 		t.Fatalf("exit %+v, facts %v, tier %v", st, f, sb.Tier())
+	}
+	if n, _ := strconv.Atoi(f["env"]); n < 3 || n > 5 {
+		t.Fatalf("env held %s entries, want the stated one, the two carried and at most the temporary directory's two", f["env"])
 	}
 	spec, out = payload("probe")
 	_, st = run(t, spec)
@@ -317,19 +325,21 @@ func TestNetworkDeniedUnlessGranted(t *testing.T) {
 }
 
 // TestMemoryBoundKillsHog pins the memory bound: a payload past it is
-// killed by the Job's message, and the account says so.
+// ended by the Job's refused commit — killed on the Job's report, or
+// dead of the refusal first, as this binary's race runtime is — and
+// the account says the bound did it.
 func TestMemoryBoundKillsHog(t *testing.T) {
 	requireAppContainer(t)
 	spec, out := payload("hog")
-	spec.Limits = Limits{MemoryBytes: 64 << 20}
+	spec.Limits = Limits{MemoryBytes: 256 << 20}
 	sb, st := run(t, spec)
 	f := facts(out.String())
-	if st.Code != killExitCode || f["hog"] != "start" || f["hogged"] != "" {
-		t.Fatalf("exit %+v, facts %v; want the kill past the bound", st, f)
+	if st.Code == 0 || f["hogged"] != "" {
+		t.Fatalf("exit %+v, facts %v; want the run ended past the bound", st, f)
 	}
 	stats, err := sb.Stats()
-	if err != nil || stats.Accounting != AccountingJobObject || stats.MemoryKills != 1 || stats.CPUKills != 0 || stats.MemoryPeakBytes < 32<<20 {
-		t.Fatalf("stats %+v %v, want the Job's kill by the memory bound", stats, err)
+	if err != nil || stats.Accounting != AccountingJobObject || stats.MemoryKills != 1 || stats.CPUKills != 0 || stats.MemoryPeakBytes < 128<<20 {
+		t.Fatalf("stats %+v %v, want the Job's enforcement of the memory bound", stats, err)
 	}
 }
 
@@ -507,10 +517,10 @@ func TestMinimalRowRefusesBoundaries(t *testing.T) {
 		t.Fatalf("exit %+v, output %q, tier %v; want the Minimal row's run", st, out.String(), sb.Tier())
 	}
 	spec, out = payload("hog")
-	spec.Limits = Limits{MemoryBytes: 64 << 20}
+	spec.Limits = Limits{MemoryBytes: 256 << 20}
 	sb, st = run(t, spec)
-	if st.Code != killExitCode || facts(out.String())["hogged"] != "" {
-		t.Fatalf("exit %+v, output %q; want the Job's kill on the Minimal row", st, out.String())
+	if st.Code == 0 || facts(out.String())["hogged"] != "" {
+		t.Fatalf("exit %+v, output %q; want the Job's bound on the Minimal row", st, out.String())
 	}
 	if stats, err := sb.Stats(); err != nil || stats.MemoryKills != 1 {
 		t.Fatalf("stats %+v %v", stats, err)
