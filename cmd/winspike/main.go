@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -133,14 +134,43 @@ func parent() {
 	} else {
 		fact("ungranted-run", "ran")
 	}
+	fact("icacls-temp", icacls(filepath.Dir(tree)))
+	fact("icacls-other", icacls(other))
+	fact("icacls-tree", icacls(tree))
 
-	for _, mode := range []string{"probe", "net", "hog", "spin", "spawn"} {
+	// A directory whose descriptor the caller may not write: the grant fails.
+	locked, _ := os.MkdirTemp("", "spike-locked-")
+	defer func() {
+		exec.Command("icacls", locked, "/grant", os.Getenv("USERNAME")+":(F)").Run()
+		os.RemoveAll(locked)
+	}()
+	if out, err := exec.Command("icacls", locked, "/deny", os.Getenv("USERNAME")+":(WDAC)").CombinedOutput(); err != nil {
+		fact("lock", fmt.Sprintf("%v %s", err, out))
+	}
+	fact("grant-locked", grant(locked, sid, windows.GENERIC_READ))
+
+	// A sibling of the tree, granted: the payload may execute it.
+	sibling, _ := os.MkdirTemp("", "spike-sibling-")
+	defer os.RemoveAll(sibling)
+	copyFile(exe, filepath.Join(sibling, "payload.exe"))
+	fact("grant-sibling", grant(sibling, sid, windows.GENERIC_READ|windows.GENERIC_EXECUTE))
+	// A library beside the payload, and one in an un-granted place.
+	copyFile(`C:\Windows\System32\winmm.dll`, filepath.Join(tree, "sibling.dll"))
+	copyFile(`C:\Windows\System32\winmm.dll`, filepath.Join(other, "sibling.dll"))
+
+	// The kill tie: a sleeper in a job dies when the job's last handle closes.
+	fact("kill-on-close", killOnClose(payload, sid))
+
+	for _, mode := range []string{"probe", "envempty", "dll", "exec-sibling", "net", "hog", "jobhog", "spin", "spawn"} {
 		limits := &windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 		limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 		switch mode {
 		case "hog":
 			limits.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_PROCESS_MEMORY
 			limits.ProcessMemoryLimit = 128 << 20
+		case "jobhog":
+			limits.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_JOB_MEMORY
+			limits.JobMemoryLimit = 128 << 20
 		case "spin":
 			limits.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_JOB_TIME
 			limits.BasicLimitInformation.PerJobUserTimeLimit = 2 * 10_000_000 // 100ns units: two seconds
@@ -148,7 +178,13 @@ func parent() {
 			limits.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_ACTIVE_PROCESS
 			limits.BasicLimitInformation.ActiveProcessLimit = 3
 		}
-		out, code, acct, err := run(payload, sid, limits, []string{mode, tree, addr}, 15*time.Second)
+		args := []string{mode, tree, addr, sibling, other}
+		if mode == "jobhog" {
+			args[0] = "hog"
+		}
+		emptyEnv = mode == "envempty"
+		out, code, acct, err := run(payload, sid, limits, args, 15*time.Second)
+		emptyEnv = false
 		fact(mode+"-err", err)
 		fact(mode+"-exit", code)
 		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -158,6 +194,42 @@ func parent() {
 		}
 		fact(mode+"-acct", acct)
 	}
+}
+
+// emptyEnv runs the next child with an empty environment block.
+var emptyEnv bool
+
+func icacls(path string) string {
+	out, _ := exec.Command("icacls", path).CombinedOutput()
+	return strings.ReplaceAll(strings.TrimSpace(string(out)), "\n", " | ")
+}
+
+// killOnClose starts a sleeper in a job with KILL_ON_JOB_CLOSE, closes
+// the job's only handle and reports whether the sleeper died.
+func killOnClose(exe string, sid *windows.SID) string {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return err.Error()
+	}
+	limits := &windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(limits)), uint32(unsafe.Sizeof(*limits)))
+	pi, err := start(exe, sid, []string{"sleep"}, 0, 0)
+	if err != nil {
+		return err.Error()
+	}
+	windows.AssignProcessToJobObject(job, pi.Process)
+	windows.ResumeThread(pi.Thread)
+	windows.CloseHandle(pi.Thread)
+	windows.CloseHandle(job)
+	ev, _ := windows.WaitForSingleObject(pi.Process, 3000)
+	var code uint32
+	windows.GetExitCodeProcess(pi.Process, &code)
+	windows.CloseHandle(pi.Process)
+	if ev == uint32(windows.WAIT_TIMEOUT) {
+		return "the sleeper outlived the job's handle"
+	}
+	return fmt.Sprintf("died, exit %d", code)
 }
 
 func copyFile(src, dst string) error {
@@ -216,6 +288,45 @@ func grant(path string, sid *windows.SID, access windows.ACCESS_MASK) error {
 // run starts exe under the container sid, in a job with the limits
 // where given, its stdout captured; it returns the output, the exit
 // code, the job's account and any failure to start.
+// start creates exe suspended under the container sid, its stdout
+// and stderr the handle out where given.
+func start(exe string, sid *windows.SID, args []string, out windows.Handle, _ int) (windows.ProcessInformation, error) {
+	var pi windows.ProcessInformation
+	al, err := windows.NewProcThreadAttributeList(1)
+	if err != nil {
+		return pi, fmt.Errorf("attribute list: %w", err)
+	}
+	defer al.Delete()
+	caps := securityCapabilities{AppContainerSid: sid}
+	if err := al.Update(procThreadAttributeSecurityCapabilities, unsafe.Pointer(&caps), unsafe.Sizeof(caps)); err != nil {
+		return pi, fmt.Errorf("capabilities attribute: %w", err)
+	}
+	si := &windows.StartupInfoEx{}
+	si.Cb = uint32(unsafe.Sizeof(*si))
+	if out != 0 {
+		si.Flags = windows.STARTF_USESTDHANDLES
+		si.StdOutput = out
+		si.StdErr = out
+	}
+	si.ProcThreadAttributeList = al.List()
+	cmdline := syscall.EscapeArg(exe)
+	for _, a := range args {
+		cmdline += " " + syscall.EscapeArg(a)
+	}
+	exeP, _ := windows.UTF16PtrFromString(exe)
+	cmdP, _ := windows.UTF16PtrFromString(cmdline)
+	flags := uint32(windows.CREATE_SUSPENDED | windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_NO_WINDOW | windows.CREATE_UNICODE_ENVIRONMENT)
+	var env *uint16
+	if emptyEnv {
+		env = &[]uint16{0, 0}[0]
+	}
+	err = windows.CreateProcess(exeP, cmdP, nil, nil, out != 0, flags, env, nil, &si.StartupInfo, &pi)
+	if err != nil {
+		return pi, fmt.Errorf("create process: %w", err)
+	}
+	return pi, nil
+}
+
 func run(exe string, sid *windows.SID, limits *windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION, args []string, wait time.Duration) (string, uint32, string, error) {
 	sa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), InheritHandle: 1}
 	var r, w windows.Handle
@@ -223,35 +334,11 @@ func run(exe string, sid *windows.SID, limits *windows.JOBOBJECT_EXTENDED_LIMIT_
 		return "", 0, "", fmt.Errorf("pipe: %w", err)
 	}
 	windows.SetHandleInformation(r, windows.HANDLE_FLAG_INHERIT, 0)
-
-	al, err := windows.NewProcThreadAttributeList(1)
-	if err != nil {
-		return "", 0, "", fmt.Errorf("attribute list: %w", err)
-	}
-	defer al.Delete()
-	caps := securityCapabilities{AppContainerSid: sid}
-	if err := al.Update(procThreadAttributeSecurityCapabilities, unsafe.Pointer(&caps), unsafe.Sizeof(caps)); err != nil {
-		return "", 0, "", fmt.Errorf("capabilities attribute: %w", err)
-	}
-	si := &windows.StartupInfoEx{}
-	si.Cb = uint32(unsafe.Sizeof(*si))
-	si.Flags = windows.STARTF_USESTDHANDLES
-	si.StdOutput = w
-	si.StdErr = w
-	si.ProcThreadAttributeList = al.List()
-	var pi windows.ProcessInformation
-	cmdline := syscall.EscapeArg(exe)
-	for _, a := range args {
-		cmdline += " " + syscall.EscapeArg(a)
-	}
-	exeP, _ := windows.UTF16PtrFromString(exe)
-	cmdP, _ := windows.UTF16PtrFromString(cmdline)
-	flags := uint32(windows.CREATE_SUSPENDED | windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_NO_WINDOW)
-	err = windows.CreateProcess(exeP, cmdP, nil, nil, true, flags, nil, nil, &si.StartupInfo, &pi)
+	pi, err := start(exe, sid, args, w, 0)
 	windows.CloseHandle(w)
 	if err != nil {
 		windows.CloseHandle(r)
-		return "", 0, "", fmt.Errorf("create process: %w", err)
+		return "", 0, "", err
 	}
 	var job, port windows.Handle
 	acct := ""
@@ -344,6 +431,39 @@ func child(mode string, args []string) {
 		fact("temp", os.TempDir())
 		fact("localappdata", os.Getenv("LOCALAPPDATA"))
 		fact("env", len(os.Environ()))
+	case "envempty":
+		fact("ran", "yes")
+		fact("env", len(os.Environ()))
+		fact("temp", os.TempDir())
+		fact("systemroot", os.Getenv("SystemRoot"))
+		_, err := os.ReadFile(`C:\Windows\System32\kernel32.dll`)
+		fact("read-system", err)
+	case "dll":
+		tree := args[0]
+		d, err := windows.LoadDLL(filepath.Join(tree, "sibling.dll"))
+		if d != nil {
+			d.Release()
+		}
+		fact("load-granted", err)
+		d, err = windows.LoadDLL(filepath.Join(args[3], "sibling.dll"))
+		if d != nil {
+			d.Release()
+		}
+		fact("load-ungranted", err)
+	case "exec-sibling":
+		files := []*os.File{os.Stdin, os.Stdout, os.Stderr}
+		p, err := os.StartProcess(filepath.Join(args[2], "payload.exe"), []string{"payload.exe", "ran"}, &os.ProcAttr{Files: files})
+		if err == nil {
+			p.Wait()
+		}
+		fact("exec-sibling", err)
+		p, err = os.StartProcess(filepath.Join(args[3], "payload.exe"), []string{"payload.exe", "ran"}, &os.ProcAttr{Files: files})
+		if err == nil {
+			p.Wait()
+		}
+		fact("exec-ungranted", err)
+	case "ran":
+		fact("sibling-ran", "yes")
 	case "net":
 		c, err := net.DialTimeout("tcp", args[1], 3*time.Second)
 		if c != nil {
@@ -378,7 +498,7 @@ func child(mode string, args []string) {
 	case "spawn":
 		exe, _ := os.Executable()
 		for i := 1; i <= 3; i++ {
-			p, err := os.StartProcess(exe, []string{exe, "sleep"}, &os.ProcAttr{})
+			p, err := os.StartProcess(exe, []string{exe, "sleep"}, &os.ProcAttr{Files: []*os.File{os.Stdin, os.Stdout, os.Stderr}})
 			if err != nil {
 				fact("spawn-"+strconv.Itoa(i), err)
 				continue
