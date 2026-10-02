@@ -22,12 +22,16 @@ var _ = func() int {
 	if os.Getenv(envInit) == "" {
 		// The test process: a marker a killed predecessor of the same
 		// pid left behind would kill every init below; none is kept.
-		os.Remove(initDeathMarker(os.Getpid()))
+		if m := initDeathMarker(os.Getpid()); m != "" {
+			os.Remove(m)
+		}
 		return 0
 	}
 	if os.Getenv(envInit) == "1" && os.Getenv(envProbe) == "" {
-		if _, err := os.Stat(initDeathMarker(os.Getppid())); err == nil {
-			os.Exit(3)
+		if m := initDeathMarker(os.Getppid()); m != "" {
+			if _, err := os.Stat(m); err == nil {
+				os.Exit(3)
+			}
 		}
 	}
 	return 0
@@ -35,11 +39,13 @@ var _ = func() int {
 
 // initDeathMarker names the marker beside this binary: a place the
 // init child, whose environment is the markers alone (no TMPDIR),
-// spells exactly as the test process does.
+// spells exactly as the test process does; where the binary's own
+// path is unknown the fixture names nothing and stays out of the
+// way.
 func initDeathMarker(pid int) string {
 	exe, err := os.Executable()
 	if err != nil {
-		panic(err)
+		return ""
 	}
 	return filepath.Join(filepath.Dir(exe), "sandbox-init-death-"+strconv.Itoa(pid))
 }
@@ -51,6 +57,9 @@ func initDeathMarker(pid int) string {
 func TestInitDeathReported(t *testing.T) {
 	overrideMinimal(t)
 	marker := initDeathMarker(os.Getpid())
+	if marker == "" {
+		t.Fatal("this binary's own path is unknown")
+	}
 	if err := os.WriteFile(marker, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
