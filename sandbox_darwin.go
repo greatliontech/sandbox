@@ -273,8 +273,9 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 		if errors.Is(err, syscall.ESRCH) {
 			// The init is already a zombie of ours — a package init
 			// of this binary exited under the marker — which the
-			// status pipe reports as such below; nothing is left to
-			// watch.
+			// empty status pipe reports as the init's death below
+			// (the config write failing for want of a reader read
+			// the same way); nothing is left to watch.
 			exited, err = nil, nil
 		}
 	}
@@ -300,7 +301,10 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	if readErr != nil {
 		return fail(fmt.Errorf("sandbox: read init status: %w", readErr))
 	}
-	if encodeErr != nil {
+	// A config write refused for want of a reader is the init dead
+	// before reading it, which the empty status pipe reports as the
+	// death it is (startFailure); any other write failure is its own.
+	if encodeErr != nil && !(errors.Is(encodeErr, syscall.EPIPE) && len(status) == 0) {
 		return fail(fmt.Errorf("sandbox: write init config: %v", encodeErr))
 	}
 	outcome, reason := classifyStatus(status)
