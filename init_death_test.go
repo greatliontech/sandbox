@@ -19,6 +19,12 @@ import (
 // by the parent's pid makes the re-exec'd init exit before it reads
 // its config — the breach the Re-exec clause names.
 var _ = func() int {
+	if os.Getenv(envInit) == "" {
+		// The test process: a marker a killed predecessor of the same
+		// pid left behind would kill every init below; none is kept.
+		os.Remove(initDeathMarker(os.Getpid()))
+		return 0
+	}
 	if os.Getenv(envInit) == "1" && os.Getenv(envProbe) == "" {
 		if _, err := os.Stat(initDeathMarker(os.Getppid())); err == nil {
 			os.Exit(3)
