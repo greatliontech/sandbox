@@ -1985,6 +1985,73 @@ func TestCPUBoundKillAttributed(t *testing.T) {
 	}
 }
 
+// TestZombieCPUClock pins the reading of a dead process's CPU time
+// from its process CPU clock before the reap, on the path a run
+// takes: a child under a CPU rlimit, whose group timer is then
+// running as a run's is, spins until its clock shows a tenth of a
+// second, is killed, and shows at least that much as a zombie — a
+// loaded host delays the kill, never the reading.
+func TestZombieCPUClock(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh available")
+	}
+	cmd := exec.Command("/bin/sh", "-c", "while :; do :; done")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Whatever ends the test, the spinner ends with it: a kill and a
+	// reap, each harmless once done.
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+	pid := cmd.Process.Pid
+	if err := unix.Prlimit(pid, unix.RLIMIT_CPU, &unix.Rlimit{Cur: 100, Max: 100}, nil); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		var ts unix.Timespec
+		if err := unix.ClockGettime(processCPUClock(pid), &ts); err != nil {
+			t.Fatal(err)
+		}
+		if time.Duration(ts.Nano()) >= 100*time.Millisecond {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Skip("the host could not spare a tenth of a second of CPU in twenty")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	own, err := zombieCPUTime(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("the child survived its kill")
+	}
+	if own < 100*time.Millisecond || own > 30*time.Second {
+		t.Fatalf("the zombie's clock read %v for a spinner killed past a tenth of a second", own)
+	}
+	// A reaped process keeps no clock to read.
+	if _, err := zombieCPUTime(pid); err == nil {
+		t.Fatal("a reaped process's clock was read")
+	}
+}
+
+// TestProcessCPUClockID pins the clock id's encoding: the profiling
+// clock (the low three bits zero), of the process (the per-thread
+// bit clear), the pid recoverable from the complement, the largest
+// pid included.
+func TestProcessCPUClockID(t *testing.T) {
+	for _, pid := range []int{1, 2, 4096, 65535, 4194304} {
+		id := processCPUClock(pid)
+		if id&7 != 0 || int(^(id>>3)) != pid {
+			t.Errorf("processCPUClock(%d) = %d: clock bits %d, pid %d", pid, id, id&7, ^(id >> 3))
+		}
+	}
+}
+
 // A nil Env without a Root inherits the host's environment minus this
 // package's own markers.
 func TestHostEnvStripsMarkers(t *testing.T) {

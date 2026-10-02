@@ -11,8 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -352,15 +350,12 @@ func (s *linuxSandbox) Wait() (ExitStatus, error) {
 	}
 	// RLIMIT_CPU ends the run with a kill at the limit, its soft and
 	// hard limits one; the kill is the bound's where the dead
-	// process's own CPU time reached the bound within the allowance
-	// (cpuAllowance): the kernel checks the limit on its tick against
-	// a group timer that can run a tick ahead of the time accounted,
-	// and the zombie's time is read in two separately truncated clock
-	// ticks. A shortfall past the allowance leaves a bound's kill
-	// unattributed, never attributes another's; a kill by another
-	// hand within the allowance of the bound is misattributed, the
-	// cost of the allowance.
-	if s.bounds.cpu > 0 && status.Signaled && status.Signal == syscall.SIGKILL && ownErr == nil && own >= s.bounds.cpu-cpuAllowance {
+	// process's own CPU time, read from the clock the kernel checks
+	// the limit on, reached the bound. A kill by another hand once
+	// that clock reached the bound is misattributed, the one cost; a
+	// clock short of the bound leaves a kill unattributed, never
+	// attributes another's.
+	if s.bounds.cpu > 0 && status.Signaled && status.Signal == syscall.SIGKILL && ownErr == nil && own >= s.bounds.cpu {
 		s.cpuKills = 1
 	}
 	var waitErr error
@@ -425,19 +420,16 @@ func (s *linuxSandbox) Stats() (Stats, error) {
 	return st, err
 }
 
-// cpuAllowance is how far the CPU time read from a zombie may fall
-// short of the bound RLIMIT_CPU killed it at: the coarsest scheduler
-// tick a Linux kernel checks the limit on (HZ=100, 10ms), and the
-// two clock ticks (USER_HZ, 10ms each) the zombie's user and system
-// times are separately truncated to.
-const cpuAllowance = 30 * time.Millisecond
-
 // zombieCPUTime waits for the process to exit without reaping it and
-// reads its own user and system CPU time from its zombie — the
-// process's alone, as /proc/<pid>/stat keeps it apart from its
-// reaped children's — before the caller reaps it; a process that is
-// no zombie under that pid (the caller's /proc belonging to another
-// pid namespace) is refused.
+// reads its CPU time from its process CPU clock — the profiling
+// clock of the thread group, user and system time summed as the
+// kernel charges them, tick by tick where it accounts by the tick —
+// which is the clock RLIMIT_CPU is checked on: a reading from it is
+// the limit's own, where the zombie's /proc stat reports times
+// rescaled to the scheduler's precise runtime, a second clock that
+// drifts from the first under contention. The zombie keeps its
+// group's clock until it is reaped, so the reading precedes the
+// reap.
 func zombieCPUTime(pid int) (time.Duration, error) {
 	var info unix.Siginfo
 	for {
@@ -449,29 +441,19 @@ func zombieCPUTime(pid int) (time.Duration, error) {
 			break
 		}
 	}
-	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return 0, err
+	var ts unix.Timespec
+	if err := unix.ClockGettime(processCPUClock(pid), &ts); err != nil {
+		return 0, fmt.Errorf("the process CPU clock of %d: %w", pid, err)
 	}
-	// The fields after the parenthesized command name: the state
-	// first, the user and system times the twelfth and thirteenth.
-	rest := strings.Fields(string(stat[strings.LastIndexByte(string(stat), ')')+1:]))
-	if len(rest) < 13 {
-		return 0, fmt.Errorf("/proc/%d/stat: %d fields after the name", pid, len(rest))
-	}
-	if rest[0] != "Z" {
-		return 0, fmt.Errorf("/proc/%d/stat: no zombie under that pid (state %s)", pid, rest[0])
-	}
-	var ticks uint64
-	for _, f := range rest[11:13] {
-		n, err := strconv.ParseUint(f, 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("/proc/%d/stat: %w", pid, err)
-		}
-		ticks += n
-	}
-	const userHz = 100 // USER_HZ, fixed by the ABI at a hundred on every architecture Go runs on
-	return time.Duration(ticks) * time.Second / userHz, nil
+	return time.Duration(ts.Nano()), nil
+}
+
+// processCPUClock is the clock id of a process's profiling CPU clock
+// as the kernel spells it: the pid's complement shifted past the
+// three bits that name the clock, CPUCLOCK_PROF being zero, the
+// per-thread bit clear (MAKE_PROCESS_CPUCLOCK).
+func processCPUClock(pid int) int32 {
+	return int32(^pid) << 3
 }
 
 // cloneFlags returns the namespace creation flags. Network isolation (a new,
