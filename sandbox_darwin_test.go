@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -151,16 +152,37 @@ func withoutSeatbelt(t *testing.T) {
 	t.Cleanup(func() { hostOverride = nil })
 }
 
+// output is the payload's captured output, readable while the run's
+// copier still writes it.
+type output struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (o *output) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.Write(p)
+}
+
+func (o *output) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.String()
+}
+
+func (o *output) Len() int { return len(o.String()) }
+
 // payload is a spec running this binary as the payload in the named
 // mode, its output captured.
-func payload(mode string, env ...string) (Spec, *bytes.Buffer) {
-	var out bytes.Buffer
+func payload(mode string, env ...string) (Spec, *output) {
+	out := &output{}
 	return Spec{
 		Exec:   must(os.Executable()),
 		Env:    append([]string{childEnv + "=" + mode}, env...),
-		Stdout: &out,
+		Stdout: out,
 		Stderr: os.Stderr,
-	}, &out
+	}, out
 }
 
 func run(t *testing.T, spec Spec) (Sandbox, ExitStatus) {

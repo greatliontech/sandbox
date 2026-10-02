@@ -179,8 +179,10 @@ type taskReadings struct {
 // (the libproc call proc_pidinfo wraps: call 2, flavor
 // PROC_PIDTASKINFO), which an unprivileged process may read for its
 // own user's processes. The task info struct opens with the virtual
-// and resident sizes and the total user and system times in
-// nanoseconds, each eight bytes, in that order.
+// and resident sizes and the total user and system times, each eight
+// bytes, in that order; the times are in the kernel's timebase
+// ticks (hw.tbfrequency of them a second: twenty-four million on
+// Apple silicon, a thousand million on Intel), converted here.
 func taskInfo(pid int) (taskReadings, error) {
 	const (
 		callPidInfo      = 2
@@ -198,10 +200,33 @@ func taskInfo(pid int) (taskReadings, error) {
 	if n != taskInfoSize {
 		return taskReadings{}, fmt.Errorf("proc_info: %d bytes, want %d", n, taskInfoSize)
 	}
+	freq, err := timebase()
+	if err != nil {
+		return taskReadings{}, err
+	}
 	at := func(off int) uint64 { return *(*uint64)(unsafe.Pointer(&buf[off])) }
+	ticks := func(off int) time.Duration {
+		return time.Duration(float64(at(off)) * float64(time.Second) / float64(freq))
+	}
 	return taskReadings{
 		resident: at(residentOffset),
-		user:     time.Duration(at(userTimeOffset)),
-		system:   time.Duration(at(systemTimeOffset)),
+		user:     ticks(userTimeOffset),
+		system:   ticks(systemTimeOffset),
 	}, nil
 }
+
+// timebase is the kernel's timebase frequency in ticks a second, read
+// once.
+var timebase = sync.OnceValues(func() (uint64, error) {
+	if f, err := unix.SysctlUint64("hw.tbfrequency"); err == nil && f > 0 {
+		return f, nil
+	}
+	f, err := unix.SysctlUint32("hw.tbfrequency")
+	if err != nil {
+		return 0, fmt.Errorf("hw.tbfrequency: %w", err)
+	}
+	if f == 0 {
+		return 0, fmt.Errorf("hw.tbfrequency: zero")
+	}
+	return uint64(f), nil
+})
