@@ -451,15 +451,16 @@ func TestProcessBoundKillsThreads(t *testing.T) {
 // kernel shows it to the sandbox, so the run ends by its own exit,
 // in bounds and without a watchdog error.
 func TestWatchdogReadsPlatformBinaries(t *testing.T) {
+	out := &output{}
 	sb, st := run(t, Spec{
 		Exec:   "/bin/sh",
 		Args:   []string{"-c", "/bin/sleep 0.5; echo shell=done"},
 		Limits: Limits{MemoryBytes: 256 << 20, CPUSeconds: 10},
-		Stdout: &output{},
+		Stdout: out,
 		Stderr: os.Stderr,
 	})
-	if st.Code != 0 || st.Signaled {
-		t.Fatalf("exit %+v, want 0", st)
+	if st.Code != 0 || st.Signaled || facts(out.String())["shell"] != "done" {
+		t.Fatalf("exit %+v, output %q; want the shell done", st, out.String())
 	}
 	stats, err := sb.Stats()
 	if err != nil || stats.Accounting != AccountingWatchdog || stats.MemoryKills != 0 || stats.MemoryPeakBytes == 0 {

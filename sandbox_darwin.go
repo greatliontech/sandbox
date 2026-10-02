@@ -270,6 +270,13 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	if err == nil {
 		s.group.Store(&g)
 		exited, err = watchExit(g)
+		if errors.Is(err, syscall.ESRCH) {
+			// The init is already a zombie of ours — a package init
+			// of this binary exited under the marker — which the
+			// status pipe reports as such below; nothing is left to
+			// watch.
+			exited, err = nil, nil
+		}
 	}
 	if err != nil {
 		cfgW.Close()
