@@ -991,6 +991,26 @@ func TestRootLoadsTreeLibraries(t *testing.T) {
 				t.Fatalf("lipo: %v\n%s", err, out)
 			}
 		}
+		// lipo orders slices its own way: the pin against a selection
+		// by place holds only where the native slice sits at different
+		// places in the two images, which is reported either way.
+		nativeAt := func(name string) int {
+			fat, err := macho.OpenFat(filepath.Join(tree, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fat.Close()
+			want := map[string]macho.Cpu{"arm64": macho.CpuArm64, "amd64": macho.CpuAmd64}[runtime.GOARCH]
+			for i, a := range fat.Arches {
+				if a.Cpu == want {
+					return i
+				}
+			}
+			return -1
+		}
+		if a, b := nativeAt("universal"), nativeAt("universal-bad"); a == b {
+			t.Logf("lipo placed the native slice at %d in both images: the selection by machine is pinned, a selection by place is not", a)
+		}
 	}
 	out := &output{}
 	sb, st := run(t, Spec{Exec: "/relative", Root: tree, Env: []string{}, Stdout: out, Stderr: os.Stderr})
