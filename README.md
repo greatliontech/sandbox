@@ -52,7 +52,7 @@ fmt.Println(es.Code, sb.Tier())
 |---|---|---|---|
 | linux | create-only namespaces (`SysProcAttr` clone) + uid/gid map + pivoted read-only root with path grants + capability drop + seccomp (a native-ABI policy behind an arch guard) + no_new_privs + cgroup-or-rlimit bounds with reported accounting | `Strong` | delivered; a host without user namespaces reaches the `OS` row where it has Landlock — the world allowlisted at its host paths, the network denied at the socket, static entrypoints only — and the `Minimal` row otherwise: bounds only, refusing every intent needing a boundary (`Root`, `Hostname`, a denied network, read-only grants) and a spec with no limits, `MinTier` gating both |
 | windows | AppContainer + Job Object (`KILL_ON_JOB_CLOSE`) | `OS` | skeleton |
-| darwin | `sandbox-exec` SBPL profile + rlimits with a watchdog over the kernel's per-process readings for the bounds the kernel will not hold (memory, CPU past `SIGXCPU`) | `OS` | the rows and the bounds delivered; a host without `sandbox-exec` reaches the `Minimal` row; a stated `Root` not yet delivered (docs/issues/darwin-root-world.md) |
+| darwin | `sandbox-exec` SBPL profile (deny by default over Apple's `system.sb` substrate under a `Root`, the tree and grants allowlisted at the kernel's spelling; the whole world with the network denied without one) + rlimits with a watchdog over the kernel's per-process readings for the bounds the kernel will not hold (memory, CPU past `SIGXCPU`, the thread count) | `OS` | delivered; a host without `sandbox-exec` reaches the `Minimal` row |
 | other | — | — | `ErrUnsupported` |
 
 Linux strong-tier off Linux (Hyper-V / Virtualization.framework micro-VM running
@@ -61,7 +61,7 @@ the Linux backend) is a future tier, not yet wired.
 ## Roadmap
 
 1. **Windows**: AppContainer profile + Job Object; named-pipe transport plumbing.
-2. **macOS**: the `Root` world under the Seatbelt profile (docs/plans/rows.md).
+2. **macOS**: the rows' close-out (docs/plans/rows.md).
 3. Resource-usage `Stats` per backend.
 
 ## Spike

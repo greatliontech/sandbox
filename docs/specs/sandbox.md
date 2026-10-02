@@ -73,11 +73,19 @@ independent by design.
   at construction.
 - **`Root` is world-restriction.** A stated `Root` bounds the process's
   world: it may read exactly that tree, the granted paths, and the
-  platform's execution substrate (the runtime every process on that
-  platform necessarily maps: dyld and the system libraries on darwin,
-  nothing on Linux); it writes only where a `PathGrant` grants
-  `ReadWrite` and in the rendezvous directory; and the entrypoint comes
-  from the tree. Rows with mount namespaces additionally present the
+  platform's execution substrate — what every process on that
+  platform necessarily reaches to run, as the platform's own
+  baseline for a sandboxed process defines it: nothing on Linux; on
+  darwin what Apple's `system.sb` admits — dyld and the shared
+  cache, reads under `/System`, `/usr/lib`, `/usr/share` and
+  `/Library/Apple`, the timezone database, the passwd and services
+  files, the basic devices, the kernel's sysctl facts, the system
+  logger's socket, a fixed set of mach services — together, on
+  darwin alone, with the sandbox's own calling binary, whose second
+  stage runs under the profile before the payload, so the payload
+  may read and execute that binary; it writes only where a
+  `PathGrant` grants `ReadWrite` and in the rendezvous directory; and
+  the entrypoint comes from the tree. Rows with mount namespaces additionally present the
   tree at `/`. Rows without cannot: an entrypoint whose *loading*
   requires the image-absolute layout — dynamic linking against the
   image's own libraries — is refused there rather than run against a
@@ -98,8 +106,13 @@ independent by design.
   absent or wrong-kind target, or one reached through a symlink at
   any component, is an undeliverable intent, never an omission; so is
   a grant overlapping another grant or the rendezvous directory, two
-  intents over one path having no single delivery — and a read-only
-  grant is read-only throughout, submounts included. The tree itself
+  intents over one path having no single delivery, a rendezvous
+  directory that is no directory, and a file grant with more than
+  one name on the host, which could be the tree's own file under
+  another (a hard link, which no path can see) — a read-write
+  directory grant holding such a link is the caller's own doing, the
+  tree being the caller's to shape — and a read-only grant is
+  read-only throughout, submounts included. The tree itself
   is never written, not even transiently: a shared, read-only tree is
   a valid `Root`. The environment is caller-supplied state: under a
   `Root` an unstated environment is empty, never the host's.
@@ -174,7 +187,7 @@ independent by design.
 |---|---|---|
 | linux, unprivileged user namespaces available | namespaces (user, mount, pid, uts, ipc; net unless granted), pivoted read-only root repeating locked mount flags, capability drop, seccomp holding for every syscall ABI the kernel exposes (a foreign-ABI call is killed, never let through unfiltered), `no_new_privs`, cgroup-or-rlimit bounds | `Strong` |
 | linux, user namespaces unavailable, Landlock available | Landlock filesystem allowlist over the world at its host paths (the caller's whole world where no `Root` is stated), seccomp network denial at the socket (Landlock ABI 4's TCP restrictions are supplementary, never the sole arm — UDP and raw sockets stay open without seccomp; an ABI that also multiplexes the socket calls through `socketcall` refuses that route whole, the local family reached by the direct calls), Landlock's IPC scoping where the kernel has it (ABI 6), `no_new_privs`, cgroup-or-rlimit bounds; static entrypoints only under a `Root` — an ELF the kernel loads whole, native, with no interpreter; a script, a dynamically linked executable, or a file the check cannot read is refused | `OS` |
-| darwin, Seatbelt available (`sandbox-exec` applies a profile) | Seatbelt profile (filesystem allowlist, network denial at the socket — the platform's mach services stay reachable, name resolution among them, as a row without namespaces leaves IPC; a read-only grant refused without a `Root`, the profile over the whole world having no rule a renamed ancestor cannot carry a grant out of), rlimit bounds with the watchdog behind them | `OS` |
+| darwin, Seatbelt available (`sandbox-exec` applies a profile) | Seatbelt profile: under a `Root`, nothing by default but the platform's execution substrate as Apple's own `system.sb` states it (dyld, the system libraries and frameworks, the services every process reaches, name resolution not among them) less the one place it lets a process create files (`/cores`), the tree read, mapped and executed at its host path so an entrypoint may load the tree's own libraries and execute a sibling of the tree, the calling binary read and executed (its second stage runs under the profile before the payload: an exposure of that binary's bytes and its execution to the payload), grants read, mapped and executed as on the Linux `OS` row and read-write ones written, the rendezvous directory read and written with unix sockets within it alone, the network by address where granted, the platform's name resolution with it (a unix socket elsewhere on the host is not the network); the entrypoint an executable Mach-O image for the machine — the machine being the one the calling binary runs for — whose dynamic linker, libraries and run paths are the substrate's or relative to the image and which sets no loader environment, a script or an image linked at an image-absolute path refused; a grant's two spellings of one directory (a firmlink's, a case variant's) judged one, by the kernel's spelling; without a `Root`, the whole world with the network denied at the socket — the platform's mach services stay reachable, name resolution among them, as a row without namespaces leaves IPC — and a read-only grant refused, the profile over the whole world having no rule a renamed ancestor cannot carry a grant out of; the profile matching the kernel's own spelling of every path; rlimit bounds with the watchdog behind them | `OS` |
 | windows, AppContainer available | AppContainer boundary, Job Object bounds | `OS` |
 | any platform where no security boundary is available but resource bounds are | resource bounds (rlimits, Job Object, darwin's watchdog) | `Minimal` |
 | anything else | refused (`ErrUnsupported`) | — |

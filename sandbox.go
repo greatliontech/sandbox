@@ -100,7 +100,9 @@ const (
 // the tree is the caller's to shape, and a grant with nowhere to land
 // is an undeliverable intent (ErrUndeliverable), never a silent
 // omission. Grants may not overlap one another or RuntimeDir: two
-// intents over one path have no single delivery.
+// intents over one path have no single delivery. A file granted
+// under a Root has one name on the host: a second name could be the
+// tree's own file (a hard link), which no path can see.
 type PathGrant struct {
 	Path   string
 	Access Access
