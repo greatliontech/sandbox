@@ -983,7 +983,9 @@ func TestRootLoadsTreeLibraries(t *testing.T) {
 	// one judged — clean beside a bad foreign one runs, bad beside a
 	// clean foreign one is refused.
 	if lipo, err := exec.LookPath("lipo"); err == nil {
-		for name, slices := range map[string][]string{"universal": {"relative", "foreign-bad"}, "universal-bad": {"hostrpath", "foreign"}} {
+		// The foreign slice first in one image: the native slice is
+		// found by its machine, never by its place.
+		for name, slices := range map[string][]string{"universal": {"foreign-bad", "relative"}, "universal-bad": {"hostrpath", "foreign"}} {
 			cmd := exec.Command(lipo, "-create", filepath.Join(tree, slices[0]), filepath.Join(tree, slices[1]), "-output", filepath.Join(tree, name))
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("lipo: %v\n%s", err, out)
