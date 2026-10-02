@@ -40,9 +40,7 @@ type darwinSandbox struct {
 	exited *exitWatch
 	bounds bounds
 
-	waited  bool // Wait's outcome is memoized: Destroy waits too
-	status  ExitStatus
-	waitErr error
+	outcome outcome // Wait's reaping memoized: Destroy waits too
 }
 
 // initConfig is the JSON payload handed to the re-exec'd init.
@@ -394,23 +392,22 @@ func (s *darwinSandbox) Wait() (ExitStatus, error) {
 	if s.cmd == nil {
 		return ExitStatus{}, errors.New("sandbox: not started")
 	}
-	if s.waited {
-		return s.status, s.waitErr
+	if !s.outcome.begin() {
+		return s.outcome.result()
 	}
-	s.waited = true
 	status, err := reaped(s.cmd, s.cmd.Wait())
 	s.exited.halt()
 	if s.bounds.watch != nil {
 		s.bounds.watch.halt()
 	}
 	_ = s.group.Load().kill()
-	s.status, s.waitErr = status, err
 	if s.bounds.watch != nil {
-		if _, _, werr := s.bounds.watch.stats(); werr != nil && s.waitErr == nil {
-			s.waitErr = werr
+		if _, _, werr := s.bounds.watch.stats(); werr != nil && err == nil {
+			err = werr
 		}
 	}
-	return s.status, s.waitErr
+	s.outcome.end(status, err)
+	return status, err
 }
 
 // Signal sends a signal to the sandboxed process: the applier and
@@ -427,7 +424,7 @@ func (s *darwinSandbox) Destroy() error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return nil
 	}
-	if !s.waited {
+	if !s.outcome.ended() {
 		_ = s.group.Load().kill()
 	}
 	_, err := s.Wait()

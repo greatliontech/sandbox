@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"time"
 	"unsafe"
@@ -16,24 +17,25 @@ import (
 // process of the run is born into, which kills them all with its last
 // handle. The memory bound is the Job's own, over the run's committed
 // memory summed, which the Job refuses past the bound and reports
-// through its completion port, on which message the run is killed —
-// the one place a refused commit would leave a payload to die as it
-// may; the process bound is the Job's active-process limit, which
-// refuses the process past it and reports each refusal; the CPU
-// bound is sampled from the Job's own account of the run's user and
-// kernel time at the stated interval and the run killed past it, the
-// Job's own time limit behind it as the kernel's backstop, which it
-// enforces on an interval of seconds. The Job counts what it
-// enforced: the peak committed memory, the kills by the memory and
-// CPU bounds, the processes refused.
+// through its completion port — the report the bound's enforcement,
+// on which the run is killed, a payload dying of the refused commit
+// first or not; the process bound is the Job's active-process limit,
+// which refuses the process past it and reports each refusal; the
+// CPU bound is sampled from the Job's own account of the run's user
+// and kernel time at the stated interval and the run killed past it,
+// the Job's own time limit (user time alone) behind it as the
+// kernel's backstop, which it enforces on an interval of seconds and
+// reports too. The Job counts what it enforced: the peak committed
+// memory, the enforcements of the memory and CPU bounds, the
+// processes refused.
 type bounds struct {
-	job    windows.Handle
-	port   windows.Handle
 	memory uint64
 	cpu    time.Duration
 	procs  uint64
 
-	mu        sync.Mutex
+	mu        sync.Mutex // guards the handles and the counters
+	job       windows.Handle
+	port      windows.Handle
 	memKills  uint64
 	cpuKills  uint64
 	refused   uint64
@@ -47,9 +49,7 @@ type bounds struct {
 // Job Object messages the completion port posts (winnt.h).
 const (
 	jobMsgEndOfJobTime       = 1
-	jobMsgEndOfProcessTime   = 2
 	jobMsgActiveProcessLimit = 3
-	jobMsgActiveProcessZero  = 4
 	jobMsgJobMemoryLimit     = 10
 
 	jobObjectAssociateCompletionPort = 7
@@ -67,6 +67,9 @@ type jobBasicAccounting struct {
 
 // newBounds makes the run's Job with the limits stated.
 func newBounds(l Limits) (*bounds, error) {
+	if l.MemoryBytes > math.MaxUint32 && unsafe.Sizeof(uintptr(0)) == 4 {
+		return nil, fmt.Errorf("%w: a memory bound of %d bytes exceeds what this platform's word holds", ErrUndeliverable, l.MemoryBytes)
+	}
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: job object: %w", err)
@@ -136,16 +139,24 @@ func (b *bounds) start() {
 
 // messages reads the Job's completion port until the run is halted,
 // then what the port still holds: a refused process counted; the
-// memory limit's message — the bound's enforcement, the commit
-// refused — answered with the run's kill and counted once, whether
-// or not the payload outlives its refused commit to be killed.
+// memory limit's report — the bound's enforcement, the commit refused
+// — answered with the run's kill and counted, whether or not the
+// payload outlives its refused commit to be killed; the Job's own
+// time limit's report, the backstop's kill, counted as the CPU
+// bound's.
 func (b *bounds) messages() {
 	defer close(b.done)
 	for {
 		var msg uint32
 		var key uintptr
 		var ov *windows.Overlapped
-		err := windows.GetQueuedCompletionStatus(b.port, &msg, &key, &ov, 100)
+		b.mu.Lock()
+		port := b.port
+		b.mu.Unlock()
+		if port == 0 {
+			return
+		}
+		err := windows.GetQueuedCompletionStatus(port, &msg, &key, &ov, 100)
 		stopped := false
 		select {
 		case <-b.stop:
@@ -163,10 +174,14 @@ func (b *bounds) messages() {
 		case jobMsgActiveProcessLimit:
 			b.refused++
 		case jobMsgJobMemoryLimit:
-			if b.memKills == 0 {
+			if !b.killed {
 				b.memKills++
-				b.killed = true
-				_ = windows.TerminateJobObject(b.job, killExitCode)
+				b.end()
+			}
+		case jobMsgEndOfJobTime:
+			if !b.killed {
+				b.cpuKills++
+				b.end()
 			}
 		}
 		b.mu.Unlock()
@@ -185,27 +200,33 @@ func (b *bounds) watch() {
 			return
 		case <-t.C:
 			a, err := b.account()
-			if err != nil {
-				b.mu.Lock()
+			b.mu.Lock()
+			switch {
+			case err != nil:
 				if b.err == nil {
 					b.err = fmt.Errorf("sandbox: the watchdog could not read the job's account: %w", err)
-					b.killed = true
-					_ = windows.TerminateJobObject(b.job, killExitCode)
+					b.end()
 				}
 				b.mu.Unlock()
 				return
-			}
-			if time.Duration(a.TotalUserTime+a.TotalKernelTime)*100 > b.cpu {
-				b.mu.Lock()
+			case time.Duration(a.TotalUserTime+a.TotalKernelTime)*100 > b.cpu:
 				if !b.killed {
-					b.killed = true
 					b.cpuKills++
-					_ = windows.TerminateJobObject(b.job, killExitCode)
+					b.end()
 				}
 				b.mu.Unlock()
 				return
 			}
+			b.mu.Unlock()
 		}
+	}
+}
+
+// end terminates the Job, once; called with the lock held.
+func (b *bounds) end() {
+	b.killed = true
+	if b.job != 0 {
+		_ = windows.TerminateJobObject(b.job, killExitCode)
 	}
 }
 
@@ -213,7 +234,13 @@ func (b *bounds) watch() {
 func (b *bounds) account() (jobBasicAccounting, error) {
 	var a jobBasicAccounting
 	var n uint32
-	if err := windows.QueryInformationJobObject(b.job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&a)), uint32(unsafe.Sizeof(a)), &n); err != nil {
+	b.mu.Lock()
+	job := b.job
+	b.mu.Unlock()
+	if job == 0 {
+		return a, fmt.Errorf("the job is closed")
+	}
+	if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&a)), uint32(unsafe.Sizeof(a)), &n); err != nil {
 		return a, err
 	}
 	return a, nil
@@ -223,23 +250,29 @@ func (b *bounds) account() (jobBasicAccounting, error) {
 func (b *bounds) peak() (uint64, error) {
 	var x windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	var n uint32
-	if err := windows.QueryInformationJobObject(b.job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&x)), uint32(unsafe.Sizeof(x)), &n); err != nil {
+	b.mu.Lock()
+	job := b.job
+	b.mu.Unlock()
+	if job == 0 {
+		return 0, fmt.Errorf("the job is closed")
+	}
+	if err := windows.QueryInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&x)), uint32(unsafe.Sizeof(x)), &n); err != nil {
 		return 0, err
 	}
 	return uint64(x.PeakJobMemoryUsed), nil
 }
 
-// kill ends every process of the run.
-func (b *bounds) kill() error {
+// kill ends every process of the run, where the Job is still open.
+func (b *bounds) kill() {
 	b.mu.Lock()
-	b.killed = true
-	b.mu.Unlock()
-	return windows.TerminateJobObject(b.job, killExitCode)
+	defer b.mu.Unlock()
+	b.end()
 }
 
 // halt ends the readers and waits for them, the port's remaining
 // messages read on the way out; the Job's handles stay open for the
-// account until close.
+// account until close. The caller ends the run first (kill), so
+// that no process is left to keep the port busy.
 func (b *bounds) halt() {
 	if b.stop == nil {
 		return
@@ -255,16 +288,17 @@ func (b *bounds) halt() {
 	}
 }
 
-// stats is the Job's account: the peak committed memory, the kills
-// by the memory and CPU bounds, the processes refused, and the bound
-// the watchdog could not hold.
+// stats is the Job's account: the peak committed memory, the
+// enforcements of the memory and CPU bounds, the processes refused,
+// and the bound the watchdog could not hold.
 func (b *bounds) stats() (Stats, error) {
 	st := Stats{Accounting: b.accounting()}
 	b.mu.Lock()
 	st.MemoryKills, st.CPUKills, st.ForksRefused = b.memKills, b.cpuKills, b.refused
 	err := b.err
+	open := b.job != 0
 	b.mu.Unlock()
-	if b.job != 0 {
+	if open {
 		if peak, perr := b.peak(); perr == nil {
 			st.MemoryPeakBytes = peak
 		} else if err == nil {
@@ -275,8 +309,11 @@ func (b *bounds) stats() (Stats, error) {
 }
 
 // close releases the Job and its port: with the last handle the Job
-// kills what it still holds (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).
+// kills what it still holds (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+// nothing reads the handles after.
 func (b *bounds) close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.port != 0 {
 		windows.CloseHandle(b.port)
 		b.port = 0

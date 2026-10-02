@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -105,6 +107,16 @@ func child(mode string) {
 		}
 		say("spawned", n)
 		time.Sleep(20 * time.Second)
+	case "echo":
+		b, _ := io.ReadAll(os.Stdin)
+		say("echoed", strings.TrimSpace(string(b)))
+	case "runtime":
+		say("write-runtime", os.WriteFile(filepath.Join(os.Getenv("SANDBOX_TEST_RUNTIME"), "w"), []byte("x"), 0o644))
+	case "repermission":
+		// A payload turning a read-write grant's permissions to its own
+		// ends: refused, the grant carrying no right to.
+		err := exec.Command(filepath.Join(os.Getenv("SystemRoot"), "System32", "icacls.exe"), os.Getenv("SANDBOX_TEST_RW"), "/grant", "Everyone:(F)").Run()
+		say("repermission", err)
 	case "sleep":
 		time.Sleep(20 * time.Second)
 	}
@@ -295,6 +307,168 @@ func entries(t *testing.T, path string) int {
 	return n
 }
 
+// TestRunReleasesWhatItHeld pins the run's end: the entrypoint's
+// directory and the rendezvous directory carry no entry for the
+// container after the run, and the profile's package directory is
+// gone with the profile.
+func TestRunReleasesWhatItHeld(t *testing.T) {
+	requireAppContainer(t)
+	rt := t.TempDir()
+	spec, out := payload("runtime", "SANDBOX_TEST_RUNTIME="+rt)
+	spec.RuntimeDir = rt
+	sb, st := run(t, spec)
+	if st.Code != 0 || facts(out.String())["write-runtime"] != "<nil>" {
+		t.Fatalf("exit %+v, facts %v; want the rendezvous directory written", st, facts(out.String()))
+	}
+	exe, _ := os.Executable()
+	for _, p := range []string{filepath.Dir(exe), rt} {
+		if entries(t, p) != 0 {
+			t.Errorf("%s still carries a container after the run", p)
+		}
+	}
+	name := sb.(*windowsSandbox).profile.name
+	if name != "" {
+		t.Errorf("the profile %s outlived the run", name)
+	}
+	if dirs, _ := filepath.Glob(filepath.Join(os.Getenv("LOCALAPPDATA"), "Packages", "sandbox-run-*")); len(dirs) != 0 {
+		t.Errorf("package directories outlive their runs: %v", dirs)
+	}
+}
+
+// TestDestroyDuringWait pins Destroy against a Wait in progress: the
+// run is killed and both callers see its end.
+func TestDestroyDuringWait(t *testing.T) {
+	requireAppContainer(t)
+	spec, _ := payload("sleep")
+	sb, err := New(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	type reaped struct {
+		st  ExitStatus
+		err error
+	}
+	waited := make(chan reaped, 1)
+	go func() {
+		st, err := sb.Wait()
+		waited <- reaped{st, err}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if err := sb.Destroy(); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	select {
+	case r := <-waited:
+		if r.err != nil || r.st.Code != killExitCode {
+			t.Fatalf("Wait = %+v %v, want the kill", r.st, r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Wait outlived Destroy")
+	}
+}
+
+// TestEndedContextRefusesStart pins the wall clock as the caller's: a
+// context ended before Start refuses, nothing running.
+func TestEndedContextRefusesStart(t *testing.T) {
+	requireAppContainer(t)
+	spec, out := payload("hello")
+	sb, err := New(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sb.Start(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start = %v, want the context's end", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("something ran: %q", out.String())
+	}
+}
+
+// TestStreamsCopied pins the standard streams: a reader's bytes reach
+// the payload's input, a file of the host's own takes its output.
+func TestStreamsCopied(t *testing.T) {
+	requireAppContainer(t)
+	spec, out := payload("echo")
+	spec.Stdin = strings.NewReader("from the caller\n")
+	_, st := run(t, spec)
+	if st.Code != 0 || facts(out.String())["echoed"] != "from the caller" {
+		t.Fatalf("exit %+v, output %q", st, out.String())
+	}
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	spec, _ = payload("hello")
+	spec.Stdout = f
+	spec.Stderr = f
+	_, st = run(t, spec)
+	b, _ := os.ReadFile(f.Name())
+	if st.Code != 0 || facts(string(b))["hello"] != "world" {
+		t.Fatalf("exit %+v, file %q", st, b)
+	}
+}
+
+// TestGrantCarriesNoPermissionRight pins a read-write grant's
+// rights: data written and entries made, never the permissions
+// changed.
+func TestGrantCarriesNoPermissionRight(t *testing.T) {
+	requireAppContainer(t)
+	rw := t.TempDir()
+	spec, out := payload("repermission", "SANDBOX_TEST_RW="+rw)
+	spec.PathGrants = []PathGrant{{Path: rw, Access: ReadWrite}}
+	_, st := run(t, spec)
+	if st.Code != 0 || facts(out.String())["repermission"] == "<nil>" {
+		t.Fatalf("exit %+v, facts %v; want the permission change refused", st, facts(out.String()))
+	}
+}
+
+// TestOverlapJudgedByIdentity pins overlap on the entries named: a
+// case variant and a short name of one grant are the one entry.
+func TestOverlapJudgedByIdentity(t *testing.T) {
+	requireAppContainer(t)
+	d := t.TempDir()
+	inner := filepath.Join(d, "inner")
+	if err := os.Mkdir(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	variants := map[string]string{"a case variant": strings.ToUpper(d)}
+	if short, err := shortPath(d); err == nil && !strings.EqualFold(short, d) {
+		variants["a short name"] = short
+	}
+	for name, alias := range variants {
+		spec, _ := payload("hello")
+		spec.PathGrants = []PathGrant{{Path: inner, Access: ReadOnly}, {Path: alias, Access: ReadWrite}}
+		sb, err := New(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "overlap") {
+			t.Errorf("%s of a grant over another: %v, want refused as overlapping", name, err)
+			sb.Destroy()
+		}
+	}
+}
+
+// shortPath is the platform's short (8.3) spelling of a path.
+func shortPath(path string) (string, error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return "", err
+	}
+	var buf [windows.MAX_PATH]uint16
+	n, err := windows.GetShortPathName(p, &buf[0], uint32(len(buf)))
+	if err != nil {
+		return "", err
+	}
+	return windows.UTF16ToString(buf[:n]), nil
+}
+
 // TestNetworkDeniedUnlessGranted pins the network: a container dials
 // nothing unless the network is granted — and never an address of
 // the host's own, loopback or interface, which the platform keeps
@@ -469,7 +643,8 @@ func TestStartRefusals(t *testing.T) {
 		"a relative exec":    func(s *Spec) { s.Exec = "nope.exe" },
 		"overlapping grants": func(s *Spec) {
 			d := t.TempDir()
-			s.PathGrants = []PathGrant{{Path: d}, {Path: filepath.Join(d, "..", filepath.Base(d))}}
+			os.Mkdir(filepath.Join(d, "in"), 0o755)
+			s.PathGrants = []PathGrant{{Path: d}, {Path: filepath.Join(d, "in")}}
 		},
 	} {
 		spec, _ := payload("hello")

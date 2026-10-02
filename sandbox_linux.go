@@ -58,9 +58,7 @@ type linuxSandbox struct {
 	// process's CPU time (Wait).
 	cpuKills uint64
 
-	waited  bool // Wait's outcome is memoized: Destroy waits too
-	status  ExitStatus
-	waitErr error
+	outcome outcome // Wait's reaping memoized: Destroy waits too
 }
 
 func newSandbox(spec Spec) (Sandbox, error) {
@@ -338,17 +336,18 @@ func (s *linuxSandbox) Wait() (ExitStatus, error) {
 	if s.cmd == nil {
 		return ExitStatus{}, errors.New("sandbox: not started")
 	}
-	if s.waited {
-		// A release that failed earlier is retried, not forgotten; the
-		// outcome itself is what it was.
+	if !s.outcome.begin() {
+		// A later Wait finds what the first did (waiting for it where
+		// it is still reaping); a release that failed earlier is
+		// retried, not forgotten, the outcome itself what it was.
+		status, err := s.outcome.result()
 		if s.bounds.cgroup != nil {
-			if err := s.release(); err != nil {
-				return s.status, errors.Join(s.waitErr, err)
+			if rerr := s.release(); rerr != nil {
+				return status, errors.Join(err, rerr)
 			}
 		}
-		return s.status, s.waitErr
+		return status, err
 	}
-	s.waited = true
 	// The payload's own CPU time is read from its zombie before the
 	// reap: the reap's rusage adds the time of every child the payload
 	// reaped, which RLIMIT_CPU, a bound on the process alone, never
@@ -356,10 +355,9 @@ func (s *linuxSandbox) Wait() (ExitStatus, error) {
 	own, ownErr := zombieCPUTime(s.cmd.Process.Pid)
 	status, err := reaped(s.cmd, s.cmd.Wait())
 	if err != nil {
-		s.waitErr = err
+		s.outcome.end(ExitStatus{}, err)
 		return ExitStatus{}, errors.Join(err, s.release())
 	}
-	s.status = status
 	// RLIMIT_CPU ends the run with a kill at the limit, its soft and
 	// hard limits one; the kill is the bound's where the dead
 	// process's own CPU time reached the bound within the allowance
@@ -373,18 +371,22 @@ func (s *linuxSandbox) Wait() (ExitStatus, error) {
 	if s.bounds.cpu > 0 && status.Signaled && status.Signal == syscall.SIGKILL && ownErr == nil && own >= s.bounds.cpu-cpuAllowance {
 		s.cpuKills = 1
 	}
+	var waitErr error
 	if s.bounds.cgroup != nil {
 		st, serr := s.bounds.stats()
 		if serr != nil {
-			s.waitErr = serr
+			waitErr = serr
 		} else {
 			s.final = &st
 		}
+	}
+	s.outcome.end(status, waitErr)
+	if s.bounds.cgroup != nil {
 		if rerr := s.release(); rerr != nil {
-			return s.status, errors.Join(s.waitErr, rerr)
+			return status, errors.Join(waitErr, rerr)
 		}
 	}
-	return s.status, s.waitErr
+	return status, waitErr
 }
 
 // release deletes the run's cgroup once; idempotent, and a failure
@@ -415,14 +417,11 @@ func (s *linuxSandbox) Destroy() error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return nil
 	}
-	if !s.waited {
+	if !s.outcome.ended() {
 		_ = killRun(s.row, s.bounds, s.cmd.Process)
-		if _, err := s.Wait(); err != nil {
-			return err
-		}
-		return nil
 	}
-	return s.release()
+	_, err := s.Wait()
+	return err
 }
 
 func (s *linuxSandbox) Stats() (Stats, error) {

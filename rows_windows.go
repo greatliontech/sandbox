@@ -4,11 +4,13 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -22,7 +24,9 @@ import (
 // name, its network withheld unless granted; the Minimal row is a
 // Job Object's bounds alone, in the caller's own world, graded for
 // nothing else. The kill tie is the Job on both: every process of
-// the run is born into it and dies with its last handle.
+// the run is born into it and dies with its last handle — which the
+// OS row's payload cannot escape, and the Minimal row's, the
+// caller's own user, can (docs/specs/sandbox.md, "No orphans").
 type row struct {
 	tier Isolation
 }
@@ -76,7 +80,7 @@ func (r row) refuses(spec Spec) error {
 // the fact does not hold on this host, or nil where it does.
 type hostFacts struct {
 	// appContainer: the platform makes an AppContainer profile for
-	// this user and launches a process under it.
+	// this user and creates a process under it.
 	appContainer error
 }
 
@@ -106,9 +110,12 @@ func hostFactsFor(ctx context.Context) (hostFacts, error) {
 }
 
 // probeHost asks the platform for an AppContainer profile of its own
-// and gives it back: a platform that refuses one (an edition without
-// the API, a policy denying this user) is the fact that the OS row
-// is out of reach; any other failure is an anomaly, not an answer.
+// and a process under it — the platform's own command interpreter,
+// which every package may read, created suspended and ended before
+// it runs an instruction — and gives both back: a platform that
+// refuses either (an edition without the API, a policy denying this
+// user) is the fact that the OS row is out of reach; a failure to
+// take back what was made is an anomaly, not an answer.
 func probeHost(ctx context.Context) (hostFacts, error) {
 	var f hostFacts
 	if err := userenv.Load(); err != nil {
@@ -120,38 +127,76 @@ func probeHost(ctx context.Context) (hostFacts, error) {
 		f.appContainer = fmt.Errorf("appcontainer: %v", err)
 		return f, nil
 	}
-	if err := p.delete(); err != nil {
-		return f, fmt.Errorf("sandbox: appcontainer probe: %w", err)
+	defer func() {
+		if derr := p.delete(); derr != nil && err == nil {
+			err = fmt.Errorf("sandbox: appcontainer probe: %w", derr)
+		}
+	}()
+	pi, lerr := createUnder(filepath.Join(os.Getenv("SystemRoot"), "System32", "cmd.exe"), &securityCapabilities{AppContainerSid: p.sid})
+	if lerr != nil {
+		f.appContainer = fmt.Errorf("appcontainer: a process under a container: %v", lerr)
+		return f, nil
 	}
-	return f, nil
+	windows.TerminateProcess(pi.Process, killExitCode)
+	windows.CloseHandle(pi.Thread)
+	windows.CloseHandle(pi.Process)
+	return f, err
+}
+
+// createUnder creates exe suspended under the container the
+// capabilities name, with no streams and the caller's environment:
+// the probe's process, which never runs.
+func createUnder(exe string, caps *securityCapabilities) (windows.ProcessInformation, error) {
+	var pi windows.ProcessInformation
+	al, err := windows.NewProcThreadAttributeList(1)
+	if err != nil {
+		return pi, err
+	}
+	defer al.Delete()
+	if err := al.Update(procThreadAttributeSecurityCapabilities, unsafe.Pointer(caps), unsafe.Sizeof(*caps)); err != nil {
+		return pi, err
+	}
+	si := &windows.StartupInfoEx{}
+	si.Cb = uint32(unsafe.Sizeof(*si))
+	si.ProcThreadAttributeList = al.List()
+	exeP, err := windows.UTF16PtrFromString(exe)
+	if err != nil {
+		return pi, err
+	}
+	flags := uint32(windows.CREATE_SUSPENDED | windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_NO_WINDOW)
+	if err := windows.CreateProcess(exeP, nil, nil, nil, false, flags, nil, nil, &si.StartupInfo, &pi); err != nil {
+		return pi, err
+	}
+	return pi, nil
 }
 
 var (
-	userenv                           = windows.NewLazySystemDLL("userenv.dll")
-	procCreateAppContainerProfile     = userenv.NewProc("CreateAppContainerProfile")
-	procDeleteAppContainerProfile     = userenv.NewProc("DeleteAppContainerProfile")
-	procDeriveAppContainerSidFromName = userenv.NewProc("DeriveAppContainerSidFromAppContainerName")
+	userenv                       = windows.NewLazySystemDLL("userenv.dll")
+	procCreateAppContainerProfile = userenv.NewProc("CreateAppContainerProfile")
+	procDeleteAppContainerProfile = userenv.NewProc("DeleteAppContainerProfile")
 )
 
 // profile is an AppContainer profile of this user's: the package
 // identity a run's processes carry, made for the run and deleted at
 // its end. The platform keeps a directory per profile (the package's
 // own, under the user's local application data), which the run's
-// processes may write and which goes with the profile.
+// processes may write and which goes with the profile. A name is
+// drawn at random and never reused: a profile a crashed run left
+// behind, with its directory and the entries its identity still
+// holds on the host, serves no later run.
 type profile struct {
 	name string
 	sid  *windows.SID
 }
 
-// profiles numbers the profiles this process makes, so that two runs
-// of one process never share a name.
-var profiles atomic.Uint64
-
-// newProfile makes a profile named for this process and the purpose,
-// its SID derived where one of that name already exists (a run of
-// this pid ended without deleting it).
+// newProfile makes a profile named for the purpose and a random
+// suffix; one of that name existing already is refused.
 func newProfile(purpose string) (*profile, error) {
-	name := "sandbox-" + purpose + "-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatUint(profiles.Add(1), 10)
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return nil, err
+	}
+	name := "sandbox-" + purpose + "-" + hex.EncodeToString(suffix[:])
 	n, err := windows.UTF16PtrFromString(name)
 	if err != nil {
 		return nil, err
@@ -159,19 +204,17 @@ func newProfile(purpose string) (*profile, error) {
 	var sid *windows.SID
 	r, _, _ := procCreateAppContainerProfile.Call(uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(n)), 0, 0, uintptr(unsafe.Pointer(&sid)))
 	if hr := uint32(r); hr != 0 {
-		if hr != hresultAlreadyExists {
-			return nil, fmt.Errorf("CreateAppContainerProfile %s: %w", name, hresult(hr))
-		}
-		r, _, _ := procDeriveAppContainerSidFromName.Call(uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(&sid)))
-		if hr := uint32(r); hr != 0 {
-			return nil, fmt.Errorf("DeriveAppContainerSidFromAppContainerName %s: %w", name, hresult(hr))
-		}
+		return nil, fmt.Errorf("CreateAppContainerProfile %s: %w", name, hresult(hr))
 	}
 	return &profile{name: name, sid: sid}, nil
 }
 
-// delete removes the profile and its package directory.
+// delete removes the profile and its package directory; a profile
+// already deleted is nothing to do.
 func (p *profile) delete() error {
+	if p == nil || p.name == "" {
+		return nil
+	}
 	n, err := windows.UTF16PtrFromString(p.name)
 	if err != nil {
 		return err
@@ -184,10 +227,9 @@ func (p *profile) delete() error {
 		windows.FreeSid(p.sid)
 		p.sid = nil
 	}
+	p.name = ""
 	return nil
 }
-
-const hresultAlreadyExists = 0x800700B7 // HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)
 
 // hresult reads an HRESULT as an error: a wrapped Win32 code as that
 // errno, any other as its number.

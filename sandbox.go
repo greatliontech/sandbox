@@ -176,9 +176,10 @@ const (
 	AccountingWatchdog
 )
 
-// WatchdogInterval is the interval at which the watchdog samples the
-// run (AccountingWatchdog): a bound it holds is exceeded by at most
-// what the run can take in one interval.
+// WatchdogInterval is the interval at which a sampled bound is
+// checked — darwin's watchdog (AccountingWatchdog), and the CPU bound
+// over a windows Job's account — so that the bound is exceeded by at
+// most what the run can take in one interval.
 const WatchdogInterval = 10 * time.Millisecond
 
 func (a Accounting) String() string {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,17 +29,16 @@ type windowsSandbox struct {
 	spec    Spec
 	row     row // the row that ran; meaningful once process is set
 	process windows.Handle
-	pid     uint32
 	profile *profile
-	grants  []grantee // the entries carrying the container, to be relieved
+	held    []grantee // the entries carrying the container, not yet relieved
 	bounds  *bounds
 	copiers sync.WaitGroup
 	closers []io.Closer
 
-	waited  bool // Wait's outcome is memoized: Destroy waits too
-	status  ExitStatus
-	waitErr error
+	mu      sync.Mutex // guards final and the run's end
 	final   *Stats
+	running bool
+	outcome outcome // Wait's reaping memoized: Destroy waits too
 }
 
 func newSandbox(spec Spec) (Sandbox, error) {
@@ -87,13 +87,15 @@ type grantee struct {
 // "Intent is portable; delivery is all-or-nothing"): the spelling
 // checks, the row's own refusals, the entrypoint an executable file
 // on the host, each grant and the rendezvous directory an entry on
-// the host, no two of them one entry or one within another. On the
-// OS row the world is what the container is granted: the
-// entrypoint's own directory read and executed — the platform loads
-// a program's libraries from beside it — each grant read and
-// executed, and written where read-write, the rendezvous directory
-// read and written; the platform grants every package the system's
-// own files besides.
+// the host, no two of them one entry or one within another — judged
+// by the entries' identities, never their spellings, which the
+// platform folds and aliases (a case variant, a short name, a
+// junction). On the OS row the world is what the container is
+// granted: the entrypoint's own directory read and executed — the
+// platform loads a program's libraries from beside it — each grant
+// read and executed, and written where read-write, the rendezvous
+// directory read and written; the platform grants every package the
+// system's own files besides.
 func resolveWorld(spec Spec, r row) (world, error) {
 	undeliverable := func(format string, a ...any) (world, error) {
 		return world{}, fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
@@ -130,6 +132,7 @@ func resolveWorld(spec Spec, r row) (world, error) {
 	if spec.RuntimeDir != "" {
 		paths = append(paths, stated{spec.RuntimeDir, "runtime dir", true})
 	}
+	var lines []lineage
 	for _, p := range paths {
 		if !filepath.IsAbs(p.path) || filepath.Clean(p.path) != p.path {
 			return undeliverable("%s %q is not a clean absolute path", p.what, p.path)
@@ -141,36 +144,80 @@ func resolveWorld(spec Spec, r row) (world, error) {
 		if p.what == "runtime dir" && !fi.IsDir() {
 			return undeliverable("runtime dir %s is not a directory", p.path)
 		}
-		w.grants = append(w.grants, grantee{path: p.path, write: p.write})
-	}
-	// Overlap is judged on the spellings the platform folds: two
-	// grants one entry, or one within another, are two intents over
-	// one entry — an inheriting entry on the outer would carry its
-	// access into the inner.
-	for i, a := range w.grants[1:] {
-		for _, b := range w.grants[i+2:] {
-			if sameOrWithin(a.path, b.path) || sameOrWithin(b.path, a.path) {
-				return undeliverable("grants %s and %s overlap", a.path, b.path)
+		l, err := lineageOf(p.path)
+		if err != nil {
+			return undeliverable("%s %s: %v", p.what, p.path, err)
+		}
+		for i, o := range lines {
+			if l.same(o) || l.holds(o) || o.holds(l) {
+				return undeliverable("grants %s and %s overlap", paths[i].path, p.path)
 			}
 		}
+		lines = append(lines, l)
+		w.grants = append(w.grants, grantee{path: p.path, write: p.write})
 	}
 	return w, nil
 }
 
-// sameOrWithin reports whether p is dir or lies beneath it, the
-// platform's folding of case applied.
-func sameOrWithin(p, dir string) bool {
-	p, dir = strings.ToLower(filepath.Clean(p)), strings.ToLower(filepath.Clean(dir))
-	return p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, `\`)+`\`)
+// identity is an entry's identity on the host: the volume's serial
+// and the file's index on it, which every spelling of one entry
+// shares — a case variant's, a short name's, a junction's.
+type identity struct{ volume, index uint64 }
+
+// lineage is the identities of an entry and of every directory above
+// it, the entry's own first.
+type lineage []identity
+
+func lineageOf(path string) (lineage, error) {
+	var l lineage
+	for {
+		id, err := identityOf(path)
+		if err != nil {
+			return nil, err
+		}
+		l = append(l, id)
+		parent := filepath.Dir(path)
+		if parent == path {
+			return l, nil
+		}
+		path = parent
+	}
 }
+
+// identityOf reads an entry's identity through a handle opened for
+// no access, a directory included (FILE_FLAG_BACKUP_SEMANTICS).
+func identityOf(path string) (identity, error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return identity{}, err
+	}
+	h, err := windows.CreateFile(p, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return identity{}, err
+	}
+	defer windows.CloseHandle(h)
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		return identity{}, err
+	}
+	return identity{volume: uint64(info.VolumeSerialNumber), index: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow)}, nil
+}
+
+func (l lineage) same(o lineage) bool  { return l[0] == o[0] }
+func (l lineage) holds(o lineage) bool { return slices.Contains(o[1:], l[0]) }
 
 // Start selects the row this host's facts satisfy, refuses below
 // MinTier before anything runs, resolves the world and the bounds,
 // and creates the payload's process — suspended, placed in the Job,
-// then released — under the container on the OS row.
+// then released — under the container on the OS row. A context
+// ended already refuses, as os/exec does: the wall clock is the
+// caller's.
 func (s *windowsSandbox) Start(ctx context.Context) error {
 	if s.process != 0 {
 		return errors.New("sandbox: already started")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	r, below, err := selection(ctx)
 	if err != nil {
@@ -189,14 +236,12 @@ func (s *windowsSandbox) Start(ctx context.Context) error {
 	}
 	// From here every failure path releases what the run holds.
 	var p *profile
-	var granted []grantee
+	var held []grantee
 	fail := func(err error) error {
-		for _, g := range granted {
+		for _, g := range held {
 			_ = relieve(g.path, p.sid)
 		}
-		if p != nil {
-			_ = p.delete()
-		}
+		_ = p.delete()
 		b.close()
 		return err
 	}
@@ -206,10 +251,13 @@ func (s *windowsSandbox) Start(ctx context.Context) error {
 			return fail(fmt.Errorf("sandbox: appcontainer profile: %w", err))
 		}
 		for _, g := range w.grants {
-			if err := admit(g.path, p.sid, g.write); err != nil {
+			switch err := admit(g.path, p.sid, g.write); {
+			case errors.Is(err, errReachedAlready):
+			case err != nil:
 				return fail(fmt.Errorf("%w: cannot grant %s to the container: %v", ErrUndeliverable, g.path, err))
+			default:
+				held = append(held, g)
 			}
-			granted = append(granted, g)
 		}
 		caps = &securityCapabilities{AppContainerSid: p.sid}
 		if s.spec.Network {
@@ -223,35 +271,36 @@ func (s *windowsSandbox) Start(ctx context.Context) error {
 	if err != nil {
 		return fail(err)
 	}
-	if err := b.assign(pi.Process); err != nil {
+	abandon := func(err error) error {
 		windows.TerminateProcess(pi.Process, killExitCode)
 		windows.CloseHandle(pi.Thread)
 		windows.CloseHandle(pi.Process)
 		for _, c := range closers {
 			c.Close()
 		}
+		s.copiers.Wait()
 		return fail(err)
+	}
+	if err := b.assign(pi.Process); err != nil {
+		return abandon(err)
 	}
 	b.start()
 	if _, err := windows.ResumeThread(pi.Thread); err != nil {
 		b.halt()
-		windows.TerminateProcess(pi.Process, killExitCode)
-		windows.CloseHandle(pi.Thread)
-		windows.CloseHandle(pi.Process)
-		for _, c := range closers {
-			c.Close()
-		}
-		return fail(fmt.Errorf("sandbox: resume: %w", err))
+		return abandon(fmt.Errorf("sandbox: resume: %w", err))
 	}
 	windows.CloseHandle(pi.Thread)
-	s.process, s.pid, s.row, s.profile, s.grants, s.bounds, s.closers = pi.Process, pi.ProcessId, r, p, granted, b, closers
+	s.process, s.row, s.profile, s.held, s.bounds, s.closers = pi.Process, r, p, held, b, closers
+	s.mu.Lock()
+	s.running = true
+	s.mu.Unlock()
+	// Cancellation kills the run through its Job, which no process
+	// leaves; the kill is the bounds' own, which answers nothing once
+	// the Job is closed.
 	go func() {
-		if err := context.Cause(ctx); err != nil {
-			return
-		}
 		select {
 		case <-ctx.Done():
-			_ = b.kill()
+			b.kill()
 		case <-b.done:
 		}
 	}()
@@ -296,7 +345,8 @@ func hasVar(env []string, name string) bool {
 // from the entrypoint and arguments, the environment block, the
 // working directory, the standard streams as pipes copied from and
 // to the spec's where they are not files of the host's own, and the
-// container's capabilities where the row has them.
+// container's capabilities where the row has them. The streams'
+// handles are the only ones inherited.
 func (s *windowsSandbox) create(w world, caps *securityCapabilities, env []string) (windows.ProcessInformation, []io.Closer, error) {
 	var pi windows.ProcessInformation
 	var closers []io.Closer
@@ -336,8 +386,6 @@ func (s *windowsSandbox) create(w world, caps *securityCapabilities, env []strin
 		return pi, nil, fmt.Errorf("sandbox: attribute list: %w", err)
 	}
 	defer al.Delete()
-	// The handles inherited are the streams alone: nothing else of the
-	// caller's reaches the payload.
 	if err := al.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&inherited[0]), uintptr(len(inherited))*unsafe.Sizeof(inherited[0])); err != nil {
 		closeAll()
 		return pi, nil, fmt.Errorf("sandbox: handle list: %w", err)
@@ -380,17 +428,18 @@ func (s *windowsSandbox) create(w world, caps *securityCapabilities, env []strin
 		closeAll()
 		return pi, nil, fmt.Errorf("%w: exec %s: %v", ErrUndeliverable, w.cmd, err)
 	}
-	// The payload holds its own copies of the streams' handles.
-	for _, h := range inherited {
-		for i, c := range closers {
-			if hc, ok := c.(handleCloser); ok && hc.h == h {
-				closers = append(closers[:i], closers[i+1:]...)
-				hc.Close()
-				break
-			}
+	// The payload holds its own copies of the streams' handles; ours
+	// are closed, so that the copiers meet EOF when the run's last
+	// writer goes.
+	var kept []io.Closer
+	for _, c := range closers {
+		if hc, ok := c.(handleCloser); ok && slices.Contains(inherited, hc.h) {
+			hc.Close()
+			continue
 		}
+		kept = append(kept, c)
 	}
-	return pi, closers, nil
+	return pi, kept, nil
 }
 
 // handleCloser closes a raw handle.
@@ -401,8 +450,17 @@ func (c handleCloser) Close() error { return windows.CloseHandle(c.h) }
 // stream is the inheritable handle for one standard stream: a file
 // of the host's own as it is (its handle made inheritable through a
 // duplicate), a nil stream as the null device, and anything else as
-// one end of a pipe whose other end a goroutine copies.
+// one end of a pipe whose other end a goroutine copies — the pipe
+// made uninheritable and the payload's end duplicated inheritable,
+// so that no end of ours is ever inheritable.
 func (s *windowsSandbox) stream(i int, v any) (windows.Handle, []io.Closer, error) {
+	inheritable := func(h windows.Handle) (windows.Handle, error) {
+		var dup windows.Handle
+		if err := windows.DuplicateHandle(windows.CurrentProcess(), h, windows.CurrentProcess(), &dup, 0, true, windows.DUPLICATE_SAME_ACCESS); err != nil {
+			return 0, fmt.Errorf("sandbox: stream %d: %w", i, err)
+		}
+		return dup, nil
+	}
 	if v == nil {
 		mode := uint32(windows.GENERIC_READ)
 		if i > 0 {
@@ -415,19 +473,23 @@ func (s *windowsSandbox) stream(i int, v any) (windows.Handle, []io.Closer, erro
 		return h, []io.Closer{handleCloser{h}}, nil
 	}
 	if f, ok := v.(*os.File); ok {
-		var dup windows.Handle
-		if err := windows.DuplicateHandle(windows.CurrentProcess(), windows.Handle(f.Fd()), windows.CurrentProcess(), &dup, 0, true, windows.DUPLICATE_SAME_ACCESS); err != nil {
-			return 0, nil, fmt.Errorf("sandbox: stream %d: %w", i, err)
+		dup, err := inheritable(windows.Handle(f.Fd()))
+		if err != nil {
+			return 0, nil, err
 		}
 		return dup, []io.Closer{handleCloser{dup}}, nil
 	}
-	sa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), InheritHandle: 1}
 	var r, w windows.Handle
-	if err := windows.CreatePipe(&r, &w, sa, 0); err != nil {
+	if err := windows.CreatePipe(&r, &w, nil, 0); err != nil {
 		return 0, nil, fmt.Errorf("sandbox: stream %d: %w", i, err)
 	}
 	if i == 0 {
-		windows.SetHandleInformation(w, windows.HANDLE_FLAG_INHERIT, 0)
+		theirs, err := inheritable(r)
+		windows.CloseHandle(r)
+		if err != nil {
+			windows.CloseHandle(w)
+			return 0, nil, err
+		}
 		wf := os.NewFile(uintptr(w), "stdin")
 		s.copiers.Add(1)
 		go func() {
@@ -435,9 +497,14 @@ func (s *windowsSandbox) stream(i int, v any) (windows.Handle, []io.Closer, erro
 			io.Copy(wf, v.(io.Reader))
 			wf.Close()
 		}()
-		return r, []io.Closer{handleCloser{r}}, nil
+		return theirs, []io.Closer{handleCloser{theirs}, wf}, nil
 	}
-	windows.SetHandleInformation(r, windows.HANDLE_FLAG_INHERIT, 0)
+	theirs, err := inheritable(w)
+	windows.CloseHandle(w)
+	if err != nil {
+		windows.CloseHandle(r)
+		return 0, nil, err
+	}
 	rf := os.NewFile(uintptr(r), "stdout")
 	s.copiers.Add(1)
 	go func() {
@@ -445,7 +512,7 @@ func (s *windowsSandbox) stream(i int, v any) (windows.Handle, []io.Closer, erro
 		io.Copy(v.(io.Writer), rf)
 		rf.Close()
 	}()
-	return w, []io.Closer{handleCloser{w}}, nil
+	return theirs, []io.Closer{handleCloser{theirs}}, nil
 }
 
 // envBlock spells an environment as the platform wants it: each
@@ -467,63 +534,93 @@ func envBlock(env []string) ([]uint16, error) {
 
 // Wait reaps the payload and reports how it ended: its exit code,
 // never a signal, the platform having none — a process the sandbox
-// ended exits with killExitCode. The Job is closed at the end, which
-// kills the run's remnants, and the container's profile deleted and
-// the granted entries relieved of its identity. A bound the watchdog
-// could not hold is Wait's error. Wait is memoized: Destroy waits
-// too, and a second call returns the first's outcome.
+// ended exits with killExitCode. At the payload's exit the run's
+// remnants are ended through the Job, the Job's readers halted and
+// its account read, the Job closed, the container's profile deleted
+// and the granted entries relieved of its identity. A bound the
+// watchdog could not hold is Wait's error. Wait is memoized: Destroy
+// waits too, a later call returns the first's outcome, and a release
+// that failed is retried by it.
 func (s *windowsSandbox) Wait() (ExitStatus, error) {
 	if s.process == 0 {
 		return ExitStatus{}, errors.New("sandbox: not started")
 	}
-	if s.waited {
-		return s.status, s.waitErr
+	if !s.outcome.begin() {
+		status, err := s.outcome.result()
+		if rerr := s.release(); rerr != nil {
+			return status, errors.Join(err, rerr)
+		}
+		return status, err
 	}
-	s.waited = true
+	var waitErr error
 	ev, err := windows.WaitForSingleObject(s.process, windows.INFINITE)
 	if err != nil || ev != windows.WAIT_OBJECT_0 {
-		s.waitErr = fmt.Errorf("sandbox: wait: %v (%d)", err, ev)
+		waitErr = fmt.Errorf("sandbox: wait: %v (%d)", err, ev)
 	}
 	var code uint32
-	if err := windows.GetExitCodeProcess(s.process, &code); err != nil && s.waitErr == nil {
-		s.waitErr = fmt.Errorf("sandbox: exit code: %w", err)
+	if err := windows.GetExitCodeProcess(s.process, &code); err != nil && waitErr == nil {
+		waitErr = fmt.Errorf("sandbox: exit code: %w", err)
 	}
-	s.status = ExitStatus{Code: int(code)}
+	status := ExitStatus{Code: int(code)}
+	// The run's remnants end with the payload, before the port is
+	// drained: a descendant left running would keep it busy.
+	s.bounds.kill()
 	s.bounds.halt()
 	st, serr := s.bounds.stats()
-	s.final = &st
-	if serr != nil && s.waitErr == nil {
-		s.waitErr = serr
+	if serr != nil && waitErr == nil {
+		waitErr = serr
 	}
-	s.bounds.close() // the remnants die with the Job
+	s.bounds.close()
 	for _, c := range s.closers {
 		c.Close()
 	}
 	s.copiers.Wait()
 	windows.CloseHandle(s.process)
-	for _, g := range s.grants {
-		if err := relieve(g.path, s.profile.sid); err != nil && s.waitErr == nil {
-			s.waitErr = fmt.Errorf("sandbox: relieving %s of the container: %w", g.path, err)
+	s.mu.Lock()
+	s.final, s.running = &st, false
+	s.mu.Unlock()
+	s.outcome.end(status, waitErr)
+	if rerr := s.release(); rerr != nil {
+		return status, errors.Join(waitErr, rerr)
+	}
+	return status, waitErr
+}
+
+// release relieves the granted entries of the container and deletes
+// its profile, once each; what failed stays for a later try.
+func (s *windowsSandbox) release() error {
+	var errs []error
+	var left []grantee
+	for _, g := range s.held {
+		if err := relieve(g.path, s.profile.sid); err != nil {
+			errs = append(errs, fmt.Errorf("sandbox: relieving %s of the container: %w", g.path, err))
+			left = append(left, g)
 		}
 	}
-	if s.profile != nil {
-		if err := s.profile.delete(); err != nil && s.waitErr == nil {
-			s.waitErr = err
+	s.held = left
+	if len(left) == 0 {
+		if err := s.profile.delete(); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return s.status, s.waitErr
+	return errors.Join(errs...)
 }
 
 // Signal ends the payload: the platform has no signals, so only
 // os.Kill is delivered, as a termination of the payload's process
 // alone (the Job's kill, which ends the run whole, is cancellation's
-// and Destroy's).
+// and Destroy's); a run already ended has nothing to end.
 func (s *windowsSandbox) Signal(sig os.Signal) error {
 	if s.process == 0 {
 		return errors.New("sandbox: not started")
 	}
 	if sig != os.Kill {
 		return fmt.Errorf("%w: this platform delivers no signal but os.Kill", ErrUndeliverable)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.running {
+		return errors.New("sandbox: not running")
 	}
 	return windows.TerminateProcess(s.process, killExitCode)
 }
@@ -533,8 +630,8 @@ func (s *windowsSandbox) Destroy() error {
 	if s.process == 0 {
 		return nil
 	}
-	if !s.waited {
-		_ = s.bounds.kill()
+	if !s.outcome.ended() {
+		s.bounds.kill()
 	}
 	_, err := s.Wait()
 	return err
@@ -546,8 +643,11 @@ func (s *windowsSandbox) Stats() (Stats, error) {
 	if s.process == 0 {
 		return Stats{}, errors.New("sandbox: not started")
 	}
-	if s.final != nil {
-		return *s.final, nil
+	s.mu.Lock()
+	final := s.final
+	s.mu.Unlock()
+	if final != nil {
+		return *final, nil
 	}
 	return s.bounds.stats()
 }
@@ -566,9 +666,7 @@ const procThreadAttributeSecurityCapabilities = 0x00020009
 
 // networkCapabilities are the capability SIDs that open the network
 // to a container: the internet as a client and a server, the private
-// network as a client and a server (WinCapabilityInternetClient,
-// WinCapabilityInternetClientServer,
-// WinCapabilityPrivateNetworkClientServer).
+// network as a client and a server.
 func networkCapabilities() (*windows.SIDAndAttributes, uint32, error) {
 	var caps []windows.SIDAndAttributes
 	for _, kind := range []windows.WELL_KNOWN_SID_TYPE{windows.WinCapabilityInternetClientSid, windows.WinCapabilityInternetClientServerSid, windows.WinCapabilityPrivateNetworkClientServerSid} {
@@ -581,14 +679,39 @@ func networkCapabilities() (*windows.SIDAndAttributes, uint32, error) {
 	return &caps[0], uint32(len(caps)), nil
 }
 
+// descriptors serializes this process's writes of security
+// descriptors: a write reads the entry list, changes it and writes it
+// back, which two runs of one process over one directory would race.
+// Two processes racing the same descriptor are not serialized here.
+var descriptors sync.Mutex
+
+// errReachedAlready is admit's answer where the entry needs none:
+// the platform grants every package what the directory already
+// allows, and the caller may not write its descriptor.
+var errReachedAlready = errors.New("reached by every package already")
+
+// readAccess is what a grant read and executed carries; writeAccess
+// what a read-write one carries besides: data written and entries
+// made, renamed and deleted — never the permissions or the owner,
+// which a payload could turn to its own ends past the run.
+const (
+	readAccess      = windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE
+	writeAccess     = readAccess | windows.FILE_GENERIC_WRITE | windows.DELETE | fileDeleteChild
+	fileDeleteChild = 0x0040 // FILE_DELETE_CHILD: entries beneath a directory deleted
+)
+
 // admit adds an inheriting entry for the container to the path's
-// security descriptor: read and execute, and the generic all where
-// written.
+// security descriptor. Where the descriptor may not be written and
+// the directory already allows every package what the entry would
+// (the platform's own directories, System32 among them), the entry
+// is not needed and errReachedAlready says so.
 func admit(path string, sid *windows.SID, write bool) error {
-	access := windows.ACCESS_MASK(windows.GENERIC_READ | windows.GENERIC_EXECUTE)
+	access := windows.ACCESS_MASK(readAccess)
 	if write {
-		access = windows.GENERIC_ALL
+		access = writeAccess
 	}
+	descriptors.Lock()
+	defer descriptors.Unlock()
 	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return err
@@ -606,7 +729,39 @@ func admit(path string, sid *windows.SID, write bool) error {
 	if err != nil {
 		return err
 	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+		if errors.Is(err, windows.ERROR_ACCESS_DENIED) && !write && allPackagesAllowed(old, access) {
+			return errReachedAlready
+		}
+		return err
+	}
+	return nil
+}
+
+// allPackagesAllowed reports whether the ACL allows every package
+// (ALL APPLICATION PACKAGES) the access, in an inheriting entry.
+func allPackagesAllowed(acl *windows.ACL, access windows.ACCESS_MASK) bool {
+	if acl == nil {
+		return false
+	}
+	all, err := windows.CreateWellKnownSid(windows.WinBuiltinAnyPackageSid)
+	if err != nil {
+		return false
+	}
+	ace := unsafe.Add(unsafe.Pointer(acl), unsafe.Sizeof(*acl))
+	for i := 0; i < int(acl.AceCount); i++ {
+		h := (*windows.ACE_HEADER)(ace)
+		if h.AceType == windows.ACCESS_ALLOWED_ACE_TYPE {
+			a := (*windows.ACCESS_ALLOWED_ACE)(ace)
+			sid := (*windows.SID)(unsafe.Pointer(&a.SidStart))
+			generic := windows.ACCESS_MASK(windows.GENERIC_READ | windows.GENERIC_EXECUTE)
+			if sid.Equals(all) && h.AceFlags&windows.CONTAINER_INHERIT_ACE != 0 && (a.Mask&access == access || a.Mask&generic == generic || a.Mask&windows.GENERIC_ALL != 0) {
+				return true
+			}
+		}
+		ace = unsafe.Add(ace, h.AceSize)
+	}
+	return false
 }
 
 // relieve removes the container's entries from the path's security
@@ -615,6 +770,8 @@ func relieve(path string, sid *windows.SID) error {
 	if sid == nil {
 		return nil
 	}
+	descriptors.Lock()
+	defer descriptors.Unlock()
 	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return err
