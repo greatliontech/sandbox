@@ -6,7 +6,7 @@ darwin row)
 - [x] 1. The Linux OS row: Landlock filesystem allowlist, seccomp
       network denial, no_new_privs, rlimit bounds, static entrypoints
       only, reached by a host without unprivileged user namespaces
-- [ ] 2. The darwin row: a Seatbelt profile delivering the OS tier,
+- [x] 2. The darwin row: a Seatbelt profile delivering the OS tier,
       so a Start on darwin succeeds and reports a tier
   - [x] 2.1. Triage gate.
   - [x] 2.2. The rows, the probe and the bounds: `sandbox-exec`
@@ -29,6 +29,24 @@ darwin row)
         load commands held to the substrate and the tree, a sibling
         of the tree executed by the entrypoint admitted; the world
         probe payload run under it on the macOS row.
-  - [ ] 2.4. Close-out: consolidation (the world resolution and the
+  - [x] 2.4. Close-out: consolidation (the world resolution and the
         trampoline shared across the platforms' rows), the spec's
         darwin statements settled, the campaign.
+- [ ] 3. The windows row: an AppContainer boundary and Job Object
+      bounds delivering the OS tier, so a Start on windows succeeds
+      and reports a tier
+  - [ ] 3.1. Triage gate.
+  - [ ] 3.2. The rows, the probe and the bounds: the AppContainer
+        probed for the `OS` row, the `Minimal` row beneath it (a Job
+        Object alone); `Reach` by the same selection; the Job
+        Object's bounds (memory, CPU time, the process count) with
+        its kill-on-close as the kill tie; the accounting reported;
+        the windows CI row demanding the `OS` row.
+  - [ ] 3.3. The AppContainer row's world: the tree, the grants and
+        the rendezvous directory granted to the container's
+        capability at their host paths, the network denied or
+        granted whole, the entrypoint held to what the row can load,
+        a sibling of the tree executed by the entrypoint admitted;
+        the world probe payload run under it on the windows row.
+  - [ ] 3.4. Close-out: consolidation, the spec's windows statements
+        settled, the campaign.
