@@ -35,8 +35,8 @@ darwin row)
 - [ ] 3. The windows row: an AppContainer boundary and Job Object
       bounds delivering the OS tier, so a Start on windows succeeds
       and reports a tier
-  - [ ] 3.1. Triage gate.
-  - [ ] 3.2. The rows, the probe and the bounds: the AppContainer
+  - [x] 3.1. Triage gate.
+  - [x] 3.2. The rows, the probe and the bounds: the AppContainer
         probed for the `OS` row, the `Minimal` row beneath it (a Job
         Object alone); `Reach` by the same selection; the Job
         Object's bounds (memory, CPU time, the process count) with
