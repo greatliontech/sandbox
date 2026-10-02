@@ -2706,3 +2706,12 @@ func TestNamespaceRefusal(t *testing.T) {
 		}
 	}
 }
+
+// overrideMinimal makes every selection reach the Minimal row, the
+// probes' answers set aside: the shared tests' name for it.
+func overrideMinimal(t *testing.T) {
+	t.Helper()
+	refused := errors.New("set aside for the test")
+	hostOverride = &hostFacts{namespaces: refused, netns: refused, seccompKill: refused, landlock: refused}
+	t.Cleanup(func() { hostOverride = nil })
+}

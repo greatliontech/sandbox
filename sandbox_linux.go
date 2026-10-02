@@ -232,6 +232,9 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	// The config write cannot block on a child that died: the pipe
 	// buffer holds it whole, and a dead reader turns the write into
 	// EPIPE, which the status read below explains.
+	if beforeConfigWrite != nil {
+		beforeConfigWrite()
+	}
 	encodeErr := json.NewEncoder(cfgW).Encode(&cfg)
 	cfgW.Close()
 

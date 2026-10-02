@@ -196,6 +196,10 @@ func requireSeatbelt(t testing.TB) {
 	testdemand.Live(t, "SANDBOX_TEST_REQUIRE_SEATBELT", unavailable)
 }
 
+// overrideMinimal makes every selection reach the Minimal row, the
+// probe's answer set aside: the shared tests' name for it.
+func overrideMinimal(t *testing.T) { withoutSeatbelt(t) }
+
 // withoutSeatbelt makes every selection in the test reach the Minimal
 // row, the probe's answer set aside.
 func withoutSeatbelt(t *testing.T) {

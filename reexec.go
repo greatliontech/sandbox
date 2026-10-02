@@ -169,6 +169,10 @@ func statusPipe() *os.File {
 	return os.NewFile(uintptr(fd), "sandbox-status")
 }
 
+// beforeConfigWrite is the seam tests set to hold the config write
+// back, so an init that dies on its own is dead before the write.
+var beforeConfigWrite func()
+
 // initUnread reports whether a config write's failure is the init dead
 // before reading it: the write refused for want of a reader, with
 // nothing reported on the status pipe. Such a death is the empty

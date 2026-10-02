@@ -286,6 +286,9 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 		cmd.Wait()
 		return err
 	}
+	if beforeConfigWrite != nil {
+		beforeConfigWrite()
+	}
 	encodeErr := json.NewEncoder(cfgW).Encode(&cfg)
 	cfgW.Close()
 	status, readErr := io.ReadAll(statusR)
