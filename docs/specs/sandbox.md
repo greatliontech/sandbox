@@ -194,14 +194,30 @@ independent by design.
   as the kernel accounts it, within the allowance the kernel's tick
   and the reading's truncation leave; a memory or process rlimit refuses the payload alone,
   an allocation or a fork, and kills nothing. Which accounting
-  enforced the bounds is a reported fact of the run, so a
-  bound-exceeded death is attributable on every row delivered.
+  enforced the bounds is a reported fact of the run, so a bound-exceeded death is attributable on every row delivered. A
+  Job Object holds the memory bound over the run's committed memory
+  summed, which it refuses past the bound and reports, on which
+  report the run is killed (a refused commit would leave a payload
+  to die as it may); the process bound as its active-process limit,
+  each process past it refused and counted; and the CPU bound by the
+  sandbox's sampling of the Job's own account of the run's user and
+  kernel time at the stated interval, the run killed past it, the
+  Job's own time limit behind it as the kernel's backstop, which it
+  enforces on an interval of seconds; it bounds no open-file count,
+  so a stated one is refused on windows.
 - **The wall clock belongs to the caller.** `Start`'s context governs
   the process lifetime; sandbox adds no timeout of its own.
+- **An exit is reported as the platform ends it.** A signal death on
+  the unix rows carries the signal and the code 128 plus it; windows
+  has no signals, so a run reports its exit code alone, a process the
+  sandbox ended exiting with that same code (137), and `Signal`
+  delivers `os.Kill` alone there, as a termination of the payload's
+  process, refusing every other signal as undeliverable.
 - **No orphans, to the strongest tie the host affords.** Two triggers,
   two strengths. On *context cancellation* the caller's code runs and
   issues the strongest kill the host holds: the PID namespace or Job
-  Object where the row has one; the cgroup's kill — by whichever of
+  Object where the row has one (every process of a windows run is
+  born into its Job, which no process leaves); the cgroup's kill — by whichever of
   `cgroup.kill` or freeze-then-drain the kernel affords, the freeze
   making the drain impossible to outrun by forking — where the run was
   placed in a delegated subtree (a cgroup is accounting, not a
@@ -228,8 +244,8 @@ independent by design.
 | linux, unprivileged user namespaces available | namespaces (user, mount, pid, uts, ipc; net unless granted), pivoted read-only root repeating locked mount flags, capability drop, seccomp holding for every syscall ABI the kernel exposes (a foreign-ABI call is killed, never let through unfiltered), `no_new_privs`, cgroup-or-rlimit bounds | `Strong` |
 | linux, user namespaces unavailable, Landlock available | Landlock filesystem allowlist over the world at its host paths (the caller's whole world where no `Root` is stated), seccomp network denial at the socket (Landlock ABI 4's TCP restrictions are supplementary, never the sole arm — UDP and raw sockets stay open without seccomp; an ABI that also multiplexes the socket calls through `socketcall` refuses that route whole, the local family reached by the direct calls), Landlock's IPC scoping where the kernel has it (ABI 6), `no_new_privs`, cgroup-or-rlimit bounds; static entrypoints only under a `Root` — an ELF the kernel loads whole, native, with no interpreter; a script, a dynamically linked executable, or a file the check cannot read is refused | `OS` |
 | darwin, Seatbelt available (`sandbox-exec` applies a profile) | Seatbelt profile: under a `Root`, nothing by default but the platform's execution substrate as Apple's own `system.sb` states it (dyld, the system libraries and frameworks, the services every process reaches, name resolution not among them) less the one place it lets a process create files (`/cores`), the tree read, mapped and executed at its host path so an entrypoint may load the tree's own libraries and execute a sibling of the tree, the calling binary read and executed (its second stage runs under the profile before the payload: an exposure of that binary's bytes and its execution to the payload), grants read, mapped and executed as on the Linux `OS` row and read-write ones written, the rendezvous directory read and written with unix sockets within it alone, the network by address where granted, the platform's name resolution with it (a unix socket elsewhere on the host is not the network); the entrypoint an executable Mach-O image for the machine — the machine being the one the calling binary runs for; an image for another machine the host could translate is refused all the same — whose dynamic linker, libraries and run paths are the substrate's or relative to the image and which sets no loader environment, a script or an image linked at an image-absolute path refused; a grant's two spellings of one directory (a firmlink's, a case variant's) judged one, by identity as everywhere; without a `Root`, the whole world with the network denied at the socket — the platform's mach services stay reachable, name resolution among them, as a row without namespaces leaves IPC — and a read-only grant refused, the profile over the whole world having no rule a renamed ancestor cannot carry a grant out of; the profile matching the kernel's own spelling of every path; rlimit bounds with the watchdog behind them | `OS` |
-| windows, AppContainer available | AppContainer boundary, Job Object bounds | `OS` |
-| any platform where no security boundary is available but resource bounds are | resource bounds (rlimits, Job Object, darwin's watchdog) | `Minimal` |
+| windows, an AppContainer available (the platform makes a profile for the user) | an AppContainer of the run's own: a package identity the payload's process carries, which reaches nothing the platform does not grant every package (the system's own files and services) or the run's grants do not name — the entrypoint's own directory read and executed (the platform loads a program's libraries from beside it), each grant read and executed and read-write ones written, the rendezvous directory read and written, each carrying an entry for the run's identity in its security descriptor for the run's duration (the one platform where presenting the world writes the entries' descriptors: an entry the caller may not write to is an undeliverable grant), the package's own directory, which the platform gives every package to write and deletes with the profile, the payload's temporary directory redirected into it; the network withheld unless granted, when the internet and the private network open as client and server; the launch demanding `LOCALAPPDATA`, carried from the host where the stated environment lacks it; no hostname, no `Root` until its world under one is delivered, no open-file bound; Job Object bounds, every process of the run born into the Job and ended with its last handle | `OS` |
+| any platform where no security boundary is available but resource bounds are | resource bounds (rlimits, a Job Object, darwin's watchdog) | `Minimal` |
 | anything else | refused (`ErrUnsupported`) | — |
 
 The ladder is normative: a backend selects the highest row its host's
@@ -252,6 +268,7 @@ reaching only `Minimal` runs only if `MinTier` admits it; a platform
 matching no row refuses with `ErrUnsupported` rather than running
 unsandboxed — on Linux and darwin `Minimal` is always satisfied,
 rlimits existing on every kernel and the watchdog on every darwin,
-so neither host ever refuses that way.
+so neither host ever refuses that way, nor does windows, a Job
+Object being every process's to make.
 Tier `None` stays in the vocabulary as the floor `MinTier` can state
 — "accept anything" — but no row reports it: sandbox never bare-execs.
