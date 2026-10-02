@@ -226,13 +226,6 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func must[T any](v T, err error) T {
-	if err != nil {
-		panic(err)
-	}
-	return v
-}
-
 // facts parses the payload's "key=value" lines.
 func facts(out string) map[string]string {
 	m := map[string]string{}

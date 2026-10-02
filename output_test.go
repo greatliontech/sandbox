@@ -25,3 +25,11 @@ func (o *output) String() string {
 }
 
 func (o *output) Len() int { return len(o.String()) }
+
+// must is a test's reading of a value that cannot fail to come.
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}

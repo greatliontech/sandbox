@@ -1,5 +1,3 @@
-//go:build linux || darwin
-
 package sandbox
 
 import (
@@ -7,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -43,17 +42,28 @@ type treeWorld struct {
 	runtime int
 }
 
+// hostNameMax is the longest hostname a row presents: the Linux
+// kernel's (__NEW_UTS_LEN), which the darwin and windows rows,
+// presenting none, never reach.
+const hostNameMax = 64
+
 // checkSpelling holds the spec's paths and hostname to their forms
-// before any row reads them: absolute paths, a hostname within the
+// before any row reads them: absolute paths — tree-absolute under a
+// Root, spelled from the tree's root with forward slashes on every
+// platform; the host's own otherwise — and a hostname within the
 // length a row could present.
 func checkSpelling(spec Spec) error {
 	undeliverable := func(format string, a ...any) error {
 		return fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
 	}
-	if !filepath.IsAbs(spec.Exec) {
+	abs := filepath.IsAbs
+	if spec.Root != "" {
+		abs = path.IsAbs
+	}
+	if !abs(spec.Exec) {
 		return undeliverable("exec %q is not an absolute path", spec.Exec)
 	}
-	if spec.WorkDir != "" && !filepath.IsAbs(spec.WorkDir) {
+	if spec.WorkDir != "" && !abs(spec.WorkDir) {
 		return undeliverable("workdir %q is not an absolute path", spec.WorkDir)
 	}
 	if len(spec.Hostname) > hostNameMax {
@@ -66,20 +76,22 @@ func checkSpelling(spec Spec) error {
 // has somewhere to land, and resolves the world to canonical paths —
 // the one place the grant-to-target mapping is computed, on every
 // platform (docs/specs/sandbox.md, "Root is world-restriction").
-// Under a Root: the Root is a directory, canonicalized; the
+// Under a Root: the Root is a directory, canonicalized (the
+// platform's canonical: every link the kernel resolves, resolved); the
 // entrypoint and the working directory resolve inside the tree as a
-// file and a directory, symlinks chased exactly as a process rooted
-// there would chase them (absolute targets re-rooted at the tree,
-// ".." clamped at it), the entrypoint then held to checkEntry at its
-// host path; each grant and the rendezvous directory exist on the
-// host and in the tree as the same kind of entry, reached through no
-// symlink at any component — a bind would follow a symlink into the
-// host view and the rooted process into the tree, so the grant would
-// land where the process cannot see it. Without a Root, the
-// entrypoint is held to checkEntry as stated, and grants need only
-// exist on the host, their targets the canonical host paths — the
-// mount table records canonical mount points, and a read-only
-// remount must find its own bind there. Grants may not overlap one
+// file and a directory, links chased as the platform's process will
+// chase them (resolveInTree), the entrypoint then held to checkEntry
+// at its host path; where grants land in the tree (grantsLandInTree),
+// each grant and the rendezvous directory exist on the host and in
+// the tree as the same kind of entry, reached through no symlink at
+// any component — a bind would follow a symlink into the host view
+// and the rooted process into the tree, so the grant would land
+// where the process cannot see it. Without a Root, or where grants
+// land on the host under one, the entrypoint is held to checkEntry
+// as stated, and grants need only exist on the host, their targets
+// the canonical host paths — the mount table records canonical
+// mount points, and a read-only remount must find its own bind
+// there. Grants may not overlap one
 // another or the rendezvous directory. A failure is ErrUndeliverable:
 // the host cannot do what was asked. The spelling and length checks
 // of the entrypoint, the working directory and the hostname, and the
@@ -96,7 +108,7 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 		}
 	} else {
 		var err error
-		root, err = filepath.EvalSymlinks(spec.Root)
+		root, err = canonical(spec.Root)
 		if err != nil {
 			return undeliverable("root %s: %v", spec.Root, err)
 		}
@@ -107,7 +119,7 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 		if !fi.IsDir() {
 			return undeliverable("root %s is not a directory", spec.Root)
 		}
-		fi, resolved, err := statInTree(root, spec.Exec)
+		fi, resolved, err := resolveInTree(root, spec.Exec)
 		if err != nil {
 			return undeliverable("exec %s is not in the tree: %v", spec.Exec, err)
 		}
@@ -122,14 +134,18 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 		t.hostCmd = filepath.Join(root, resolved)
 		t.hostWorkDir = root
 		if spec.WorkDir != "" {
-			fi, _, err := statInTree(root, spec.WorkDir)
+			// The directory delivered is the one resolved, never the
+			// stated spelling joined to the tree: ".." in the stated
+			// path is clamped at the tree by the resolution and would
+			// climb out of it by the join.
+			fi, wd, err := resolveInTree(root, spec.WorkDir)
 			if err != nil {
 				return undeliverable("workdir %s is not in the tree: %v", spec.WorkDir, err)
 			}
 			if !fi.IsDir() {
 				return undeliverable("workdir %s is not a directory in the tree", spec.WorkDir)
 			}
-			t.hostWorkDir = filepath.Join(root, spec.WorkDir)
+			t.hostWorkDir = filepath.Join(root, wd)
 		}
 	}
 	// The host entries the stated paths name, read once: a grant
@@ -153,7 +169,7 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 		if !filepath.IsAbs(p.path) || filepath.Clean(p.path) != p.path {
 			continue // resolveGrant refuses it by name
 		}
-		if host, err := filepath.EvalSymlinks(p.path); err == nil {
+		if host, err := canonical(p.path); err == nil {
 			paths[i].host = host
 		} // else resolveGrant refuses it by name
 	}
@@ -246,7 +262,7 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 			return undeliverable("%s %s: cannot be read", what, b.Source)
 		}
 		p.target = p.source
-		if root != "" {
+		if root != "" && grantsLandInTree {
 			e, unread, err := hostEntry(m, b.Target, true)
 			if err != nil {
 				return undeliverable("%s %s: %v", what, b.Source, err)
@@ -278,12 +294,13 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 	return t, nil
 }
 
-// identity is an entry's identity on the host: the device and inode
-// every spelling of one entry shares — a bind mount's, a firmlink's,
-// a case variant's, a symlink's. Containment and overlap are judged
-// on it, never on spelling alone: a canonical spelling unifies
-// symlinks and nothing else, and a bind mount has no canonical
-// spelling at all.
+// identity is an entry's identity on the host — the device and inode
+// on the unix rows, the volume and file index on windows — which
+// every spelling of one entry shares: a bind mount's, a firmlink's,
+// a junction's, a case variant's, a symlink's. Containment and
+// overlap are judged on it, never on spelling alone: a canonical
+// spelling unifies symlinks and nothing else, and a bind mount has
+// no canonical spelling at all.
 type identity struct{ dev, ino uint64 }
 
 // lineage is one spelling of an entry with the identities of the
@@ -294,20 +311,18 @@ type lineage struct {
 	ids  []identity
 }
 
-// lineageOf reads the lineage of the canonical path p.
+// lineageOf reads the lineage of the canonical path p: the identity
+// of each entry from p up to the root of its tree (the platform's
+// identityOf), the walk ending where a directory is its own parent.
 func lineageOf(p string) (lineage, error) {
 	l := lineage{path: p}
 	for {
-		fi, err := os.Stat(p)
+		id, err := identityOf(p)
 		if err != nil {
 			return lineage{}, err
 		}
-		st, ok := fi.Sys().(*syscall.Stat_t)
-		if !ok {
-			return lineage{}, fmt.Errorf("%s: no inode", p)
-		}
-		l.ids = append(l.ids, identity{dev: uint64(st.Dev), ino: st.Ino})
-		if p == "/" {
+		l.ids = append(l.ids, id)
+		if parent := filepath.Dir(p); parent == p {
 			return l, nil
 		}
 		p = filepath.Dir(p)
@@ -434,8 +449,10 @@ func barred(s string, err error) bool {
 	case !errors.Is(err, fs.ErrPermission):
 		return true
 	}
-	dir := "/"
-	for _, seg := range strings.Split(strings.TrimPrefix(s, "/"), "/") {
+	// The walk starts at the spelling's root: "/", or the volume a
+	// platform spells.
+	dir := filepath.VolumeName(s) + string(filepath.Separator)
+	for _, seg := range strings.Split(strings.TrimPrefix(s, dir), string(filepath.Separator)) {
 		next := filepath.Join(dir, seg)
 		if _, err := os.Lstat(next); err != nil {
 			if !errors.Is(err, fs.ErrPermission) {
@@ -445,14 +462,11 @@ func barred(s string, err error) bool {
 		}
 		dir = next
 	}
-	fi, err := os.Stat(dir)
-	if err != nil {
-		return true
-	}
 	// Ownership is the effective user's: the one permission checks
-	// are made for, and the one a chmod is allowed to.
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	return !ok || int(st.Uid) == os.Geteuid()
+	// are made for, and the one a change of permissions is allowed
+	// to (the platform's ownsEntry).
+	owns, err := ownsEntry(dir)
+	return err != nil || owns
 }
 
 // named is what a stated path names: its entry, and the mounts
@@ -517,8 +531,12 @@ func resolveGrant(root, p, what string) (bind, error) {
 	if err != nil {
 		return bind{}, fmt.Errorf("%w: %s %s: %v", ErrUndeliverable, what, p, err)
 	}
-	if root == "" {
-		target, err := filepath.EvalSymlinks(p)
+	if root == "" || !grantsLandInTree {
+		// A grant lands at its host path: canonical, where the mount
+		// table records it; and on a platform where the tree is never
+		// presented at "/" and a host path has no spelling inside it,
+		// under a Root as well.
+		target, err := canonical(p)
 		if err != nil {
 			return bind{}, fmt.Errorf("%w: %s %s: %v", ErrUndeliverable, what, p, err)
 		}
@@ -528,8 +546,8 @@ func resolveGrant(root, p, what string) (bind, error) {
 	// be the tree's own file under that name — a hard link into the
 	// tree, which no path can see — so a file grant has one name.
 	if !host.IsDir() {
-		if st, ok := host.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
-			return bind{}, fmt.Errorf("%w: %s %s has %d names on the host; a file granted under a Root has one", ErrUndeliverable, what, p, st.Nlink)
+		if n, err := fileLinks(p); err == nil && n > 1 {
+			return bind{}, fmt.Errorf("%w: %s %s has %d names on the host; a file granted under a Root has one", ErrUndeliverable, what, p, n)
 		}
 	}
 	// Every component of the target, walked from the tree down, must
@@ -557,62 +575,4 @@ func kind(dir bool) string {
 		return "directory"
 	}
 	return "file"
-}
-
-// statInTree stats a tree-absolute path the way the pivoted process
-// will see it: symlinks are chased inside the tree, an absolute
-// target re-rooted at the tree and ".." clamped at it, with the
-// kernel's own bound on chained links. root must be canonical.
-func statInTree(root, p string) (os.FileInfo, string, error) {
-	const maxLinks = 40
-	links := 0
-	// rest holds the components still to walk; cur is the tree-absolute
-	// directory resolved so far. The stated path is walked as written:
-	// a lexical clean-up would apply ".." before the symlink it
-	// follows, which is not what the kernel does.
-	rest := strings.Split(strings.TrimPrefix(p, "/"), "/")
-	cur := "/"
-	for len(rest) > 0 {
-		seg := rest[0]
-		rest = rest[1:]
-		switch seg {
-		case "", ".":
-			continue
-		case "..":
-			cur = filepath.Dir(cur)
-			continue
-		}
-		next := filepath.Join(cur, seg)
-		fi, err := os.Lstat(filepath.Join(root, next))
-		if err != nil {
-			return nil, "", err
-		}
-		if fi.Mode()&os.ModeSymlink == 0 {
-			if len(rest) == 0 {
-				return fi, next, nil
-			}
-			if !fi.IsDir() {
-				return nil, "", &os.PathError{Op: "stat", Path: p, Err: syscall.ENOTDIR}
-			}
-			cur = next
-			continue
-		}
-		links++
-		if links > maxLinks {
-			return nil, "", &os.PathError{Op: "stat", Path: p, Err: syscall.ELOOP}
-		}
-		target, err := os.Readlink(filepath.Join(root, next))
-		if err != nil {
-			return nil, "", err
-		}
-		// The link's target is cleaned only of its spelling (trailing
-		// slashes); its own ".." components are walked like any other.
-		targetSegs := strings.Split(strings.Trim(target, "/"), "/")
-		if filepath.IsAbs(target) {
-			cur = "/"
-		}
-		rest = append(targetSegs, rest...)
-	}
-	fi, err := os.Lstat(filepath.Join(root, cur))
-	return fi, cur, err
 }

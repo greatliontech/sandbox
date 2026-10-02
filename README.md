@@ -51,7 +51,7 @@ fmt.Println(es.Code, sb.Tier())
 | GOOS | Mechanism | Target tier | Status |
 |---|---|---|---|
 | linux | create-only namespaces (`SysProcAttr` clone) + uid/gid map + pivoted read-only root with path grants + capability drop + seccomp (a native-ABI policy behind an arch guard) + no_new_privs + cgroup-or-rlimit bounds with reported accounting | `Strong` | delivered; a host without user namespaces reaches the `OS` row where it has Landlock — the world allowlisted at its host paths, the network denied at the socket, static entrypoints only — and the `Minimal` row otherwise: bounds only, refusing every intent needing a boundary (`Root`, `Hostname`, a denied network, read-only grants) and a spec with no limits, `MinTier` gating both |
-| windows | an AppContainer of the run's own (the entrypoint's directory, the grants and the rendezvous directory granted to its identity for the run; the network withheld unless granted) + a Job Object every process of the run is born into, holding the bounds (memory killed on the Job's report, the CPU by a watchdog over the Job's account, the process count refused) and the kill tie (`KILL_ON_JOB_CLOSE`) | `OS` | delivered; a host without an AppContainer reaches `Minimal` (the Job alone); a `Root` refused until its world lands |
+| windows | an AppContainer of the run's own (the tree under a `Root`, or the entrypoint's directory without one, the grants and the rendezvous directory granted to its identity at their host paths for the run; the network withheld unless granted) + a Job Object every process of the run is born into, holding the bounds (memory killed on the Job's report, the CPU by a watchdog over the Job's account, the process count refused) and the kill tie (`KILL_ON_JOB_CLOSE`) | `OS` | delivered; a host without an AppContainer reaches `Minimal` (the Job alone) |
 | darwin | `sandbox-exec` SBPL profile (deny by default over Apple's `system.sb` substrate under a `Root`, the tree and grants allowlisted at the kernel's spelling; the whole world with the network denied without one) + rlimits with a watchdog over the kernel's per-process readings for the bounds the kernel will not hold (memory, CPU past `SIGXCPU`, the thread count) | `OS` | delivered; a host without `sandbox-exec` reaches the `Minimal` row |
 | other | — | — | `ErrUnsupported` |
 
@@ -60,8 +60,7 @@ the Linux backend) is a future tier, not yet wired.
 
 ## Roadmap
 
-1. **Windows**: the AppContainer row's world under a `Root` (docs/plans/rows.md).
-2. Resource-usage `Stats` per backend.
+1. Resource-usage `Stats` per backend.
 
 ## Spike
 

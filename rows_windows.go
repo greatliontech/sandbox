@@ -39,8 +39,7 @@ var (
 // Neither row presents a hostname, and neither bounds an open-file
 // count: a Job Object limits memory, CPU time and the process count
 // and nothing of handles (docs/specs/sandbox.md, "Bounded means
-// bounded"). The OS row refuses a Root until its world under one is
-// delivered. The Minimal row's mechanism set is bounds alone: it
+// bounded"). The Minimal row's mechanism set is bounds alone: it
 // refuses every intent only a security boundary delivers — a Root, a
 // denied network, a read-only grant — and a Spec stating no limits,
 // which would leave that row nothing to apply (sandbox never
@@ -55,11 +54,11 @@ func (r row) refuses(spec Spec) error {
 	if spec.Limits.MaxFiles > 0 {
 		return undeliverable("bounds no open-file count: a Job Object limits memory, CPU time and the process count alone")
 	}
-	if spec.Root != "" {
-		return undeliverable("cannot restrict the world to a Root")
-	}
 	if r.tier == OS {
 		return nil
+	}
+	if spec.Root != "" {
+		return undeliverable("cannot restrict the world to a Root")
 	}
 	if !spec.Network {
 		return undeliverable("cannot deny the network: Network must be granted to run on it")

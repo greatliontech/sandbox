@@ -1166,9 +1166,11 @@ func TestMemoryBoundRlimitsRefusesAllocation(t *testing.T) {
 }
 
 // The process-count bound refuses forks beyond it: the payload's own
-// runtime fits under six and its forks are refused — counted by the
-// kernel under cgroups, and by the payload alone under rlimits, which
-// current kernels count within the sandbox's user namespace.
+// runtime fits under six — its parallelism pinned to one, a Go
+// runtime otherwise starting a thread per processor of the host —
+// and its forks are refused — counted by the kernel under cgroups,
+// and by the payload alone under rlimits, which current kernels
+// count within the sandbox's user namespace.
 func TestProcessBound(t *testing.T) {
 	requireTree(t)
 	cgroups := cgroupPlacement(t)
@@ -1181,6 +1183,7 @@ func TestProcessBound(t *testing.T) {
 	sb, err := New(Spec{
 		Exec:   "/world",
 		Args:   []string{"fork"},
+		Env:    []string{"GOMAXPROCS=1"},
 		Root:   worldTree,
 		Limits: Limits{MaxProcs: 6},
 		Stdout: &out,
