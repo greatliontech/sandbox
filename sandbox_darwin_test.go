@@ -1184,3 +1184,27 @@ func universal(t *testing.T, out string, slices ...string) {
 		t.Fatal(err)
 	}
 }
+
+// TestProfileRules pins the Root profile's text where a host's own
+// refusal would hide a rule's effect: the cores denial after the
+// substrate's import (the last matching rule winning), the
+// deny-by-default opening, and nothing re-admitting /cores.
+func TestProfileRules(t *testing.T) {
+	w := world{root: "/tree", binds: []bind{{Source: "/g", Target: "/g"}}, runtime: ""}
+	p, err := profile(Spec{Root: "/tree"}, w, "/self")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(p), "\n")
+	if lines[0] != "(version 1)" || lines[1] != "(deny default)" || lines[2] != `(import "system.sb")` {
+		t.Fatalf("the profile opens %q", lines[:3])
+	}
+	if lines[3] != `(deny file-write* (subpath "/cores"))` {
+		t.Fatalf("the cores denial not right after the import: %q", lines[3])
+	}
+	for _, l := range lines[4:] {
+		if strings.Contains(l, "/cores") {
+			t.Fatalf("a later rule names /cores: %q", l)
+		}
+	}
+}
