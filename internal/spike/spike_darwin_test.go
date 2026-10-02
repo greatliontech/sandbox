@@ -30,27 +30,42 @@ func TestDarwinFacts(t *testing.T) {
 	for _, r := range []struct {
 		name string
 		res  int
-	}{{"RLIMIT_AS", syscall.RLIMIT_AS}, {"RLIMIT_DATA", syscall.RLIMIT_DATA}} {
+		cur  uint64
+	}{{"RLIMIT_AS 64MiB", syscall.RLIMIT_AS, 64 << 20}, {"RLIMIT_AS 1GiB", syscall.RLIMIT_AS, 1 << 30}, {"RLIMIT_AS 8GiB", syscall.RLIMIT_AS, 8 << 30}, {"RLIMIT_DATA 1GiB", syscall.RLIMIT_DATA, 1 << 30}, {"RLIMIT_RSS(5) 64MiB", 5, 64 << 20}} {
 		cmd := exec.Command(exe, "-test.run=^TestDarwinFacts$")
-		cmd.Env = append(os.Environ(), "SPIKE_CHILD=alloc", fmt.Sprintf("SPIKE_RLIMIT=%d", r.res))
+		cmd.Env = append(os.Environ(), "SPIKE_CHILD=alloc", fmt.Sprintf("SPIKE_RLIMIT=%d", r.res), fmt.Sprintf("SPIKE_CUR=%d", r.cur))
 		out, err := cmd.CombinedOutput()
-		t.Logf("%s set to 64MiB then alloc 256MiB: err=%v out=%s", r.name, err, trim(out))
+		t.Logf("%s then alloc 256MiB: err=%v out=%s", r.name, err, trim(out))
+	}
+	var lim syscall.Rlimit
+	syscall.Getrlimit(syscall.RLIMIT_AS, &lim)
+	t.Logf("RLIMIT_AS current: %+v", lim)
+	syscall.Getrlimit(syscall.RLIMIT_DATA, &lim)
+	t.Logf("RLIMIT_DATA current: %+v", lim)
+	{
+		start := time.Now()
+		out, err := exec.Command("sh", "-c", "ulimit -t 1; yes > /dev/null; echo exit=$?").CombinedOutput()
+		t.Logf("sh ulimit -t 1; yes: err=%v after %v out=%s", err, time.Since(start).Round(time.Millisecond), trim(out))
+		start = time.Now()
+		out, err = exec.Command("sh", "-c", "ulimit -S -t 1; ulimit -H -t 2; yes > /dev/null; echo exit=$?").CombinedOutput()
+		t.Logf("sh soft 1 hard 2; yes: err=%v after %v out=%s", err, time.Since(start).Round(time.Millisecond), trim(out))
 	}
 	{
 		cmd := exec.Command(exe, "-test.run=^TestDarwinFacts$")
-		cmd.Env = append(os.Environ(), "SPIKE_CHILD=spin")
-		start := time.Now()
+		cmd.Env = append(os.Environ(), "SPIKE_CHILD=jetsam")
 		out, err := cmd.CombinedOutput()
-		t.Logf("RLIMIT_CPU=1 spin: err=%v after %v out=%s", err, time.Since(start).Round(time.Millisecond), trim(out))
+		t.Logf("memorystatus_control task limit 64MiB then alloc 256MiB: err=%v out=%s", err, trim(out))
 	}
 
-	tree := t.TempDir()
+	tree, _ := filepath.EvalSymlinks(t.TempDir())
 	payload := filepath.Join(tree, "payload")
 	cp(t, exe, payload)
 	rt := filepath.Join(tree, "rt")
 	os.Mkdir(rt, 0o755)
-	outside := filepath.Join(t.TempDir(), "outside.txt")
+	outsideDir, _ := filepath.EvalSymlinks(t.TempDir())
+	outside := filepath.Join(outsideDir, "outside.txt")
 	os.WriteFile(outside, []byte("secret"), 0o644)
+	t.Logf("tree=%s rt=%s outside=%s", tree, rt, outside)
 	substrate := `(allow file-read* (subpath "/usr/lib") (subpath "/System/Library") (subpath "/System/Volumes/Preboot/Cryptexes") (subpath "/private/var/db/dyld") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (literal "/dev/zero"))`
 	base := `(version 1)(deny default)(allow process-exec (subpath "` + tree + `"))(allow file-read* (subpath "` + tree + `"))`
 	profiles := []struct{ name, sbpl string }{
@@ -58,6 +73,8 @@ func TestDarwinFacts(t *testing.T) {
 		{"+ substrate", base + substrate},
 		{"+ sysctl + fork + metadata + mach", base + substrate + `(allow process-fork)(allow file-read-metadata)(allow sysctl-read)(allow mach-lookup)`},
 		{"+ rt write + unix socket", base + substrate + `(allow process-fork)(allow file-read-metadata)(allow sysctl-read)(allow mach-lookup)(allow file-write* (subpath "` + rt + `"))(allow network* (local unix-socket) (remote unix-socket))`},
+		{"system.sb import + tree", `(version 1)(deny default)(import "system.sb")(allow process-exec (subpath "` + tree + `"))(allow file-read* (subpath "` + tree + `"))(allow process-fork)(allow file-write* (subpath "` + rt + `"))(allow network* (local unix-socket) (remote unix-socket))`},
+		{"allow default, deny net+write", `(version 1)(allow default)(deny network*)(deny file-write*)(allow file-write* (subpath "` + rt + `"))`},
 	}
 	for _, p := range profiles {
 		for _, mode := range []string{"hello", "readoutside", "writetree", "net", "sibling", "sock"} {
@@ -72,11 +89,24 @@ func TestDarwinFacts(t *testing.T) {
 
 func child() {
 	switch os.Getenv("SPIKE_CHILD") {
+	case "jetsam":
+		// memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT=6, pid, limitMB, 0, 0)
+		_, _, errno := syscall.Syscall6(440, 6, uintptr(os.Getpid()), 64, 0, 0, 0)
+		fmt.Println("memorystatus_control errno:", errno)
+		b := make([]byte, 256<<20)
+		for i := 0; i < len(b); i += 4096 {
+			b[i] = 1
+		}
+		fmt.Println("allocated 256MiB fine under task limit")
 	case "alloc":
 		var res int
+		var cur uint64
 		fmt.Sscan(os.Getenv("SPIKE_RLIMIT"), &res)
-		if err := syscall.Setrlimit(res, &syscall.Rlimit{Cur: 64 << 20, Max: 64 << 20}); err != nil {
-			fmt.Println("setrlimit:", err)
+		fmt.Sscan(os.Getenv("SPIKE_CUR"), &cur)
+		var before syscall.Rlimit
+		syscall.Getrlimit(res, &before)
+		if err := syscall.Setrlimit(res, &syscall.Rlimit{Cur: cur, Max: before.Max}); err != nil {
+			fmt.Printf("setrlimit (before %+v): %v\n", before, err)
 			os.Exit(3)
 		}
 		b := make([]byte, 256<<20)
