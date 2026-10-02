@@ -69,7 +69,7 @@ func child(mode string) {
 		_, err = os.ReadDir(os.Getenv("SANDBOX_TEST_OUTSIDE"))
 		say("read-outside", err)
 	case "net":
-		c, err := net.DialTimeout("tcp", os.Getenv("SANDBOX_TEST_ADDR"), 2*time.Second)
+		c, err := net.DialTimeout("tcp", os.Getenv("SANDBOX_TEST_ADDR"), 5*time.Second)
 		if c != nil {
 			c.Close()
 		}
@@ -296,28 +296,17 @@ func entries(t *testing.T, path string) int {
 }
 
 // TestNetworkDeniedUnlessGranted pins the network: a container dials
-// nothing unless the network is granted — and never the loopback,
-// which the platform keeps from every package, so the listener sits
-// on an address of the host's own.
+// nothing unless the network is granted — and never an address of
+// the host's own, loopback or interface, which the platform keeps
+// from every package, so the witness is an endpoint off the host
+// (the runner reaches it for its own work).
 func TestNetworkDeniedUnlessGranted(t *testing.T) {
 	requireAppContainer(t)
-	addr := hostAddress(t)
-	l, err := net.Listen("tcp", net.JoinHostPort(addr, "0"))
-	if err != nil {
-		t.Fatal(err)
+	if _, err := net.DialTimeout("tcp", offHost, 5*time.Second); err != nil {
+		testdemand.Live(t, "SANDBOX_TEST_REQUIRE_APPCONTAINER", "no network to "+offHost+" from this host: "+err.Error())
 	}
-	defer l.Close()
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				return
-			}
-			c.Close()
-		}
-	}()
 	for _, network := range []bool{false, true} {
-		spec, out := payload("net", "SANDBOX_TEST_ADDR="+l.Addr().String())
+		spec, out := payload("net", "SANDBOX_TEST_ADDR="+offHost)
 		spec.Network = network
 		_, st := run(t, spec)
 		dialed := facts(out.String())["dial"] == "<nil>"
@@ -327,29 +316,8 @@ func TestNetworkDeniedUnlessGranted(t *testing.T) {
 	}
 }
 
-// hostAddress is an IPv4 address of the host's own that is no
-// loopback, which a container may reach where the network is
-// granted.
-func hostAddress(t *testing.T) string {
-	t.Helper()
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, i := range ifaces {
-		if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, _ := i.Addrs()
-		for _, a := range addrs {
-			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil {
-				return n.IP.String()
-			}
-		}
-	}
-	t.Skip("no address of the host's own but the loopback")
-	return ""
-}
+// offHost is an endpoint off the host for the network's witness.
+const offHost = "github.com:443"
 
 // TestMemoryBoundKillsHog pins the memory bound: a payload past it is
 // ended by the Job's refused commit — killed on the Job's report, or
