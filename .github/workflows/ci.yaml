@@ -43,3 +43,17 @@ jobs:
       # create user namespaces or delegate fails here, loudly.
       - name: Live Strong-row and cgroup arms under a delegated scope
         run: systemd-run --user --scope -q -p Delegate=yes env SANDBOX_TEST_REQUIRE_USERNS=1 SANDBOX_TEST_REQUIRE_CGROUPS=1 SANDBOX_TEST_REQUIRE_LANDLOCK=1 go test ./... -count=1 -race -timeout=20m
+
+  spike-darwin:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go test ./internal/spike/ -run TestDarwinFacts -v -count=1 2>&1 | tee spike.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spike
+          path: spike.log
