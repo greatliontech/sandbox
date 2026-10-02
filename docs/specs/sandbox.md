@@ -124,13 +124,20 @@ independent by design.
   platform affords an unprivileged process no native bound at all —
   darwin, whose kernel refuses every memory rlimit (`RLIMIT_AS`,
   `RLIMIT_DATA`, `RLIMIT_RSS`) and keeps its per-task memory limit
-  for root, and which delivers the CPU limit as `SIGXCPU`, a signal
-  a payload may handle — the row bounds by a watchdog: the kernel's
-  own per-process readings (resident size, CPU time), sampled over
-  the run's process group at a stated interval, the group killed at
-  the bound; such a bound is exceeded by at most what the group can
-  take in one interval, which is the whole of its weakness, and the
-  accounting reported names the watchdog. Which accounting
+  for root, which delivers the CPU limit as `SIGXCPU`, a signal a
+  payload may handle, and whose process limit counts every process
+  of the user — the row bounds by a watchdog: the kernel's own
+  per-process readings (the resident size, the CPU time, the thread
+  count), sampled over the run's process group at the stated
+  interval (`WatchdogInterval`), the group killed at the bound — the
+  memory bound over the group's resident sizes summed, the CPU bound
+  over each process's own time as `RLIMIT_CPU` reads it, the process
+  bound over the group's processes and threads. Such a bound is
+  exceeded by at most what the group can take in one interval, and
+  it reaches what the group holds: a process that leaves the group
+  (`setsid`) leaves the bounds, the same escape that leaves the
+  kill tie, stated under "No orphans"; the accounting reported names
+  the watchdog. Which accounting
   enforced the bounds is a reported fact of the run, so a
   bound-exceeded death is attributable.
 - **The wall clock belongs to the caller.** `Start`'s context governs
@@ -152,7 +159,9 @@ independent by design.
   parent-death tie at all — the sandboxed process itself survives a
   caller `SIGKILL` there. Both strengths are stated, never silent;
   admitting rows with the weaker ties through `MinTier` is informed
-  consent.
+  consent. On darwin the run's end is a third trigger: when the
+  payload exits, the group's remnants are killed, there being no
+  namespace to take a descendant with it.
 
 ## Mechanism ladder
 
@@ -160,7 +169,7 @@ independent by design.
 |---|---|---|
 | linux, unprivileged user namespaces available | namespaces (user, mount, pid, uts, ipc; net unless granted), pivoted read-only root repeating locked mount flags, capability drop, seccomp holding for every syscall ABI the kernel exposes (a foreign-ABI call is killed, never let through unfiltered), `no_new_privs`, cgroup-or-rlimit bounds | `Strong` |
 | linux, user namespaces unavailable, Landlock available | Landlock filesystem allowlist over the world at its host paths (the caller's whole world where no `Root` is stated), seccomp network denial at the socket (Landlock ABI 4's TCP restrictions are supplementary, never the sole arm — UDP and raw sockets stay open without seccomp; an ABI that also multiplexes the socket calls through `socketcall` refuses that route whole, the local family reached by the direct calls), Landlock's IPC scoping where the kernel has it (ABI 6), `no_new_privs`, cgroup-or-rlimit bounds; static entrypoints only under a `Root` — an ELF the kernel loads whole, native, with no interpreter; a script, a dynamically linked executable, or a file the check cannot read is refused | `OS` |
-| darwin, Seatbelt available (`sandbox-exec` applies a profile) | Seatbelt profile (filesystem allowlist, network denial), rlimit bounds with the watchdog behind them | `OS` |
+| darwin, Seatbelt available (`sandbox-exec` applies a profile) | Seatbelt profile (filesystem allowlist, network denial at the socket — the platform's mach services stay reachable, name resolution among them, as a row without namespaces leaves IPC; a read-only grant refused without a `Root`, the profile over the whole world having no rule a renamed ancestor cannot carry a grant out of), rlimit bounds with the watchdog behind them | `OS` |
 | windows, AppContainer available | AppContainer boundary, Job Object bounds | `OS` |
 | any platform where no security boundary is available but resource bounds are | resource bounds (rlimits, Job Object, darwin's watchdog) | `Minimal` |
 | anything else | refused (`ErrUnsupported`) | — |

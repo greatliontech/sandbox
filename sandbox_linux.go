@@ -23,9 +23,6 @@ import (
 	"github.com/greatliontech/sandbox/internal/nslinux"
 )
 
-// Internal re-exec protocol.
-//
-
 // initConfig is the JSON payload handed to the re-exec'd init process.
 // Root and every bind's Target are canonical paths resolved by the
 // parent: the one place the grant-to-target mapping is computed, so
@@ -263,14 +260,6 @@ func (s *linuxSandbox) Start(ctx context.Context) error {
 	waitErr := cmd.Wait()
 	return fail(startFailure(r.tier, outcome, reason, status, ctx.Err(), waitErr))
 }
-
-// startFailure is Start's report of an init that did not reach exec,
-// by the status pipe's shape: an intent the host would not deliver
-// is ErrUndeliverable; a row whose mechanism failed to apply is
-// reported as that, under neither refusal sentinel — the row is
-// never re-selected; nothing written is a death before composing —
-// a consumer package init exiting under the re-exec marker, a kill,
-// or the caller's context ending — and the payload never ran.
 
 // world is the resolved shape of a run: the tree to pivot to (the
 // Strong row only), the binds to place there, the OS row's allowlist
@@ -911,4 +900,11 @@ func composeWorld(cfg initConfig) error {
 		return err
 	}
 	return nslinux.RemountRootReadOnly()
+}
+
+// runStage is the second stage of a staged plan, which no Linux row
+// uses: an init reaching it is the protocol breached.
+func runStage() {
+	fmt.Fprintln(os.Stderr, "sandbox-init: no second stage on this platform")
+	os.Exit(127)
 }

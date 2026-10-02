@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,11 +49,49 @@ func TestMain(m *testing.M) {
 		err := os.WriteFile(os.Getenv("SANDBOX_TEST_WRITE"), []byte("x"), 0o644)
 		fmt.Printf("write=%v\n", err)
 		os.Exit(0)
+	case "unix":
+		// Listen and dial a unix socket at the named path.
+		p := os.Getenv("SANDBOX_TEST_SOCK")
+		l, err := net.Listen("unix", p)
+		if err != nil {
+			fmt.Printf("unix=listen: %v\n", err)
+			os.Exit(0)
+		}
+		go func() {
+			c, err := l.Accept()
+			if err == nil {
+				c.Close()
+			}
+		}()
+		c, err := net.Dial("unix", p)
+		if c != nil {
+			c.Close()
+		}
+		l.Close()
+		fmt.Printf("unix=%v\n", err)
+		os.Exit(0)
+	case "threads":
+		// Park three hundred threads, then wait: under a smaller
+		// process bound the watchdog kills.
+		var n int
+		fmt.Sscan(os.Getenv("SANDBOX_TEST_THREADS"), &n)
+		block := make(chan struct{})
+		for i := 0; i < n; i++ {
+			go func() {
+				runtime.LockOSThread()
+				<-block
+			}()
+		}
+		time.Sleep(200 * time.Millisecond)
+		fmt.Println("threads=parked")
+		os.Stdout.Sync()
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
 	case "rlimits":
 		for _, r := range []struct {
 			name string
 			res  int
-		}{{"cpu", unix.RLIMIT_CPU}, {"nofile", unix.RLIMIT_NOFILE}, {"nproc", unix.RLIMIT_NPROC}} {
+		}{{"cpu", unix.RLIMIT_CPU}, {"nofile", unix.RLIMIT_NOFILE}} {
 			var l unix.Rlimit
 			if err := unix.Getrlimit(r.res, &l); err != nil {
 				fmt.Printf("%s=err:%v\n", r.name, err)
@@ -325,42 +365,115 @@ func TestOSRowNetwork(t *testing.T) {
 	}
 }
 
-// TestOSRowReadOnlyGrant pins a read-only grant on the OS row: its
-// writes denied throughout, a write beside it untouched.
-func TestOSRowReadOnlyGrant(t *testing.T) {
-	requireSeatbelt(t)
-	ro := must(filepath.EvalSymlinks(t.TempDir()))
-	rw := must(filepath.EvalSymlinks(t.TempDir()))
-	if err := os.Mkdir(filepath.Join(ro, "sub"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	spec, out := payload("write", "SANDBOX_TEST_WRITE="+filepath.Join(ro, "sub", "w"))
-	spec.PathGrants = []PathGrant{{Path: ro, Access: ReadOnly}}
-	if _, st := run(t, spec); st.Code != 0 || !strings.Contains(facts(out.String())["write"], "operation not permitted") {
-		t.Fatalf("a write under the read-only grant: exit %+v, write=%q", st, facts(out.String())["write"])
-	}
-	spec, out = payload("write", "SANDBOX_TEST_WRITE="+filepath.Join(rw, "w"))
-	spec.PathGrants = []PathGrant{{Path: ro, Access: ReadOnly}}
-	if _, st := run(t, spec); st.Code != 0 || facts(out.String())["write"] != "<nil>" {
-		t.Fatalf("a write beside the grant: exit %+v, write=%q", st, facts(out.String())["write"])
-	}
-}
-
 // TestRlimitsApplied pins the kernel's bounds reaching the payload,
-// and the working directory entered.
+// the working directory entered, and the accounting reported: the
+// open-files limit alone is the kernel's, a CPU bound the
+// watchdog's.
 func TestRlimitsApplied(t *testing.T) {
 	wd := must(filepath.EvalSymlinks(t.TempDir()))
 	spec, out := payload("rlimits")
-	spec.Limits = Limits{CPUSeconds: 100, MaxFiles: 300, MaxProcs: 500}
+	spec.Limits = Limits{MaxFiles: 300}
 	spec.WorkDir = wd
 	sb, st := run(t, spec)
 	f := facts(out.String())
-	if st.Code != 0 || f["cpu"] != "100" || f["nofile"] != "300" || f["nproc"] != "500" || f["cwd"] != wd {
+	if st.Code != 0 || f["nofile"] != "300" || f["cwd"] != wd {
 		t.Fatalf("exit %+v, facts %v", st, f)
 	}
 	stats, err := sb.Stats()
 	if err != nil || stats.Accounting != AccountingRlimits {
 		t.Fatalf("stats %+v %v, want rlimits", stats, err)
+	}
+	spec, out = payload("rlimits")
+	spec.Limits = Limits{CPUSeconds: 100, MaxFiles: 300}
+	sb, st = run(t, spec)
+	f = facts(out.String())
+	if st.Code != 0 || f["cpu"] != "100" || f["nofile"] != "300" {
+		t.Fatalf("exit %+v, facts %v", st, f)
+	}
+	stats, err = sb.Stats()
+	if err != nil || stats.Accounting != AccountingWatchdog {
+		t.Fatalf("stats %+v %v, want the watchdog", stats, err)
+	}
+}
+
+// TestProcessBoundKillsThreads pins the process bound as the
+// watchdog holds it: the run's processes and threads summed.
+func TestProcessBoundKillsThreads(t *testing.T) {
+	spec, out := payload("threads", "SANDBOX_TEST_THREADS=300")
+	spec.Limits = Limits{MaxProcs: 100}
+	_, st := run(t, spec)
+	if !st.Signaled || st.Signal != syscall.SIGKILL {
+		t.Fatalf("exit %+v, output %q; want a kill", st, out.String())
+	}
+	spec, out = payload("threads", "SANDBOX_TEST_THREADS=20")
+	spec.Limits = Limits{MaxProcs: 100}
+	spec.Stdin = nil
+	sb, err := New(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := sb.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for facts(out.String())["threads"] == "" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if facts(out.String())["threads"] != "parked" {
+		t.Fatalf("under the bound the payload never parked: %q", out.String())
+	}
+	cancel()
+	sb.Wait()
+}
+
+// TestOSRowUnixSockets pins what a denied network leaves open: a
+// unix socket reached by path.
+func TestOSRowUnixSockets(t *testing.T) {
+	requireSeatbelt(t)
+	dir := must(filepath.EvalSymlinks(t.TempDir()))
+	spec, out := payload("unix", "SANDBOX_TEST_SOCK="+filepath.Join(dir, "s"))
+	if _, st := run(t, spec); st.Code != 0 || facts(out.String())["unix"] != "<nil>" {
+		t.Fatalf("a unix socket under a denied network: exit %+v, unix=%q", st, facts(out.String())["unix"])
+	}
+}
+
+// TestOSRowRefusesReadOnlyGrantWithoutRoot pins the OS row's refusal:
+// without a Root its profile allows the whole world, where no rule
+// keeps a grant read-only past a renamed ancestor.
+func TestOSRowRefusesReadOnlyGrantWithoutRoot(t *testing.T) {
+	requireSeatbelt(t)
+	spec, _ := payload("hello")
+	spec.PathGrants = []PathGrant{{Path: t.TempDir(), Access: ReadOnly}}
+	sb, err := New(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) {
+		t.Fatalf("Start = %v, want ErrUndeliverable", err)
+	}
+}
+
+// TestApplierFailureIsStarts pins the staged init: the applier
+// refusing the profile is the row failing to apply, reported by
+// Start, never the payload's exit.
+func TestApplierFailureIsStarts(t *testing.T) {
+	requireSeatbelt(t)
+	profileOverride = "(version 1)(this is no profile"
+	t.Cleanup(func() { profileOverride = "" })
+	spec, out := payload("hello")
+	spec.Stderr = io.Discard
+	sb, err := New(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = sb.Start(context.Background())
+	if err == nil || errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "failed to apply") {
+		t.Fatalf("Start = %v, want the row failing to apply", err)
+	}
+	if out.Len() != 0 || sb.Tier() != None {
+		t.Fatalf("something ran under a refused profile: %q, tier %v", out.String(), sb.Tier())
 	}
 }
 
@@ -371,8 +484,8 @@ func TestMemoryWatchdogKillsHog(t *testing.T) {
 	spec, out := payload("hog")
 	spec.Limits = Limits{MemoryBytes: 64 << 20}
 	sb, st := run(t, spec)
-	if !st.Signaled || st.Signal != syscall.SIGKILL {
-		t.Fatalf("exit %+v, output %q; want a kill", st, out.String())
+	if !st.Signaled || st.Signal != syscall.SIGKILL || st.Code != 128+int(syscall.SIGKILL) {
+		t.Fatalf("exit %+v, output %q; want a kill, its code 128 plus the signal", st, out.String())
 	}
 	f := facts(out.String())
 	if f["hog"] != "start" || f["hogged"] != "" {

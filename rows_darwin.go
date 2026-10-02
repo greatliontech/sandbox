@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // row is one rung of the ladder (docs/specs/sandbox.md, "Mechanism
@@ -32,11 +34,16 @@ var (
 
 // refuses names the intent in spec the row cannot deliver, if any.
 // The OS row presents no hostname (no UTS namespace on this
-// platform). The Minimal row's mechanism set is bounds alone: it
-// refuses every intent only a security boundary delivers — a Root,
-// a hostname, a denied network, a read-only grant — and a Spec
-// stating no limits, which would leave that row nothing to apply
-// (docs/specs/sandbox.md, the ladder: sandbox never bare-execs).
+// platform), and without a Root its profile allows the caller's
+// whole world, under which a grant denied its writes is read-only
+// only until an ancestor of it is renamed — Seatbelt matches the
+// path of each operation as spelled at the time — so a read-only
+// grant there has no rule that keeps it so, as on the Linux OS row.
+// The Minimal row's mechanism set is bounds alone: it refuses every
+// intent only a security boundary delivers — a Root, a hostname, a
+// denied network, a read-only grant — and a Spec stating no limits,
+// which would leave that row nothing to apply (docs/specs/sandbox.md,
+// the ladder: sandbox never bare-execs).
 func (r row) refuses(spec Spec) error {
 	undeliverable := func(what string) error {
 		return fmt.Errorf("%w: the %s row %s", ErrUndeliverable, r.tier, what)
@@ -44,6 +51,13 @@ func (r row) refuses(spec Spec) error {
 	if r.tier == OS {
 		if spec.Hostname != "" {
 			return undeliverable("presents no hostname")
+		}
+		if spec.Root == "" {
+			for _, g := range spec.PathGrants {
+				if g.Access == ReadOnly {
+					return undeliverable(fmt.Sprintf("cannot make grant %s read-only without a Root: its profile then allows the whole world, and a renamed ancestor would carry the grant out of a deny rule", g.Path))
+				}
+			}
 		}
 		return nil
 	}
@@ -149,18 +163,57 @@ func selfExecutable() (string, error) {
 	return filepath.EvalSymlinks(exe)
 }
 
-// killRun issues the strongest kill the run holds on this platform:
-// the process group, which a payload can leave with setsid (docs/
-// specs/sandbox.md, "No orphans"). The group is addressed by the
-// leader's pid, checked alive through os.Process first, as the Linux
-// rows do.
-func killRun(p *os.Process) error {
-	err := p.Signal(syscall.Signal(0))
+// group is a run's process group by identity: the leader's pid,
+// which is the group's id, and the leader's start time, which tells
+// the run's leader from a later process the kernel hands the same
+// pid once the group is gone. A pid is never reissued while a group
+// with that id exists, so a group listed non-empty is the run's own
+// unless its leader is a stranger by start time.
+type group struct {
+	pgid  int
+	start unix.Timeval
+}
+
+// groupOf reads the group a leader starts.
+func groupOf(leader *os.Process) (group, error) {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", leader.Pid)
 	if err != nil {
+		return group{}, fmt.Errorf("sandbox: the run's leader: %w", err)
+	}
+	return group{pgid: leader.Pid, start: kp.Proc.P_starttime}, nil
+}
+
+// members lists the group's processes as the kernel has them, none
+// where the group is gone or its id names a stranger's.
+func (g group) members() ([]unix.KinfoProc, error) {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", g.pgid)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range procs {
+		if int(p.Proc.P_pid) == g.pgid && p.Proc.P_starttime != g.start {
+			return nil, nil // the id reissued to another leader
+		}
+	}
+	return procs, nil
+}
+
+// kill ends every member of the group, where the group is still the
+// run's: the strongest kill this platform holds (docs/specs/
+// sandbox.md, "No orphans"), which a payload can leave with setsid.
+// What stays open is the window between the listing and the signal,
+// in which the group could empty and its id be reissued to another
+// leader — two adjacent syscalls wide, as on the Linux rows.
+func (g group) kill() error {
+	members, err := g.members()
+	if err != nil {
+		return err
+	}
+	if len(members) == 0 {
 		return nil
 	}
-	if kerr := syscall.Kill(-p.Pid, syscall.SIGKILL); kerr != nil && !errors.Is(kerr, syscall.ESRCH) {
-		return kerr
+	if err := syscall.Kill(-g.pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
 	}
 	return nil
 }

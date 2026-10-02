@@ -4,9 +4,7 @@ package sandbox
 
 import (
 	"fmt"
-	"os"
 	"sync"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -24,23 +22,19 @@ type rlimit struct {
 // bounds are the run's limits as this platform delivers them (docs/
 // specs/sandbox.md, "Bounded means bounded"): the kernel's rlimits
 // where it enforces them — CPU time, which it delivers as SIGXCPU at
-// the limit; open files; processes, counted per user — and, where it
-// has no native bound an unprivileged process can set, the watchdog:
-// the kernel refuses every memory rlimit (RLIMIT_AS, RLIMIT_DATA,
-// RLIMIT_RSS answer EINVAL) and its per-task memory limit to all but
-// root, and a payload that handles SIGXCPU outlives the CPU limit,
-// so memory and CPU are bounded by sampling the kernel's own
-// per-process readings over the run's process group and killing the
-// group at the bound.
+// the limit, and open files — and the watchdog where it has no
+// native bound an unprivileged process can set: the kernel refuses
+// every memory rlimit (RLIMIT_AS, RLIMIT_DATA, RLIMIT_RSS answer
+// EINVAL) and keeps its per-task memory limit for root, a payload
+// that handles SIGXCPU outlives the CPU limit, and its process
+// rlimit counts every process of the user rather than the run's, so
+// memory, CPU time and the process count are bounded by sampling
+// the kernel's own per-process readings over the run's process group
+// and killing the group at a bound.
 type bounds struct {
 	rlimits []rlimit
 	watch   *watchdog
 }
-
-// watchInterval paces the watchdog: the bound is exceeded by at most
-// what the group can take in one interval, and a hundred samples a
-// second cost the host a fraction of a percent of one core.
-const watchInterval = 10 * time.Millisecond
 
 // selectBounds maps the limits to the platform's accounting.
 func selectBounds(l Limits) bounds {
@@ -51,52 +45,58 @@ func selectBounds(l Limits) bounds {
 	if l.MaxFiles > 0 {
 		b.rlimits = append(b.rlimits, rlimit{Resource: unix.RLIMIT_NOFILE, Cur: l.MaxFiles, Max: l.MaxFiles})
 	}
-	if l.MaxProcs > 0 {
-		b.rlimits = append(b.rlimits, rlimit{Resource: unix.RLIMIT_NPROC, Cur: l.MaxProcs, Max: l.MaxProcs})
-	}
-	if l.MemoryBytes > 0 || l.CPUSeconds > 0 {
-		b.watch = &watchdog{memory: l.MemoryBytes, cpu: time.Duration(l.CPUSeconds) * time.Second, interval: watchInterval}
+	if l.MemoryBytes > 0 || l.CPUSeconds > 0 || l.MaxProcs > 0 {
+		b.watch = &watchdog{
+			memory:   l.MemoryBytes,
+			cpu:      time.Duration(l.CPUSeconds) * time.Second,
+			procs:    l.MaxProcs,
+			interval: WatchdogInterval,
+		}
 	}
 	return b
 }
 
-// accounting is the reported mechanism: the watchdog where a memory
-// bound was stated (the process bound beside it is the kernel's
-// rlimit either way), rlimits where any other limit was, none
-// otherwise.
-func (b bounds) accounting(l Limits) Accounting {
+// accounting is the reported mechanism: the watchdog where it bounds
+// anything (memory, CPU time, the process count), rlimits where the
+// open-files limit alone was stated, none otherwise.
+func (b bounds) accounting() Accounting {
 	switch {
-	case l.MemoryBytes > 0:
+	case b.watch != nil:
 		return AccountingWatchdog
-	case l != (Limits{}):
+	case len(b.rlimits) > 0:
 		return AccountingRlimits
 	}
 	return AccountingNone
 }
 
 // watchdog samples the run's process group — the kernel's resident
-// size and CPU time of each member, summed — and kills the group at
-// a bound. It counts what it enforced: the peak resident size seen,
-// and the kills by each bound.
+// size, CPU time and thread count of each member — and kills the
+// group at a bound: the memory bound over the members' resident
+// sizes summed, the CPU bound over each member's own time (the
+// per-process reading RLIMIT_CPU has on every row), the process
+// bound over the members and their threads summed. It counts what
+// it enforced: the peak resident size seen and the one kill a bound
+// made; a failure to read the group is a bound it could not hold,
+// which kills the run and is reported from Wait.
 type watchdog struct {
 	memory   uint64
 	cpu      time.Duration
+	procs    uint64
 	interval time.Duration
 
 	mu       sync.Mutex
-	leader   *os.Process // the group's leader, which knows whether it was reaped
-	pgid     int
+	group    group
 	peak     uint64
 	memKills uint64
-	cpuKills uint64
+	killed   bool
+	err      error
 	stop     chan struct{}
 	done     chan struct{}
 }
 
-// start begins sampling the group the leader leads.
-func (w *watchdog) start(leader *os.Process) {
-	w.leader = leader
-	w.pgid = leader.Pid
+// start begins sampling the group.
+func (w *watchdog) start(g group) {
+	w.group = g
 	w.stop = make(chan struct{})
 	w.done = make(chan struct{})
 	go w.run()
@@ -124,67 +124,86 @@ func (w *watchdog) run() {
 		case <-w.stop:
 			return
 		case <-t.C:
-			w.sample()
+			if !w.sample() {
+				return
+			}
 		}
 	}
 }
 
 // sample reads the group once and kills it where a bound is
-// exceeded. The group is addressed by the leader's pid, which names
-// the group only while the leader is unreaped (a zombie holds its
-// pid; a reaped leader's pid may already lead another group), so a
-// sample runs only while the leader is known alive through
-// os.Process, which knows whether it was waited for — the same
-// two-syscall window the Linux rows' group kill leaves open. A
+// exceeded, reporting whether there is a group left to sample. A
 // member the kernel no longer reports — exited between the listing
-// and the reading — is skipped; a listing that fails is a sample
-// missed, never a kill.
-func (w *watchdog) sample() {
-	if err := w.leader.Signal(syscall.Signal(0)); err != nil {
-		return
-	}
-	members, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", w.pgid)
+// and the reading — is skipped.
+func (w *watchdog) sample() bool {
+	members, err := w.group.members()
 	if err != nil {
-		return
+		w.fail(fmt.Errorf("sandbox: the watchdog could not list the run: %w", err))
+		return false
 	}
-	var rss uint64
-	var cpu time.Duration
+	if len(members) == 0 {
+		return false
+	}
+	var rss, threads uint64
+	var over bool
 	for _, m := range members {
 		ti, err := taskInfo(int(m.Proc.P_pid))
 		if err != nil {
 			continue
 		}
 		rss += ti.resident
-		cpu += ti.user + ti.system
+		threads += ti.threads
+		if w.cpu > 0 && ti.user+ti.system > w.cpu {
+			over = true
+		}
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if rss > w.peak {
 		w.peak = rss
 	}
-	switch {
-	case w.memory > 0 && rss > w.memory:
-		w.memKills++
-	case w.cpu > 0 && cpu > w.cpu:
-		w.cpuKills++
-	default:
-		return
+	if w.memory > 0 && rss > w.memory {
+		if !w.killed {
+			w.memKills++
+		}
+		over = true
 	}
-	_ = syscall.Kill(-w.pgid, syscall.SIGKILL)
+	if w.procs > 0 && threads > w.procs {
+		over = true
+	}
+	if !over {
+		return true
+	}
+	w.killed = true
+	_ = w.group.kill()
+	return true
+}
+
+// fail records a bound the watchdog could not hold and ends the run:
+// a run whose accounting cannot be read is not a run known to have
+// stayed in bounds.
+func (w *watchdog) fail(err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.err = err
+	w.killed = true
+	_ = w.group.kill()
 }
 
 // stats is the watchdog's account so far.
-func (w *watchdog) stats() (peak, memKills, cpuKills uint64) {
+func (w *watchdog) stats() (peak, memKills uint64, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.peak, w.memKills, w.cpuKills
+	return w.peak, w.memKills, w.err
 }
 
 // taskReadings are the kernel's per-process readings the watchdog
-// sums: the resident size and the CPU time, user and system.
+// reads: the resident size, the CPU time (user and system) and the
+// thread count.
 type taskReadings struct {
 	resident     uint64
 	user, system time.Duration
+	threads      uint64
 }
 
 // taskInfo reads a process through the kernel's proc_info interface
@@ -192,9 +211,10 @@ type taskReadings struct {
 // PROC_PIDTASKINFO), which an unprivileged process may read for its
 // own user's processes. The task info struct opens with the virtual
 // and resident sizes and the total user and system times, each eight
-// bytes, in that order; the times are in the kernel's timebase
-// ticks (hw.tbfrequency of them a second: twenty-four million on
-// Apple silicon, a thousand million on Intel), converted here.
+// bytes, in that order — the times in the kernel's timebase ticks
+// (hw.tbfrequency of them a second: twenty-four million on Apple
+// silicon, a thousand million on Intel), converted here — and
+// carries the thread count as a four-byte integer at byte 84.
 func taskInfo(pid int) (taskReadings, error) {
 	const (
 		callPidInfo      = 2
@@ -203,6 +223,7 @@ func taskInfo(pid int) (taskReadings, error) {
 		residentOffset   = 8
 		userTimeOffset   = 16
 		systemTimeOffset = 24
+		threadsOffset    = 84
 	)
 	var buf [taskInfoSize]byte
 	n, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, callPidInfo, uintptr(pid), flavorTaskInfo, 0, uintptr(unsafe.Pointer(&buf[0])), taskInfoSize)
@@ -224,6 +245,7 @@ func taskInfo(pid int) (taskReadings, error) {
 		resident: at(residentOffset),
 		user:     ticks(userTimeOffset),
 		system:   ticks(systemTimeOffset),
+		threads:  uint64(*(*int32)(unsafe.Pointer(&buf[threadsOffset]))),
 	}, nil
 }
 

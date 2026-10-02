@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -17,21 +18,27 @@ import (
 
 // Start re-execs the calling binary with envInit set; the init() below
 // intercepts that, reads the init config from a pipe (envInitFD),
-// composes the world inside the freshly created namespaces, then
-// execs the target. The namespaces themselves are created by the Go
-// runtime at clone time via SysProcAttr — no cgo, and identical
-// isolation to a C-driven clone. A second pipe (envStatusFD) carries
-// the outcome of composition back and is close-on-exec: the init
-// writes one sentinel byte immediately before exec, then either the
-// exec closes the pipe or its failure is written after the sentinel;
-// a failure before exec is written before any sentinel, marked as an
-// intent the host would not deliver or as the row's own mechanism
-// failing to apply; and an init that dies earlier — a consumer
-// package init exiting under the marker, a kill — leaves the pipe
-// empty. Start reads the shapes apart, so a world that cannot be
-// delivered refuses Start with the reason, a row that failed to
-// apply is reported as that and never re-selected, and a payload
-// that never ran is never reported as one that did.
+// composes the row's world — on Linux inside the namespaces the Go
+// runtime created at clone time via SysProcAttr, no cgo and
+// identical isolation to a C-driven clone; on darwin the bounds and
+// the working directory, the profile applied by the platform's own
+// applier in a second stage — then execs the target. A second pipe
+// (envStatusFD) carries the outcome of composition back: the init
+// marks it close-on-exec and writes one sentinel byte immediately
+// before the payload's exec, then either the exec closes the pipe or
+// its failure is written after the sentinel; a staged plan writes an
+// applying marker instead, leaves the pipe open across the applier's
+// exec, and the second stage of this binary under the applied
+// mechanism writes the sentinel, so the applier's own death leaves
+// the marker alone; a failure before exec is written before any
+// sentinel, marked as an intent the host would not deliver or as the
+// row's own mechanism failing to apply; and an init that dies
+// earlier — a consumer package init exiting under the marker, a
+// kill — leaves the pipe empty. Start reads the shapes apart, so a
+// world that cannot be delivered refuses Start with the reason, a
+// row that failed to apply is reported as that and never
+// re-selected, and a payload that never ran is never reported as
+// one that did.
 const (
 	envInit     = "_SANDBOX_INIT"
 	envInitFD   = "_SANDBOX_INITFD"
@@ -41,26 +48,38 @@ const (
 	statusExecing     = "\x00" // the init is about to exec the target
 	statusFailed      = "E"    // an intent the host would not deliver; the reason follows
 	statusApplyFailed = "A"    // the row's mechanism failed to apply; the reason follows
+	statusApplying    = "S"    // the init handed the run to the row's applier (a staged plan)
 )
 
 func init() {
-	if os.Getenv(envInit) == "1" {
+	switch os.Getenv(envInit) {
+	case "1":
 		runInit() // never returns
+	case "2":
+		runStage() // never returns
 	}
 }
 
 // execPlan is what the init execs once the row's world is composed.
+// A staged plan execs the row's applier, which applies the row's
+// mechanism and execs this binary again as the second stage
+// (runStage): the status pipe stays open across the applier's exec
+// and the sentinel is the second stage's to write, so the applier's
+// own death reads as the row failing to apply, never as the
+// payload's exit (docs/specs/sandbox.md, Re-exec).
 type execPlan struct {
-	Cmd  string
-	Args []string
-	Env  []string
+	Cmd    string
+	Args   []string
+	Env    []string
+	Staged bool
 }
 
 // runInit is the re-exec'd init: under the probe marker it exits at
 // once, the host's answer being that the exec itself succeeded;
 // otherwise it composes the row's world as the platform's
-// composeInit has it, reports the sentinel and execs the plan, a
-// failure reported through the status pipe for the parent to read
+// composeInit has it and execs the plan — the payload, after the
+// sentinel, or a staged plan's applier, after the applying marker —
+// a failure reported through the status pipe for the parent to read
 // apart (classifyStatus). The platform's composeInit returns the
 // exec plan: the command, its arguments and its environment.
 func runInit() {
@@ -86,7 +105,33 @@ func runInit() {
 		}
 		os.Exit(127)
 	}
+	if plan.Staged {
+		// The applier inherits the pipe; the second stage writes the
+		// sentinel. The applying marker tells the parent the applier
+		// was reached, so its death reads as the row failing to apply.
+		if status != nil {
+			if _, err := status.WriteString(statusApplying); err != nil {
+				fmt.Fprintln(os.Stderr, "sandbox-init: status pipe:", err)
+				os.Exit(127)
+			}
+		}
+		argv := append([]string{plan.Cmd}, plan.Args...)
+		err = syscall.Exec(plan.Cmd, argv, plan.Env)
+		report(statusApplyFailed + fmt.Sprintf("exec %s: %v", plan.Cmd, err))
+		os.Exit(127)
+	}
+	execPayload(status, plan)
+}
+
+// execPayload is the init's last act on every platform: the status
+// pipe marked close-on-exec, the sentinel written and the payload
+// execed, so the parent reads EOF exactly when the payload runs.
+func execPayload(status *os.File, plan execPlan) {
 	if status != nil {
+		if _, err := unix.FcntlInt(status.Fd(), unix.F_SETFD, unix.FD_CLOEXEC); err != nil {
+			fmt.Fprintln(os.Stderr, "sandbox-init: status pipe:", err)
+			os.Exit(127)
+		}
 		if _, err := status.WriteString(statusExecing); err != nil {
 			// Without the sentinel a running payload would read as a
 			// death before exec; better not to run it.
@@ -95,24 +140,46 @@ func runInit() {
 		}
 	}
 	argv := append([]string{plan.Cmd}, plan.Args...)
-	err = syscall.Exec(plan.Cmd, argv, plan.Env)
+	err := syscall.Exec(plan.Cmd, argv, plan.Env)
 	// Only a failed exec returns; its reason follows the sentinel.
-	report(statusFailed + fmt.Sprintf("exec %s: %v", plan.Cmd, err))
+	if status != nil {
+		status.WriteString(statusFailed + fmt.Sprintf("exec %s: %v", plan.Cmd, err))
+		status.Close()
+	} else {
+		fmt.Fprintln(os.Stderr, "sandbox-init: exec", plan.Cmd+":", err)
+	}
 	os.Exit(127)
 }
 
-// statusPipe opens the composition-status pipe and marks it
-// close-on-exec, so the parent reads EOF exactly when the target has
-// been execed.
+// statusPipe opens the composition-status pipe, inheritable until the
+// payload's exec marks it close-on-exec (execPayload).
 func statusPipe() *os.File {
 	fd, err := strconv.Atoi(os.Getenv(envStatusFD))
 	if err != nil {
 		return nil
 	}
-	if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, unix.FD_CLOEXEC); err != nil {
-		return nil
-	}
 	return os.NewFile(uintptr(fd), "sandbox-status")
+}
+
+// readInitConfig decodes the config the parent wrote for the init
+// from the pipe the environment names, closing it: nothing of the
+// parent's view is left open for the payload to find.
+func readInitConfig[T any]() (T, error) {
+	var cfg T
+	fdStr := os.Getenv(envInitFD)
+	fd, err := strconv.Atoi(fdStr)
+	if err != nil {
+		return cfg, fmt.Errorf("bad %s=%q: %w", envInitFD, fdStr, err)
+	}
+	f := os.NewFile(uintptr(fd), "sandbox-config")
+	if f == nil {
+		return cfg, fmt.Errorf("invalid config fd %d", fd)
+	}
+	defer f.Close()
+	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
+		return cfg, fmt.Errorf("decode config: %w", err)
+	}
+	return cfg, nil
 }
 
 // intentError marks an init failure that is the caller's intent
@@ -125,6 +192,10 @@ type intentError struct{ err error }
 func (e intentError) Error() string { return e.err.Error() }
 func (e intentError) Unwrap() error { return e.err }
 
+// startFailure is Start's error for an init that did not exec the
+// payload: an intent refused, the row failing to apply, or the init
+// dying — by the caller's context, or by itself, which is the
+// re-exec contract breached (docs/specs/sandbox.md, Re-exec).
 func startFailure(tier Isolation, outcome initOutcome, reason string, status []byte, ctxErr, waitErr error) error {
 	switch outcome {
 	case initRefused:
@@ -156,6 +227,14 @@ const (
 // for a failure, its reason.
 func classifyStatus(status []byte) (initOutcome, string) {
 	st := string(status)
+	if strings.HasPrefix(st, statusApplying) {
+		// The applier was reached: nothing after the marker is the
+		// applier dying before the second stage ran.
+		st = strings.TrimPrefix(st, statusApplying)
+		if st == "" {
+			return initApplyFailed, "the row's applier exited before the payload ran"
+		}
+	}
 	switch {
 	case st == "":
 		return initDied, ""
@@ -183,7 +262,9 @@ func hostEnv() []string {
 	return env
 }
 
-// hostNameMax is the kernel's hostname length (__NEW_UTS_LEN).
+// hostNameMax is the longest hostname a row presents: the Linux
+// kernel's (__NEW_UTS_LEN), which darwin's rows, presenting none,
+// never reach.
 const hostNameMax = 64
 
 // probeCache holds once-per-process answers to host probes, keyed
