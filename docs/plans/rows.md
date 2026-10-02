@@ -20,7 +20,7 @@ darwin row)
         and CPU behind the signal a payload may handle), reported as
         its own accounting with its interval; the spec amended so;
         the macOS CI row demanding the `OS` row.
-  - [ ] 2.3. The Seatbelt row's world: the profile (deny by default,
+  - [x] 2.3. The Seatbelt row's world: the profile (deny by default,
         Apple's `system.sb` as the execution substrate, the tree read
         and executed, grants and the rendezvous directory at their
         host paths, the network denied or granted whole, unix
