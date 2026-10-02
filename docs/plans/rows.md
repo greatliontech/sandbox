@@ -8,8 +8,8 @@ darwin row)
       only, reached by a host without unprivileged user namespaces
 - [ ] 2. The darwin row: a Seatbelt profile delivering the OS tier,
       so a Start on darwin succeeds and reports a tier
-  - [ ] 2.1. Triage gate.
-  - [ ] 2.2. The rows, the probe and the bounds: `sandbox-exec`
+  - [x] 2.1. Triage gate.
+  - [x] 2.2. The rows, the probe and the bounds: `sandbox-exec`
         probed for the `OS` row, the `Minimal` row beneath it;
         `Reach` by the same selection; the init trampoline (the
         calling binary re-executed, the config and status pipes, the
