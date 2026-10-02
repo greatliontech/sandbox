@@ -15,7 +15,7 @@ darwin row)
         calling binary re-executed, the config and status pipes, the
         process group) shared with Linux where it is the same;
         bounds by the kernel's rlimits where it enforces them (CPU,
-        open files, processes) and by a watchdog over the kernel's
+        open files) and by a watchdog over the kernel's
         per-process readings where it has no native bound (memory,
         and CPU behind the signal a payload may handle), reported as
         its own accounting with its interval; the spec amended so;

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -38,6 +39,7 @@ import (
 // early rlimits.
 type bounds struct {
 	accounting Accounting
+	cpu        time.Duration   // the CPU bound, which RLIMIT_CPU ends with a kill
 	cgroup     *nslinux.Cgroup // nil under rlimits
 	rlimits    []rlimit.Limit  // applied early in the init
 	late       []rlimit.Limit  // applied by the init right before exec
@@ -55,6 +57,7 @@ func selectBounds(ctx context.Context, l Limits, hierarchy *nslinux.Hierarchy) (
 	b := bounds{accounting: AccountingNone}
 	if l.CPUSeconds > 0 {
 		b.rlimits = append(b.rlimits, rlimit.Limit{Resource: unix.RLIMIT_CPU, Cur: l.CPUSeconds, Max: l.CPUSeconds})
+		b.cpu = time.Duration(l.CPUSeconds) * time.Second
 	}
 	if l.MaxFiles > 0 {
 		b.rlimits = append(b.rlimits, rlimit.Limit{Resource: unix.RLIMIT_NOFILE, Cur: l.MaxFiles, Max: l.MaxFiles})

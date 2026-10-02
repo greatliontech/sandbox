@@ -18,7 +18,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -274,27 +273,6 @@ func withoutSeatbelt(t *testing.T) {
 	t.Cleanup(func() { hostOverride = nil })
 }
 
-// output is the payload's captured output, readable while the run's
-// copier still writes it.
-type output struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (o *output) Write(p []byte) (int, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.buf.Write(p)
-}
-
-func (o *output) String() string {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.buf.String()
-}
-
-func (o *output) Len() int { return len(o.String()) }
-
 // payload is a spec running this binary as the payload in the named
 // mode, its output captured.
 func payload(mode string, env ...string) (Spec, *output) {
@@ -484,9 +462,12 @@ func TestRlimitsApplied(t *testing.T) {
 func TestProcessBoundKillsThreads(t *testing.T) {
 	spec, out := payload("threads", "SANDBOX_TEST_THREADS=300")
 	spec.Limits = Limits{MaxProcs: 100}
-	_, st := run(t, spec)
+	sb, st := run(t, spec)
 	if !st.Signaled || st.Signal != syscall.SIGKILL {
 		t.Fatalf("exit %+v, output %q; want a kill", st, out.String())
+	}
+	if stats, err := sb.Stats(); err != nil || stats.ProcessKills != 1 || stats.MemoryKills != 0 || stats.CPUKills != 0 {
+		t.Fatalf("stats %+v %v, want the watchdog's kill by the process bound", stats, err)
 	}
 	spec, out = payload("threads", "SANDBOX_TEST_THREADS=20")
 	spec.Limits = Limits{MaxProcs: 100}
@@ -638,8 +619,8 @@ func TestMemoryWatchdogKillsHog(t *testing.T) {
 		t.Fatalf("the hog's announcement: %v", f)
 	}
 	stats, err := sb.Stats()
-	if err != nil || stats.Accounting != AccountingWatchdog || stats.MemoryKills != 1 || stats.MemoryPeakBytes <= 64<<20 {
-		t.Fatalf("stats %+v %v, want the watchdog's kill past the bound", stats, err)
+	if err != nil || stats.Accounting != AccountingWatchdog || stats.MemoryKills != 1 || stats.CPUKills != 0 || stats.ProcessKills != 0 || stats.MemoryPeakBytes <= 64<<20 {
+		t.Fatalf("stats %+v %v, want the watchdog's kill by the memory bound past it", stats, err)
 	}
 }
 
@@ -649,12 +630,15 @@ func TestCPUWatchdogKillsSpinner(t *testing.T) {
 	spec, out := payload("spin")
 	spec.Limits = Limits{CPUSeconds: 1}
 	start := time.Now()
-	_, st := run(t, spec)
+	sb, st := run(t, spec)
 	if !st.Signaled || st.Signal != syscall.SIGKILL || facts(out.String())["spun"] == "yes" {
 		t.Fatalf("exit %+v after %v, output %q; want a kill", st, time.Since(start), out.String())
 	}
 	if elapsed := time.Since(start); elapsed > 20*time.Second {
 		t.Fatalf("the kill took %v", elapsed)
+	}
+	if stats, err := sb.Stats(); err != nil || stats.CPUKills != 1 || stats.MemoryKills != 0 || stats.ProcessKills != 0 {
+		t.Fatalf("stats %+v %v, want the watchdog's kill by the CPU bound", stats, err)
 	}
 }
 

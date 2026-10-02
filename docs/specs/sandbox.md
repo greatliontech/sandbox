@@ -169,22 +169,33 @@ independent by design.
   for root, which delivers the CPU limit as `SIGXCPU`, a signal a
   payload may handle, and whose process limit counts every process
   of the user — the row bounds by a watchdog: the kernel's own
-  per-process readings (the resident size, the CPU time, the thread
-  count), sampled over the run's process group at the stated
-  interval (`WatchdogInterval`), the group killed at the bound — the
-  memory bound over the group's resident sizes summed, the CPU bound
-  over each process's own time as `RLIMIT_CPU` reads it, the process
-  bound over the threads of the group's processes (every process
-  has at least one); a member the kernel will not show the sandbox
-  — one that gained privilege — is a bound the watchdog cannot
-  hold, which ends the run. Such a bound is
-  exceeded by at most what the group can take in one interval, and
-  it reaches what the group holds: a process that leaves the group
-  (`setsid`) leaves the bounds, the same escape that leaves the
-  kill tie, stated under "No orphans"; the accounting reported names
-  the watchdog. Which accounting
+  per-process readings (the physical footprint — the platform's own
+  measure of what a process costs, anonymous and compressed pages
+  included, file-backed pages not, what its memory-pressure limiter
+  reads — the CPU time, the thread count), sampled over the run's
+  process group at the stated interval (`WatchdogInterval`), the
+  group killed at the bound — the memory bound over the group's
+  footprints summed, the CPU bound over each process's own time as
+  `RLIMIT_CPU` reads it, the process bound over the threads of the
+  group's processes (every process has at least one); a member the
+  kernel will not show the sandbox — one that gained privilege — is
+  a bound the watchdog cannot hold, which ends the run. Such a bound
+  is exceeded by at most what the group can take in one interval,
+  and it reaches what the group holds: a process that leaves the
+  group (`setsid`) leaves the bounds, the same escape that leaves
+  the kill tie, stated under "No orphans"; the accounting reported
+  names the watchdog, and its one kill is counted by the bound that
+  made it (memory, CPU or process). Where the kernel holds a bound
+  the sign is the kernel's own, read for the caller: a memory
+  cgroup's kills and a pid cgroup's refused forks from the cgroup's
+  own counters, `RLIMIT_CPU`'s kill — its soft and hard limits one,
+  so the kernel ends the process at the limit rather than
+  signalling it — from the dead process's own CPU time at the bound
+  as the kernel accounts it, within the allowance the kernel's tick
+  and the reading's truncation leave; a memory or process rlimit refuses the payload alone,
+  an allocation or a fork, and kills nothing. Which accounting
   enforced the bounds is a reported fact of the run, so a
-  bound-exceeded death is attributable.
+  bound-exceeded death is attributable on every row delivered.
 - **The wall clock belongs to the caller.** `Start`'s context governs
   the process lifetime; sandbox adds no timeout of its own.
 - **No orphans, to the strongest tie the host affords.** Two triggers,
@@ -216,7 +227,7 @@ independent by design.
 |---|---|---|
 | linux, unprivileged user namespaces available | namespaces (user, mount, pid, uts, ipc; net unless granted), pivoted read-only root repeating locked mount flags, capability drop, seccomp holding for every syscall ABI the kernel exposes (a foreign-ABI call is killed, never let through unfiltered), `no_new_privs`, cgroup-or-rlimit bounds | `Strong` |
 | linux, user namespaces unavailable, Landlock available | Landlock filesystem allowlist over the world at its host paths (the caller's whole world where no `Root` is stated), seccomp network denial at the socket (Landlock ABI 4's TCP restrictions are supplementary, never the sole arm — UDP and raw sockets stay open without seccomp; an ABI that also multiplexes the socket calls through `socketcall` refuses that route whole, the local family reached by the direct calls), Landlock's IPC scoping where the kernel has it (ABI 6), `no_new_privs`, cgroup-or-rlimit bounds; static entrypoints only under a `Root` — an ELF the kernel loads whole, native, with no interpreter; a script, a dynamically linked executable, or a file the check cannot read is refused | `OS` |
-| darwin, Seatbelt available (`sandbox-exec` applies a profile) | Seatbelt profile: under a `Root`, nothing by default but the platform's execution substrate as Apple's own `system.sb` states it (dyld, the system libraries and frameworks, the services every process reaches, name resolution not among them) less the one place it lets a process create files (`/cores`), the tree read, mapped and executed at its host path so an entrypoint may load the tree's own libraries and execute a sibling of the tree, the calling binary read and executed (its second stage runs under the profile before the payload: an exposure of that binary's bytes and its execution to the payload), grants read, mapped and executed as on the Linux `OS` row and read-write ones written, the rendezvous directory read and written with unix sockets within it alone, the network by address where granted, the platform's name resolution with it (a unix socket elsewhere on the host is not the network); the entrypoint an executable Mach-O image for the machine — the machine being the one the calling binary runs for — whose dynamic linker, libraries and run paths are the substrate's or relative to the image and which sets no loader environment, a script or an image linked at an image-absolute path refused; a grant's two spellings of one directory (a firmlink's, a case variant's) judged one, by identity as everywhere; without a `Root`, the whole world with the network denied at the socket — the platform's mach services stay reachable, name resolution among them, as a row without namespaces leaves IPC — and a read-only grant refused, the profile over the whole world having no rule a renamed ancestor cannot carry a grant out of; the profile matching the kernel's own spelling of every path; rlimit bounds with the watchdog behind them | `OS` |
+| darwin, Seatbelt available (`sandbox-exec` applies a profile) | Seatbelt profile: under a `Root`, nothing by default but the platform's execution substrate as Apple's own `system.sb` states it (dyld, the system libraries and frameworks, the services every process reaches, name resolution not among them) less the one place it lets a process create files (`/cores`), the tree read, mapped and executed at its host path so an entrypoint may load the tree's own libraries and execute a sibling of the tree, the calling binary read and executed (its second stage runs under the profile before the payload: an exposure of that binary's bytes and its execution to the payload), grants read, mapped and executed as on the Linux `OS` row and read-write ones written, the rendezvous directory read and written with unix sockets within it alone, the network by address where granted, the platform's name resolution with it (a unix socket elsewhere on the host is not the network); the entrypoint an executable Mach-O image for the machine — the machine being the one the calling binary runs for; an image for another machine the host could translate is refused all the same — whose dynamic linker, libraries and run paths are the substrate's or relative to the image and which sets no loader environment, a script or an image linked at an image-absolute path refused; a grant's two spellings of one directory (a firmlink's, a case variant's) judged one, by identity as everywhere; without a `Root`, the whole world with the network denied at the socket — the platform's mach services stay reachable, name resolution among them, as a row without namespaces leaves IPC — and a read-only grant refused, the profile over the whole world having no rule a renamed ancestor cannot carry a grant out of; the profile matching the kernel's own spelling of every path; rlimit bounds with the watchdog behind them | `OS` |
 | windows, AppContainer available | AppContainer boundary, Job Object bounds | `OS` |
 | any platform where no security boundary is available but resource bounds are | resource bounds (rlimits, Job Object, darwin's watchdog) | `Minimal` |
 | anything else | refused (`ErrUnsupported`) | — |

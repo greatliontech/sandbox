@@ -436,18 +436,16 @@ func (s *darwinSandbox) Destroy() error {
 
 // Stats returns the run's accounting facts (docs/specs/sandbox.md,
 // "Bounded means bounded"): the mechanism that enforced the bounds,
-// and the watchdog's counters where it ran — the peak resident size
-// it saw and its kill by the memory bound. A kill by the CPU or the
-// process bound is the exit's signal alone: the Stats carry no
-// counter for those.
+// and the watchdog's counters where it ran — the peak footprint it
+// saw and its one kill, by the bound that made it.
 func (s *darwinSandbox) Stats() (Stats, error) {
 	if s.cmd == nil {
 		return Stats{}, errors.New("sandbox: not started")
 	}
 	st := Stats{Accounting: s.bounds.accounting()}
 	if s.bounds.watch != nil {
-		var err error
-		st.MemoryPeakBytes, st.MemoryKills, err = s.bounds.watch.stats()
+		peak, by, err := s.bounds.watch.stats()
+		st.MemoryPeakBytes, st.MemoryKills, st.CPUKills, st.ProcessKills = peak, by.memory, by.cpu, by.procs
 		if err != nil {
 			return st, err
 		}

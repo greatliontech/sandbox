@@ -63,30 +63,38 @@ func (b bounds) accounting() Accounting {
 	return AccountingNone
 }
 
-// watchdog samples the run's process group — the kernel's resident
-// size, CPU time and thread count of each member — and kills the
-// group at a bound: the memory bound over the members' resident
-// sizes summed, the CPU bound over each member's own time (the
-// per-process reading RLIMIT_CPU has on every row), the process
-// bound over the threads of the group's processes summed (every
-// process has at least one). It counts what
-// it enforced: the peak resident size seen and the one kill a bound
-// made; a failure to read the group is a bound it could not hold,
-// which kills the run and is reported from Wait.
+// watchdog samples the run's process group — the kernel's physical
+// footprint, CPU time and thread count of each member — and kills
+// the group at a bound: the memory bound over the members'
+// footprints summed (the platform's own measure of what a process
+// costs, anonymous and compressed pages included, file-backed pages
+// not: what its memory-pressure limiter reads), the CPU bound over
+// each member's own time (the per-process reading RLIMIT_CPU has on
+// every row), the process bound over the threads of the group's
+// processes summed (every process has at least one). It counts what
+// it enforced: the peak footprint seen and the one kill a bound
+// made, by which bound; a failure to read the group is a bound it
+// could not hold, which kills the run and is reported from Wait.
 type watchdog struct {
 	memory   uint64
 	cpu      time.Duration
 	procs    uint64
 	interval time.Duration
 
-	mu       sync.Mutex
-	group    group
-	peak     uint64
-	memKills uint64
-	killed   bool
-	err      error
-	stop     chan struct{}
-	done     chan struct{}
+	mu     sync.Mutex
+	group  group
+	peak   uint64
+	kills  kills
+	killed bool
+	err    error
+	stop   chan struct{}
+	done   chan struct{}
+}
+
+// kills counts the watchdog's kills by the bound that made each:
+// one at most, the group being killed once.
+type kills struct {
+	memory, cpu, procs uint64
 }
 
 // start begins sampling the group.
@@ -139,42 +147,53 @@ func (w *watchdog) sample() bool {
 	if len(members) == 0 {
 		return false
 	}
-	var rss, threads uint64
-	var over bool
+	var footprint, threads uint64
+	var cpuOver bool
 	for _, m := range members {
-		ti, err := taskInfo(int(m.Proc.P_pid))
-		if errors.Is(err, unix.EPERM) {
-			// A member the kernel will not show this process — one
-			// that gained privilege, a setuid exec — is a bound the
-			// watchdog cannot hold.
-			w.fail(fmt.Errorf("sandbox: the watchdog could not read process %d of the run: %w", m.Proc.P_pid, err))
-			return false
+		pid := int(m.Proc.P_pid)
+		ru, err := rusage(pid)
+		if err == nil {
+			var ti taskReadings
+			if ti, err = taskInfo(pid); err == nil {
+				ru.threads = ti.threads
+			}
+		}
+		if errors.Is(err, unix.ESRCH) {
+			continue // exited between the listing and the reading
 		}
 		if err != nil {
-			continue
+			// A member the kernel will not show this process — one
+			// that gained privilege, a setuid exec (EPERM) — or a
+			// reading the kernel refuses is a bound the watchdog
+			// cannot hold: a member it cannot read is not a member
+			// known to be in bounds.
+			w.fail(fmt.Errorf("sandbox: the watchdog could not read process %d of the run: %w", pid, err))
+			return false
 		}
-		rss += ti.resident
-		threads += ti.threads
-		if w.cpu > 0 && ti.user+ti.system > w.cpu {
-			over = true
+		footprint += ru.footprint
+		threads += ru.threads
+		if w.cpu > 0 && ru.user+ru.system > w.cpu {
+			cpuOver = true
 		}
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if rss > w.peak {
-		w.peak = rss
+	if footprint > w.peak {
+		w.peak = footprint
 	}
-	if w.memory > 0 && rss > w.memory {
-		if !w.killed {
-			w.memKills++
-		}
-		over = true
-	}
-	if w.procs > 0 && threads > w.procs {
-		over = true
-	}
-	if !over {
+	var by *uint64
+	switch {
+	case w.memory > 0 && footprint > w.memory:
+		by = &w.kills.memory
+	case cpuOver:
+		by = &w.kills.cpu
+	case w.procs > 0 && threads > w.procs:
+		by = &w.kills.procs
+	default:
 		return true
+	}
+	if !w.killed {
+		*by++
 	}
 	w.killed = true
 	_ = w.group.kill()
@@ -192,18 +211,20 @@ func (w *watchdog) fail(err error) {
 	_ = w.group.kill()
 }
 
-// stats is the watchdog's account so far.
-func (w *watchdog) stats() (peak, memKills uint64, err error) {
+// stats is the watchdog's account so far: the peak footprint, its
+// kills by bound, and the bound it could not hold.
+func (w *watchdog) stats() (peak uint64, by kills, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.peak, w.memKills, w.err
+	return w.peak, w.kills, w.err
 }
 
 // taskReadings are the kernel's per-process readings the watchdog
-// reads: the resident size, the CPU time (user and system) and the
-// thread count.
+// reads: the resident size and physical footprint, the CPU time
+// (user and system) and the thread count.
 type taskReadings struct {
 	resident     uint64
+	footprint    uint64
 	user, system time.Duration
 	threads      uint64
 }
@@ -213,10 +234,10 @@ type taskReadings struct {
 // PROC_PIDTASKINFO), which an unprivileged process may read for its
 // own user's processes. The task info struct opens with the virtual
 // and resident sizes and the total user and system times, each eight
-// bytes, in that order — the times in the kernel's timebase ticks
-// (hw.tbfrequency of them a second: twenty-four million on Apple
-// silicon, a thousand million on Intel), converted here — and
-// carries the thread count as a four-byte integer at byte 84.
+// bytes, in that order — the times in the kernel's timebase ticks —
+// and carries the thread count as a four-byte integer at byte 84.
+// The watchdog reads it for the thread count; the rest is read in
+// full as the oracle the resource-usage reading is checked against.
 func taskInfo(pid int) (taskReadings, error) {
 	const (
 		callPidInfo      = 2
@@ -235,20 +256,74 @@ func taskInfo(pid int) (taskReadings, error) {
 	if n != taskInfoSize {
 		return taskReadings{}, fmt.Errorf("proc_info: %d bytes, want %d", n, taskInfoSize)
 	}
-	freq, err := timebase()
+	r := procReading(buf[:])
+	user, err := r.ticks(userTimeOffset)
 	if err != nil {
 		return taskReadings{}, err
 	}
-	at := func(off int) uint64 { return *(*uint64)(unsafe.Pointer(&buf[off])) }
-	ticks := func(off int) time.Duration {
-		return time.Duration(float64(at(off)) * float64(time.Second) / float64(freq))
+	system, err := r.ticks(systemTimeOffset)
+	if err != nil {
+		return taskReadings{}, err
 	}
 	return taskReadings{
-		resident: at(residentOffset),
-		user:     ticks(userTimeOffset),
-		system:   ticks(systemTimeOffset),
+		resident: r.at(residentOffset),
+		user:     user,
+		system:   system,
 		threads:  uint64(*(*int32)(unsafe.Pointer(&buf[threadsOffset]))),
 	}, nil
+}
+
+// rusage reads a process's resource usage through the kernel's
+// proc_info interface (the libproc call proc_pid_rusage wraps: call
+// 9, flavor RUSAGE_INFO_V0, which the kernel answers with no byte
+// count): a sixteen-byte uuid, then the user and system times, the
+// package idle and interrupt wakeups, the pageins, the wired and
+// resident sizes and the physical footprint, each eight bytes in
+// that order — the times in the kernel's timebase ticks — then the
+// process's start and exit times.
+func rusage(pid int) (taskReadings, error) {
+	const (
+		callPidRusage    = 9
+		flavorV0         = 0
+		rusageSize       = 96
+		userTimeOffset   = 16
+		systemTimeOffset = 24
+		residentOffset   = 64
+		footprintOffset  = 72
+	)
+	var buf [rusageSize]byte
+	if _, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, callPidRusage, uintptr(pid), flavorV0, 0, uintptr(unsafe.Pointer(&buf[0])), 0); errno != 0 {
+		return taskReadings{}, errno
+	}
+	r := procReading(buf[:])
+	user, err := r.ticks(userTimeOffset)
+	if err != nil {
+		return taskReadings{}, err
+	}
+	system, err := r.ticks(systemTimeOffset)
+	if err != nil {
+		return taskReadings{}, err
+	}
+	return taskReadings{
+		resident:  r.at(residentOffset),
+		footprint: r.at(footprintOffset),
+		user:      user,
+		system:    system,
+	}, nil
+}
+
+// procReading decodes a proc_info buffer: eight-byte fields at their
+// offsets, times in the kernel's timebase ticks.
+type procReading []byte
+
+func (r procReading) at(off int) uint64 { return *(*uint64)(unsafe.Pointer(&r[off])) }
+
+func (r procReading) ticks(off int) (time.Duration, error) {
+	freq, err := timebase()
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(float64(r.at(off)) * float64(time.Second) / float64(freq)), nil
 }
 
 // timebase is the kernel's timebase frequency in ticks a second, read

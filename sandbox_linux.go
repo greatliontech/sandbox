@@ -11,13 +11,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	seccomp "github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
 
 	"github.com/greatliontech/sandbox/internal/nslinux"
 	"github.com/greatliontech/sandbox/internal/rlimit"
+	"golang.org/x/sys/unix"
 )
 
 // initConfig is the JSON payload handed to the re-exec'd init process.
@@ -50,6 +54,9 @@ type linuxSandbox struct {
 	cmd    *exec.Cmd
 	bounds bounds
 	final  *Stats // the accounting read at Wait, before the cgroup went
+	// cpuKills is the CPU bound's kill, told at the reap from the dead
+	// process's CPU time (Wait).
+	cpuKills uint64
 
 	waited  bool // Wait's outcome is memoized: Destroy waits too
 	status  ExitStatus
@@ -342,12 +349,30 @@ func (s *linuxSandbox) Wait() (ExitStatus, error) {
 		return s.status, s.waitErr
 	}
 	s.waited = true
+	// The payload's own CPU time is read from its zombie before the
+	// reap: the reap's rusage adds the time of every child the payload
+	// reaped, which RLIMIT_CPU, a bound on the process alone, never
+	// counts.
+	own, ownErr := zombieCPUTime(s.cmd.Process.Pid)
 	status, err := reaped(s.cmd, s.cmd.Wait())
 	if err != nil {
 		s.waitErr = err
 		return ExitStatus{}, errors.Join(err, s.release())
 	}
 	s.status = status
+	// RLIMIT_CPU ends the run with a kill at the limit, its soft and
+	// hard limits one; the kill is the bound's where the dead
+	// process's own CPU time reached the bound within the allowance
+	// (cpuAllowance): the kernel checks the limit on its tick against
+	// a group timer that can run a tick ahead of the time accounted,
+	// and the zombie's time is read in two separately truncated clock
+	// ticks. A shortfall past the allowance leaves a bound's kill
+	// unattributed, never attributes another's; a kill by another
+	// hand within the allowance of the bound is misattributed, the
+	// cost of the allowance.
+	if s.bounds.cpu > 0 && status.Signaled && status.Signal == syscall.SIGKILL && ownErr == nil && own >= s.bounds.cpu-cpuAllowance {
+		s.cpuKills = 1
+	}
 	if s.bounds.cgroup != nil {
 		st, serr := s.bounds.stats()
 		if serr != nil {
@@ -402,9 +427,62 @@ func (s *linuxSandbox) Destroy() error {
 
 func (s *linuxSandbox) Stats() (Stats, error) {
 	if s.final != nil {
-		return *s.final, nil
+		st := *s.final
+		st.CPUKills = s.cpuKills
+		return st, nil
 	}
-	return s.bounds.stats()
+	st, err := s.bounds.stats()
+	st.CPUKills = s.cpuKills
+	return st, err
+}
+
+// cpuAllowance is how far the CPU time read from a zombie may fall
+// short of the bound RLIMIT_CPU killed it at: the coarsest scheduler
+// tick a Linux kernel checks the limit on (HZ=100, 10ms), and the
+// two clock ticks (USER_HZ, 10ms each) the zombie's user and system
+// times are separately truncated to.
+const cpuAllowance = 30 * time.Millisecond
+
+// zombieCPUTime waits for the process to exit without reaping it and
+// reads its own user and system CPU time from its zombie — the
+// process's alone, as /proc/<pid>/stat keeps it apart from its
+// reaped children's — before the caller reaps it; a process that is
+// no zombie under that pid (the caller's /proc belonging to another
+// pid namespace) is refused.
+func zombieCPUTime(pid int) (time.Duration, error) {
+	var info unix.Siginfo
+	for {
+		err := unix.Waitid(unix.P_PID, pid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+		if err != unix.EINTR {
+			if err != nil {
+				return 0, err
+			}
+			break
+		}
+	}
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	// The fields after the parenthesized command name: the state
+	// first, the user and system times the twelfth and thirteenth.
+	rest := strings.Fields(string(stat[strings.LastIndexByte(string(stat), ')')+1:]))
+	if len(rest) < 13 {
+		return 0, fmt.Errorf("/proc/%d/stat: %d fields after the name", pid, len(rest))
+	}
+	if rest[0] != "Z" {
+		return 0, fmt.Errorf("/proc/%d/stat: no zombie under that pid (state %s)", pid, rest[0])
+	}
+	var ticks uint64
+	for _, f := range rest[11:13] {
+		n, err := strconv.ParseUint(f, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("/proc/%d/stat: %w", pid, err)
+		}
+		ticks += n
+	}
+	const userHz = 100 // USER_HZ, fixed by the ABI at a hundred on every architecture Go runs on
+	return time.Duration(ticks) * time.Second / userHz, nil
 }
 
 // cloneFlags returns the namespace creation flags. Network isolation (a new,
