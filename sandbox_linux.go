@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	"syscall"
 
 	seccomp "github.com/elastic/go-seccomp-bpf"
@@ -49,15 +48,6 @@ type initConfig struct {
 	Cmd         string                 `json:"cmd"`
 	Args        []string               `json:"args,omitempty"`
 	Env         []string               `json:"env"`
-}
-
-// bind is one path exposed into the world: the host source, the
-// canonical target it lands on (inside the tree under a Root, the
-// canonical host path otherwise), and whether it is read-only.
-type bind struct {
-	Source   string `json:"source"`
-	Target   string `json:"target"`
-	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
 type linuxSandbox struct {
@@ -338,111 +328,19 @@ func resolveWorld(spec Spec, r row, landlockABI int) (world, error) {
 	case OS:
 		checkEntry = func(p string) error { return checkELF(p, spec.Root != "") }
 	}
-	w := world{cmd: spec.Exec, workDir: spec.WorkDir}
-	var root string
-	if spec.Root == "" {
-		if err := checkEntry(spec.Exec); err != nil {
-			return undeliverable("exec %s: %v", spec.Exec, err)
-		}
-	} else {
-		var err error
-		root, err = filepath.EvalSymlinks(spec.Root)
-		if err != nil {
-			return undeliverable("root %s: %v", spec.Root, err)
-		}
-		fi, err := os.Stat(root)
-		if err != nil {
-			return undeliverable("root %s: %v", spec.Root, err)
-		}
-		if !fi.IsDir() {
-			return undeliverable("root %s is not a directory", spec.Root)
-		}
-		fi, resolved, err := statInTree(root, spec.Exec)
-		if err != nil {
-			return undeliverable("exec %s is not in the tree: %v", spec.Exec, err)
-		}
-		if fi.IsDir() {
-			return undeliverable("exec %s is a directory in the tree", spec.Exec)
-		}
-		if err := checkEntry(filepath.Join(root, resolved)); err != nil {
-			return undeliverable("exec %s: %v", spec.Exec, err)
-		}
-		w.root = root
-		if r.tier == OS {
-			// The tree at its host path: the entrypoint inside it, and
-			// the working directory too — the tree's root where none is
-			// stated, as the pivoted row's "/" is, never the caller's.
-			w.cmd = filepath.Join(root, resolved)
-			w.workDir = root
-		}
+	t, err := resolveTree(spec, checkEntry)
+	if err != nil {
+		return world{}, err
+	}
+	w := world{cmd: spec.Exec, workDir: spec.WorkDir, root: t.root}
+	if t.root != "" && r.tier == OS {
+		// The tree at its host path: the entrypoint inside it, and
+		// the working directory too — the tree's root where none is
+		// stated, as the pivoted row's "/" is, never the caller's.
+		w.cmd = filepath.Join(t.root, t.exec)
+		w.workDir = t.root
 		if spec.WorkDir != "" {
-			fi, _, err := statInTree(root, spec.WorkDir)
-			if err != nil {
-				return undeliverable("workdir %s is not in the tree: %v", spec.WorkDir, err)
-			}
-			if !fi.IsDir() {
-				return undeliverable("workdir %s is not a directory in the tree", spec.WorkDir)
-			}
-			if r.tier == OS {
-				w.workDir = filepath.Join(root, spec.WorkDir)
-			}
-		}
-	}
-	// A grant whose host path lies within the tree, or holds it — the
-	// host's root over the tree's included — would make the tree
-	// writable through the grant, which "never written" forbids;
-	// judged on the host paths before anything else is asked of them.
-	if root != "" {
-		type stated struct{ path, what string }
-		var paths []stated
-		for _, g := range spec.PathGrants {
-			paths = append(paths, stated{g.Path, "grant"})
-		}
-		if spec.RuntimeDir != "" {
-			paths = append(paths, stated{spec.RuntimeDir, "runtime dir"})
-		}
-		for _, p := range paths {
-			if !filepath.IsAbs(p.path) || filepath.Clean(p.path) != p.path {
-				continue // resolveGrant refuses it by name
-			}
-			host, err := filepath.EvalSymlinks(p.path)
-			if err != nil {
-				continue // resolveGrant refuses it by name
-			}
-			switch {
-			case host == root:
-				return undeliverable("%s %s is the tree %s", p.what, p.path, spec.Root)
-			case within(host, root):
-				return undeliverable("%s %s lies within the tree %s", p.what, p.path, spec.Root)
-			case within(root, host):
-				return undeliverable("%s %s holds the tree %s", p.what, p.path, spec.Root)
-			}
-		}
-	}
-	var binds []bind
-	for _, g := range spec.PathGrants {
-		b, err := resolveGrant(root, g.Path, "grant")
-		if err != nil {
-			return world{}, err
-		}
-		b.ReadOnly = g.Access == ReadOnly
-		binds = append(binds, b)
-	}
-	if spec.RuntimeDir != "" {
-		b, err := resolveGrant(root, spec.RuntimeDir, "runtime dir")
-		if err != nil {
-			return world{}, err
-		}
-		binds = append(binds, b)
-	}
-	// Overlap is judged on the canonical targets, where two stated
-	// spellings of one directory — or a symlink into another grant's
-	// subtree — meet.
-	for i, a := range binds {
-		for _, b := range binds[i+1:] {
-			if a.Target == b.Target || strings.HasPrefix(a.Target, b.Target+"/") || strings.HasPrefix(b.Target, a.Target+"/") {
-				return undeliverable("grants %s and %s overlap", a.Source, b.Source)
-			}
+			w.workDir = filepath.Join(t.root, spec.WorkDir)
 		}
 	}
 	// A row without a mount namespace binds nothing: its read-write
@@ -450,9 +348,9 @@ func resolveWorld(spec Spec, r row, landlockABI int) (world, error) {
 	// are. The OS row allowlists them there instead.
 	switch r.tier {
 	case Strong:
-		w.binds = binds
+		w.binds = t.binds
 	case OS:
-		w.landlock = landlockRules(root, binds, landlockABI)
+		w.landlock = landlockRules(t.root, t.binds, landlockABI)
 	}
 	return w, nil
 }
@@ -480,116 +378,6 @@ func landlockRules(root string, binds []bind, abi int) []nslinux.LandlockRule {
 		rules = append(rules, nslinux.LandlockRule{Path: b.Source, Access: access})
 	}
 	return rules
-}
-
-// within reports whether the canonical path p lies strictly beneath
-// the canonical directory dir — every path but "/" lies beneath "/".
-func within(p, dir string) bool {
-	if dir == "/" {
-		return p != "/"
-	}
-	return strings.HasPrefix(p, dir+"/")
-}
-
-// resolveGrant validates one stated path and computes its bind.
-func resolveGrant(root, p, what string) (bind, error) {
-	if !filepath.IsAbs(p) || filepath.Clean(p) != p {
-		return bind{}, fmt.Errorf("%w: %s %q is not a clean absolute path", ErrUndeliverable, what, p)
-	}
-	host, err := os.Stat(p)
-	if err != nil {
-		return bind{}, fmt.Errorf("%w: %s %s: %v", ErrUndeliverable, what, p, err)
-	}
-	if root == "" {
-		target, err := filepath.EvalSymlinks(p)
-		if err != nil {
-			return bind{}, fmt.Errorf("%w: %s %s: %v", ErrUndeliverable, what, p, err)
-		}
-		return bind{Source: p, Target: target}, nil
-	}
-	// Every component of the target, walked from the tree down, must
-	// be a real entry: a symlink anywhere on the way is a target the
-	// bind and the pivoted process would resolve differently.
-	dir := root
-	for _, seg := range strings.Split(strings.TrimPrefix(p, "/"), "/") {
-		dir = filepath.Join(dir, seg)
-		fi, err := os.Lstat(dir)
-		if err != nil {
-			return bind{}, fmt.Errorf("%w: %s %s has no target in the tree: %v", ErrUndeliverable, what, p, err)
-		}
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return bind{}, fmt.Errorf("%w: %s %s passes through a symlink in the tree (%s)", ErrUndeliverable, what, p, strings.TrimPrefix(dir, root))
-		}
-		if dir == filepath.Join(root, p) && fi.IsDir() != host.IsDir() {
-			return bind{}, fmt.Errorf("%w: %s %s is a %s on the host but a %s in the tree", ErrUndeliverable, what, p, kind(host.IsDir()), kind(fi.IsDir()))
-		}
-	}
-	return bind{Source: p, Target: filepath.Join(root, p)}, nil
-}
-
-func kind(dir bool) string {
-	if dir {
-		return "directory"
-	}
-	return "file"
-}
-
-// statInTree stats a tree-absolute path the way the pivoted process
-// will see it: symlinks are chased inside the tree, an absolute
-// target re-rooted at the tree and ".." clamped at it, with the
-// kernel's own bound on chained links. root must be canonical.
-func statInTree(root, p string) (os.FileInfo, string, error) {
-	const maxLinks = 40
-	links := 0
-	// rest holds the components still to walk; cur is the tree-absolute
-	// directory resolved so far. The stated path is walked as written:
-	// a lexical clean-up would apply ".." before the symlink it
-	// follows, which is not what the kernel does.
-	rest := strings.Split(strings.TrimPrefix(p, "/"), "/")
-	cur := "/"
-	for len(rest) > 0 {
-		seg := rest[0]
-		rest = rest[1:]
-		switch seg {
-		case "", ".":
-			continue
-		case "..":
-			cur = filepath.Dir(cur)
-			continue
-		}
-		next := filepath.Join(cur, seg)
-		fi, err := os.Lstat(filepath.Join(root, next))
-		if err != nil {
-			return nil, "", err
-		}
-		if fi.Mode()&os.ModeSymlink == 0 {
-			if len(rest) == 0 {
-				return fi, next, nil
-			}
-			if !fi.IsDir() {
-				return nil, "", &os.PathError{Op: "stat", Path: p, Err: syscall.ENOTDIR}
-			}
-			cur = next
-			continue
-		}
-		links++
-		if links > maxLinks {
-			return nil, "", &os.PathError{Op: "stat", Path: p, Err: syscall.ELOOP}
-		}
-		target, err := os.Readlink(filepath.Join(root, next))
-		if err != nil {
-			return nil, "", err
-		}
-		// The link's target is cleaned only of its spelling (trailing
-		// slashes); its own ".." components are walked like any other.
-		targetSegs := strings.Split(strings.Trim(target, "/"), "/")
-		if filepath.IsAbs(target) {
-			cur = "/"
-		}
-		rest = append(targetSegs, rest...)
-	}
-	fi, err := os.Lstat(filepath.Join(root, cur))
-	return fi, cur, err
 }
 
 // checkELF refuses an entrypoint built for a foreign machine: the

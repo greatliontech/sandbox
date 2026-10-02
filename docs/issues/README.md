@@ -6,4 +6,3 @@ issue file deleted — git holds history.
 
 | Issue | Summary | Lands |
 |---|---|---|
-| [darwin-root-world](darwin-root-world.md) | the darwin row refuses a stated `Root` until the Seatbelt row's world is delivered | docs/plans/rows.md, chunk 2.3 |

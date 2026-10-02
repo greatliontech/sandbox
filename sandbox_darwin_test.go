@@ -154,6 +154,53 @@ func TestMain(m *testing.M) {
 	case "sleep":
 		time.Sleep(5 * time.Minute)
 		os.Exit(0)
+	case "world":
+		// Report what the world lets this process see and touch, one
+		// fact a line: the arguments name the tree, a read-only grant,
+		// a read-write grant, the rendezvous directory and a path
+		// outside the tree (each may be empty).
+		tree, ro, rw, rt, outside := os.Args[1], os.Args[2], os.Args[3], os.Args[4], os.Args[5]
+		cwd, _ := os.Getwd()
+		fmt.Printf("cwd=%s\n", cwd)
+		fmt.Printf("env=%d\n", len(os.Environ()))
+		_, err := os.ReadFile(filepath.Join(tree, "etc", "tree-marker"))
+		fmt.Printf("readtree=%v\n", err)
+		_, err = os.ReadFile(outside)
+		fmt.Printf("readoutside=%v\n", err)
+		fmt.Printf("writetree=%v\n", os.WriteFile(filepath.Join(tree, "etc", "w"), []byte("x"), 0o644))
+		if ro != "" {
+			fmt.Printf("writero=%v\n", os.WriteFile(filepath.Join(ro, "w"), []byte("x"), 0o644))
+			_, err = os.ReadDir(ro)
+			fmt.Printf("readro=%v\n", err)
+		}
+		if rw != "" {
+			fmt.Printf("writerw=%v\n", os.WriteFile(filepath.Join(rw, "w"), []byte("x"), 0o644))
+		}
+		if rt != "" {
+			l, err := net.Listen("unix", filepath.Join(rt, "s"))
+			if err == nil {
+				l.Close()
+			}
+			fmt.Printf("unixrt=%v\n", err)
+			l, err = net.Listen("unix", filepath.Join(filepath.Dir(outside), "s"))
+			if err == nil {
+				l.Close()
+			}
+			fmt.Printf("unixout=%v\n", err)
+		}
+		c, err := net.DialTimeout("tcp", "1.1.1.1:443", 3*time.Second)
+		if c != nil {
+			c.Close()
+		}
+		fmt.Printf("net=%v\n", err)
+		out, err := exec.Command("/bin/ls", "/").CombinedOutput()
+		fmt.Printf("execout=%v\n", err)
+		_ = out
+		sib := exec.Command(filepath.Join(tree, "sibling"))
+		sib.Env = []string{childEnv + "=hello"}
+		sout, err := sib.Output()
+		fmt.Printf("sibling=%v:%s\n", err, strings.TrimSpace(string(sout)))
+		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown child mode %q\n", mode)
 		os.Exit(2)
@@ -315,7 +362,6 @@ func TestMinimalRefusesUndeliverable(t *testing.T) {
 		return s
 	}
 	for name, mutate := range map[string]func(*Spec){
-		"a root":           func(s *Spec) { s.Root = t.TempDir() },
 		"a hostname":       func(s *Spec) { s.Hostname = "box" },
 		"a denied network": func(s *Spec) { s.Network = false },
 		"a read-only grant": func(s *Spec) {
@@ -632,7 +678,6 @@ func TestStartRefusals(t *testing.T) {
 	cases := map[string]func(*Spec){
 		"a missing entrypoint":  func(s *Spec) { s.Exec = filepath.Join(t.TempDir(), "nope") },
 		"a relative entrypoint": func(s *Spec) { s.Exec = "relative" },
-		"a root":                func(s *Spec) { s.Root = t.TempDir() },
 		"a hostname":            func(s *Spec) { s.Hostname = "box" },
 		"an absent working directory": func(s *Spec) {
 			s.WorkDir = filepath.Join(t.TempDir(), "absent")
@@ -651,6 +696,193 @@ func TestStartRefusals(t *testing.T) {
 		}
 		if out.Len() != 0 {
 			t.Errorf("%s: something ran: %q", name, out.String())
+		}
+	}
+}
+
+// rootTree builds a tree with this binary as the entrypoint and as a
+// sibling, a marker file, and directories for a read-only grant, a
+// read-write grant and the rendezvous directory; the tree's path is
+// returned as the host spells it.
+func rootTree(t *testing.T) string {
+	t.Helper()
+	tree := must(filepath.EvalSymlinks(t.TempDir()))
+	exe := must(os.Executable())
+	b := must(os.ReadFile(exe))
+	for _, name := range []string{"payload", "sibling"} {
+		if err := os.WriteFile(filepath.Join(tree, name), b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, d := range []string{"etc", "grant-ro", "grant-rw", "run"} {
+		if err := os.Mkdir(filepath.Join(tree, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(tree, "etc", "tree-marker"), []byte("tree"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return tree
+}
+
+// TestRootWorld pins the OS row's world under a Root on this platform
+// (docs/specs/sandbox.md, "Root is world-restriction"): the tree
+// readable and executable at its host path and nothing else of the
+// host but the platform's substrate; the tree never written; a
+// read-only grant read, a read-write grant written; unix sockets
+// within the rendezvous directory alone; the network denied; a
+// sibling of the tree executed by the entrypoint, the host's
+// binaries not; the environment exactly the stated; the working
+// directory the tree's root.
+func TestRootWorld(t *testing.T) {
+	requireSeatbelt(t)
+	tree := rootTree(t)
+	outsideDir := must(filepath.EvalSymlinks(t.TempDir()))
+	outside := filepath.Join(outsideDir, "secret")
+	if err := os.WriteFile(outside, []byte("s"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The grants and the rendezvous directory exist on the host at
+	// their own paths and in the tree at the same paths, as the tree
+	// resolution requires.
+	hostRO, hostRW, hostRT := must(filepath.EvalSymlinks(t.TempDir())), must(filepath.EvalSymlinks(t.TempDir())), must(filepath.EvalSymlinks(t.TempDir()))
+	for _, d := range []string{hostRO, hostRW, hostRT} {
+		if err := os.MkdirAll(filepath.Join(tree, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := &output{}
+	spec := Spec{
+		Exec:       "/payload",
+		Args:       []string{tree, hostRO, hostRW, hostRT, outside},
+		Env:        []string{childEnv + "=world", "ONE=1"},
+		Root:       tree,
+		PathGrants: []PathGrant{{Path: hostRO, Access: ReadOnly}, {Path: hostRW, Access: ReadWrite}},
+		RuntimeDir: hostRT,
+		Stdout:     out,
+		Stderr:     os.Stderr,
+	}
+	sb, st := run(t, spec)
+	if st.Code != 0 || sb.Tier() != OS {
+		t.Fatalf("exit %+v, tier %v, output %q", st, sb.Tier(), out.String())
+	}
+	f := facts(out.String())
+	denied := func(key string) {
+		t.Helper()
+		if !strings.Contains(f[key], "operation not permitted") {
+			t.Errorf("%s = %q, want denied", key, f[key])
+		}
+	}
+	allowed := func(key string) {
+		t.Helper()
+		if f[key] != "<nil>" {
+			t.Errorf("%s = %q, want allowed", key, f[key])
+		}
+	}
+	if f["cwd"] != tree {
+		t.Errorf("cwd = %q, want the tree %q", f["cwd"], tree)
+	}
+	if f["env"] != "2" {
+		t.Errorf("env = %q entries, want the two stated", f["env"])
+	}
+	allowed("readtree")
+	denied("readoutside")
+	denied("writetree")
+	allowed("readro")
+	denied("writero")
+	allowed("writerw")
+	allowed("unixrt")
+	denied("unixout")
+	denied("net")
+	denied("execout")
+	if !strings.HasPrefix(f["sibling"], "<nil>:hello=yes") {
+		t.Errorf("sibling = %q, want the sibling executed", f["sibling"])
+	}
+	if _, err := os.Stat(filepath.Join(tree, "etc", "w")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the tree was written: %v", err)
+	}
+}
+
+// TestRootRefusals pins what the Root world refuses before anything
+// runs: an entrypoint that is no Mach-O image (a script), a grant
+// with no target in the tree, and the undeliverable intents the
+// shared tree resolution names.
+func TestRootRefusals(t *testing.T) {
+	requireSeatbelt(t)
+	tree := rootTree(t)
+	if err := os.WriteFile(filepath.Join(tree, "script"), []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, spec := range map[string]Spec{
+		"a script":                   {Exec: "/script", Root: tree},
+		"a missing entrypoint":       {Exec: "/nope", Root: tree},
+		"a grant absent in the tree": {Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: must(filepath.EvalSymlinks(t.TempDir())), Access: ReadWrite}}},
+		"a hostname":                 {Exec: "/payload", Root: tree, Hostname: "box"},
+		"a root that is a file":      {Exec: "/payload", Root: filepath.Join(tree, "etc", "tree-marker")},
+	} {
+		spec.Env = []string{childEnv + "=hello"}
+		sb, err := New(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) {
+			t.Errorf("%s: %v, want ErrUndeliverable", name, err)
+			sb.Destroy()
+		}
+	}
+}
+
+// TestImageRelative pins the entrypoint rule's reading of a library
+// path: the substrate's and the image-relative admitted, an
+// image-absolute path elsewhere not.
+func TestImageRelative(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/usr/lib/libSystem.B.dylib":                                         true,
+		"/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation": true,
+		"@executable_path/../lib/libfoo.dylib":                               true,
+		"@loader_path/libbar.dylib":                                          true,
+		"@rpath/libbaz.dylib":                                                true,
+		"/opt/homebrew/lib/libfoo.dylib":                                     false,
+		"/usr/local/lib/libfoo.dylib":                                        false,
+		"/lib/libc.dylib":                                                    false,
+	} {
+		if got := imageRelative(p); got != want {
+			t.Errorf("imageRelative(%q) = %v, want %v", p, got, want)
+		}
+	}
+}
+
+// TestCheckMachO pins the entrypoint check on this binary (libSystem
+// alone) and on a script.
+func TestCheckMachO(t *testing.T) {
+	if err := checkMachO(must(os.Executable())); err != nil {
+		t.Fatalf("this binary: %v", err)
+	}
+	script := filepath.Join(t.TempDir(), "s")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkMachO(script); err == nil || !strings.Contains(err.Error(), "Mach-O") {
+		t.Fatalf("a script: %v", err)
+	}
+}
+
+// TestSBPLString pins the profile's quoting.
+func TestSBPLString(t *testing.T) {
+	for in, want := range map[string]string{
+		"/plain/path":   `"/plain/path"`,
+		`/with "quote"`: `"/with \"quote\""`,
+		`/back\slash`:   `"/back\\slash"`,
+		"/café":         "\"/café\"",
+	} {
+		got, err := sbplString(in)
+		if err != nil || got != want {
+			t.Errorf("sbplString(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"/control\x01", "/bad\xff"} {
+		if _, err := sbplString(in); err == nil {
+			t.Errorf("sbplString(%q) accepted", in)
 		}
 	}
 }
