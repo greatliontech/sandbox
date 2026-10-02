@@ -24,13 +24,16 @@ import (
 // accounting enforced the memory and process bounds is reported, so
 // a bound-exceeded death is attributable.
 //
-// The process-count bound is the one limit that must not take effect
-// before exec: the init that composes the world is a multithreaded Go
-// process, and a count that fits the payload does not fit the init.
-// So the init applies it itself as its last act before exec — the
+// The process-count and address-space bounds are the limits that
+// must not take effect before exec: the init that composes the
+// world is a multithreaded Go process, and a count that fits the
+// payload does not fit the init, nor does an address space the
+// runtime's arena reservations outgrow (a reservation refused is
+// the runtime's fatal "out of memory", the init dead before exec).
+// So the init applies them itself as its last act before exec — the
 // pids.max of the cgroup it was born into (opened before the pivot
 // takes the host view away, written after hardening), or
-// RLIMIT_NPROC — while every other limit lands at clone or with the
+// RLIMIT_NPROC, and RLIMIT_AS — while every other limit lands at clone or with the
 // early rlimits.
 type bounds struct {
 	accounting Accounting
@@ -63,7 +66,7 @@ func selectBounds(ctx context.Context, l Limits, hierarchy *nslinux.Hierarchy) (
 	}
 	fallback := func() (bounds, error) {
 		if l.MemoryBytes > 0 {
-			b.rlimits = append(b.rlimits, nslinux.Rlimit{Resource: unix.RLIMIT_AS, Cur: l.MemoryBytes, Max: l.MemoryBytes})
+			b.late = append(b.late, nslinux.Rlimit{Resource: unix.RLIMIT_AS, Cur: l.MemoryBytes, Max: l.MemoryBytes})
 		}
 		if l.MaxProcs > 0 {
 			b.late = append(b.late, nslinux.Rlimit{Resource: unix.RLIMIT_NPROC, Cur: l.MaxProcs, Max: l.MaxProcs})

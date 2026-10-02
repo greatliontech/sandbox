@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"unicode/utf8"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -127,10 +126,9 @@ type world struct {
 // to the image (checkMachO). The profile matches the kernel's own
 // spelling of a path — symlinks and firmlinks resolved, the
 // filesystem's case — so the tree and the grants are read back so
-// (kernelPath), and the containment the shared resolution judged on
-// canonical spellings is judged once more on the kernel's, where two
-// spellings of one directory (a firmlink's, a case variant's) meet.
-// Without a Root the world is the caller's whole: the entrypoint an
+// (kernelPath); containment and overlap the shared resolution judged
+// by identity, where every spelling of one entry meets. Without a
+// Root the world is the caller's whole: the entrypoint an
 // executable file on the host.
 func resolveWorld(spec Spec, r row) (world, error) {
 	undeliverable := func(format string, a ...any) (world, error) {
@@ -162,26 +160,11 @@ func resolveWorld(spec Spec, r row) (world, error) {
 		if i == t.runtime {
 			what = "runtime dir"
 		}
-		target, err := kernelPath(b.Source)
-		if err != nil {
+		if b.Target, err = kernelPath(b.Source); err != nil {
 			return undeliverable("%s %s: %v", what, b.Source, err)
 		}
-		switch {
-		case target == w.root:
-			return undeliverable("%s %s is the tree %s", what, b.Source, spec.Root)
-		case within(target, w.root):
-			return undeliverable("%s %s lies within the tree %s", what, b.Source, spec.Root)
-		case within(w.root, target):
-			return undeliverable("%s %s holds the tree %s", what, b.Source, spec.Root)
-		}
-		for _, o := range w.binds {
-			if target == o.Target || within(target, o.Target) || within(o.Target, target) {
-				return undeliverable("grants %s and %s overlap", o.Source, b.Source)
-			}
-		}
-		b.Target = target
 		if i == t.runtime {
-			w.runtime = target
+			w.runtime = b.Target
 		}
 		w.binds = append(w.binds, b)
 	}
@@ -206,20 +189,7 @@ func executableFile(path string) error {
 // descriptor opened for no access at all (O_EVTONLY) and without
 // blocking (a FIFO opened for reading would wait for a writer).
 func kernelPath(path string) (string, error) {
-	fd, err := unix.Open(path, unix.O_EVTONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return "", err
-	}
-	defer unix.Close(fd)
-	var buf [unix.PathMax]byte
-	if _, _, errno := unix.Syscall(unix.SYS_FCNTL, uintptr(fd), unix.F_GETPATH, uintptr(unsafe.Pointer(&buf[0]))); errno != 0 {
-		return "", errno
-	}
-	n := 0
-	for n < len(buf) && buf[n] != 0 {
-		n++
-	}
-	return string(buf[:n]), nil
+	return fcntlPath(path, unix.F_GETPATH)
 }
 
 // profile spells the OS row's Seatbelt profile. Without a Root: the

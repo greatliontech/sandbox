@@ -1412,11 +1412,13 @@ func TestSelectBounds(t *testing.T) {
 	for _, rl := range b.rlimits {
 		early = append(early, rl.Resource)
 	}
-	if len(early) != 2 || early[0] != unix.RLIMIT_CPU || early[1] != unix.RLIMIT_AS {
-		t.Fatalf("early rlimits = %v, want CPU then AS", early)
+	if len(early) != 1 || early[0] != unix.RLIMIT_CPU {
+		t.Fatalf("early rlimits = %v, want CPU alone", early)
 	}
-	if len(b.late) != 1 || b.late[0].Resource != unix.RLIMIT_NPROC || b.late[0].Cur != 3 {
-		t.Fatalf("late rlimits = %+v, want NPROC 3", b.late)
+	// The address-space and process-count bounds land last: the init's
+	// runtime must not outgrow them before exec.
+	if len(b.late) != 2 || b.late[0].Resource != unix.RLIMIT_AS || b.late[0].Cur != 1<<20 || b.late[1].Resource != unix.RLIMIT_NPROC || b.late[1].Cur != 3 {
+		t.Fatalf("late rlimits = %+v, want AS 1 MiB then NPROC 3", b.late)
 	}
 }
 
@@ -2510,6 +2512,303 @@ func TestMinTierOnAnOSHost(t *testing.T) {
 	}
 	if es, err := sb.Wait(); err != nil || es.Code != 0 || sb.Tier() != OS {
 		t.Fatalf("Wait: %+v %v, tier %v", es, err, sb.Tier())
+	}
+}
+
+// aliasEnv marks the child TestContainmentByIdentity re-execs in a
+// mount namespace of its own, where it can bind-mount.
+const aliasEnv = "SANDBOX_TEST_ALIAS_CHILD"
+
+// TestContainmentByIdentity pins that containment and overlap are
+// judged by the entry, not its spelling: a bind mount gives a
+// directory a second spelling no canonical form unifies, and a grant
+// through it — of the tree's parent, of the tree, of a directory
+// within it, or of a directory another grant names — is refused as
+// the same grant by its first spelling would be. The judgement runs
+// in a child with a mount namespace of its own, where an unprivileged
+// user may bind-mount.
+func TestContainmentByIdentity(t *testing.T) {
+	if os.Getenv(aliasEnv) != "1" {
+		requireUserns(t)
+		cmd := exec.Command(os.Args[0], "-test.run=^TestContainmentByIdentity$", "-test.v")
+		cmd.Env = append(os.Environ(), aliasEnv+"=1")
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Cloneflags:  syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+			UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
+			GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("the namespaced child: %v\n%s", err, out)
+		}
+		return
+	}
+	parent := t.TempDir()
+	tree := filepath.Join(parent, "tree")
+	for _, d := range []string{filepath.Join(tree, "sub"), filepath.Join(parent, "shared", "x")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(tree, "payload"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Mkdir(alias, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mount(parent, alias, "", syscall.MS_BIND, ""); err != nil {
+		t.Fatalf("bind-mounting the tree's parent at %s: %v", alias, err)
+	}
+	t.Cleanup(func() { syscall.Unmount(alias, 0) })
+	// Every grant has its entry in the tree, so nothing but the
+	// judgement refuses it.
+	for _, p := range []string{alias, filepath.Join(alias, "tree", "sub")} {
+		if err := os.MkdirAll(filepath.Join(tree, p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	none := func(string) error { return nil }
+	shared := filepath.Join(parent, "shared")
+	aliased := filepath.Join(alias, "shared")
+	for _, c := range []struct {
+		name string
+		spec Spec
+		want string
+	}{
+		{"the tree's parent", Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: alias, Access: ReadWrite}}}, "grant " + alias + " holds the tree"},
+		{"the tree", Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: filepath.Join(alias, "tree"), Access: ReadWrite}}}, "is the tree"},
+		{"a directory within the tree", Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: filepath.Join(alias, "tree", "sub"), Access: ReadWrite}}}, "lies within the tree"},
+		{"the rendezvous directory over the tree's parent", Spec{Exec: "/payload", Root: tree, RuntimeDir: alias}, "runtime dir " + alias + " holds the tree"},
+		{"two spellings of one host directory, no Root", Spec{Exec: "/bin/true", PathGrants: []PathGrant{{Path: shared, Access: ReadOnly}, {Path: aliased, Access: ReadWrite}}}, "overlap"},
+		{"a spelling within the other's, no Root", Spec{Exec: "/bin/true", PathGrants: []PathGrant{{Path: shared, Access: ReadWrite}, {Path: filepath.Join(aliased, "x"), Access: ReadWrite}}}, "overlap"},
+	} {
+		_, err := resolveTree(c.spec, none)
+		if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s through the alias: %v, want refused naming %q", c.name, err, c.want)
+		}
+	}
+	// Under a Root the same two spellings land on two entries of the
+	// tree, and are two intents over one host entry still.
+	for _, p := range []string{shared, aliased} {
+		if err := os.MkdirAll(filepath.Join(tree, p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := resolveTree(Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: shared, Access: ReadOnly}, {Path: aliased, Access: ReadWrite}}}, none)
+	if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "overlap") {
+		t.Errorf("two spellings of one host directory under a Root: %v, want refused as overlapping", err)
+	}
+	// Two host directories whose entries in the tree are one — the
+	// tree holding a bind mount of its own — are two intents over one
+	// entry of the tree.
+	ga, gb := t.TempDir(), t.TempDir()
+	for _, p := range []string{ga, gb} {
+		if err := os.MkdirAll(filepath.Join(tree, p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := syscall.Mount(filepath.Join(tree, ga), filepath.Join(tree, gb), "", syscall.MS_BIND, ""); err != nil {
+		t.Fatalf("bind-mounting inside the tree: %v", err)
+	}
+	t.Cleanup(func() { syscall.Unmount(filepath.Join(tree, gb), 0) })
+	_, err = resolveTree(Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: ga, Access: ReadOnly}, {Path: gb, Access: ReadWrite}}}, none)
+	if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "overlap") {
+		t.Errorf("two grants landing on one entry of the tree: %v, want refused as overlapping", err)
+	}
+	// A grant reaches every mount beneath it: a directory holding a
+	// bind of the tree's parent, of a directory within the tree, or
+	// of another grant's directory, is refused as that grant would be.
+	holding := func(source string) string {
+		holder := t.TempDir()
+		at := filepath.Join(holder, "m")
+		if err := os.Mkdir(at, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mount(source, at, "", syscall.MS_BIND, ""); err != nil {
+			t.Fatalf("bind-mounting %s beneath a grant: %v", source, err)
+		}
+		t.Cleanup(func() { syscall.Unmount(at, 0) })
+		if err := os.MkdirAll(filepath.Join(tree, holder), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return holder
+	}
+	up, in, over := holding(parent), holding(filepath.Join(tree, "sub")), holding(shared)
+	for _, c := range []struct {
+		name string
+		spec Spec
+		want string
+	}{
+		{"a bind of the tree's parent beneath a grant", Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: up, Access: ReadWrite}}}, "grant " + up + " holds the tree " + tree + " through "}, // the spelling met first: the mount beneath, or the tree's own spelling through it
+		{"a bind of a directory within the tree beneath a grant", Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: in, Access: ReadWrite}}}, "lies within the tree " + tree + " through "},  // the bind's origin spelling, whichever is listed first
+		{"a bind of another grant's directory beneath a grant, no Root", Spec{Exec: "/bin/true", PathGrants: []PathGrant{{Path: over, Access: ReadWrite}, {Path: shared, Access: ReadOnly}}}, "overlap through "},
+	} {
+		_, err := resolveTree(c.spec, none)
+		if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want refused naming %q", c.name, err, c.want)
+		}
+	}
+	// The tree reached through a bind of a directory above it has
+	// its origin's ancestors: a grant of one of them holds the tree.
+	grafted := filepath.Join(t.TempDir(), "grafted")
+	if err := os.Mkdir(grafted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mount(filepath.Dir(parent), grafted, "", syscall.MS_BIND, ""); err != nil {
+		t.Fatalf("bind-mounting the tree's grandparent: %v", err)
+	}
+	t.Cleanup(func() { syscall.Unmount(grafted, 0) })
+	graftedTree := filepath.Join(grafted, filepath.Base(parent), "tree")
+	if err := os.MkdirAll(filepath.Join(graftedTree, filepath.Dir(parent)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = resolveTree(Spec{Exec: "/payload", Root: graftedTree, PathGrants: []PathGrant{{Path: filepath.Dir(parent), Access: ReadWrite}}}, none)
+	if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "holds the tree") {
+		t.Errorf("the origin's ancestor granted over a tree reached through a bind: %v, want refused as holding the tree", err)
+	}
+	// A mount hidden beside the mounts a path reaches covers no
+	// spelling: a tmpfs at x/y, a bind at x attached after it (which
+	// hides it), a tmpfs at x/y/z through the bind; a tree reached
+	// through a bind of x/y/z/parent keeps its spelling through x/y/z,
+	// so a grant of x/y/z holds it.
+	cv := t.TempDir()
+	x, sdir := filepath.Join(cv, "x"), filepath.Join(cv, "S")
+	for _, d := range []string{filepath.Join(x, "y"), filepath.Join(sdir, "y", "z")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, mnt := range []struct {
+		source, at, fstype string
+		flags              uintptr
+	}{
+		{"tmpfs", filepath.Join(x, "y"), "tmpfs", 0},
+		{sdir, x, "", syscall.MS_BIND},
+		{"tmpfs", filepath.Join(x, "y", "z"), "tmpfs", 0},
+	} {
+		if err := syscall.Mount(mnt.source, mnt.at, mnt.fstype, mnt.flags, ""); err != nil {
+			t.Fatalf("mounting %s at %s: %v", mnt.source, mnt.at, err)
+		}
+		t.Cleanup(func() { syscall.Unmount(mnt.at, 0) })
+	}
+	o := filepath.Join(x, "y", "z")
+	if err := os.MkdirAll(filepath.Join(o, "parent", "tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(o, "parent", "tree", "payload"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	qo := filepath.Join(t.TempDir(), "q")
+	if err := os.Mkdir(qo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mount(filepath.Join(o, "parent"), qo, "", syscall.MS_BIND, ""); err != nil {
+		t.Fatalf("bind-mounting the tree's parent: %v", err)
+	}
+	t.Cleanup(func() { syscall.Unmount(qo, 0) })
+	if err := os.MkdirAll(filepath.Join(qo, "tree", o), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = resolveTree(Spec{Exec: "/payload", Root: filepath.Join(qo, "tree"), PathGrants: []PathGrant{{Path: o, Access: ReadWrite}}}, none)
+	if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "holds the tree") {
+		t.Errorf("a grant above the tree's origin, a sibling mount hidden beside the chain: %v, want refused as holding the tree", err)
+	}
+	// A mount beneath a grant the caller cannot read — under a
+	// directory it owns and has closed — is judged where another
+	// spelling of it can be read (a bind of the tree's parent, through
+	// the parent's own spelling) and refuses the grant where none can
+	// (a filesystem of its own): the caller may open the directory
+	// from within the grant. The judgement runs on a thread with the
+	// namespace's capabilities dropped, as the payload's are, so the
+	// closed directory bars it.
+	closed := func(source, fstype string, flags uintptr) string {
+		holder := t.TempDir()
+		locked := filepath.Join(holder, "locked")
+		at := filepath.Join(locked, "m")
+		if err := os.MkdirAll(at, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mount(source, at, fstype, flags, ""); err != nil {
+			t.Fatalf("mounting %s beneath a closed directory: %v", source, err)
+		}
+		t.Cleanup(func() { syscall.Unmount(at, 0) })
+		if err := os.Chmod(locked, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(locked, 0o700) })
+		if err := os.MkdirAll(filepath.Join(tree, holder), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return holder
+	}
+	bound, own := closed(parent, "", syscall.MS_BIND), closed("tmpfs", "tmpfs", 0)
+	// A tree reached through a bind of its parent, the parent's own
+	// spelling behind a directory the caller closed: the tree's origin
+	// is barred, and a grant above it is not judged.
+	lk := t.TempDir()
+	origin := filepath.Join(lk, "locked", "parent")
+	q := filepath.Join(t.TempDir(), "q")
+	for _, d := range []string{filepath.Join(origin, "tree"), q} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(origin, "tree", "payload"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mount(origin, q, "", syscall.MS_BIND, ""); err != nil {
+		t.Fatalf("bind-mounting the tree's parent: %v", err)
+	}
+	t.Cleanup(func() { syscall.Unmount(q, 0) })
+	if err := os.MkdirAll(filepath.Join(q, "tree", lk), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(lk, "locked"), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(filepath.Join(lk, "locked"), 0o700) })
+	errc := make(chan error, 1)
+	go func() {
+		if err := nslinux.DropAllCapabilities(); err != nil {
+			errc <- err
+			return
+		}
+		if _, err := os.Stat(filepath.Join(bound, "locked", "m")); err == nil {
+			errc <- errors.New("the closed directory bars nothing: the arm proves nothing")
+			return
+		}
+		_, err := resolveTree(Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: bound, Access: ReadWrite}}}, none)
+		if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "holds the tree") {
+			errc <- fmt.Errorf("a barred bind of the tree's parent beneath a grant: %v, want refused as holding the tree", err)
+			return
+		}
+		_, err = resolveTree(Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: own, Access: ReadWrite}}}, none)
+		if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "cannot be read (permission denied), so what it names is not judged against the tree") {
+			errc <- fmt.Errorf("a barred filesystem beneath a grant: %v, want refused as unjudged", err)
+			return
+		}
+		// The tree's own origin barred: a tree reached through a bind
+		// of its parent, the parent's own spelling closed, is not
+		// judged against a grant above that spelling.
+		_, err = resolveTree(Spec{Exec: "/payload", Root: filepath.Join(q, "tree"), PathGrants: []PathGrant{{Path: lk, Access: ReadWrite}}}, none)
+		if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "cannot be read (permission denied), so grant "+lk+" is not judged against it") { // whichever barred spelling is met first: the closed parent's own, or one through an earlier bind above it
+			errc <- fmt.Errorf("a grant above the tree's barred origin: %v, want refused as unjudged", err)
+			return
+		}
+		errc <- nil
+	}()
+	if err := <-errc; err != nil {
+		t.Error(err)
+	}
+	// A spelling of another directory through the same mount is no
+	// alias of anything granted: the mount is not the overlap.
+	other := filepath.Join(alias, "shared", "x")
+	if err := os.MkdirAll(filepath.Join(tree, other), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveTree(Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: other, Access: ReadWrite}}}, none); err != nil {
+		t.Errorf("a directory through the alias, granted alone: %v", err)
 	}
 }
 

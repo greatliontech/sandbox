@@ -871,10 +871,10 @@ func TestRootWorld(t *testing.T) {
 	}
 }
 
-// TestRootOverlappingSpellingsRefused pins the overlap judged on the
-// kernel's spelling: two grants naming one directory by two
-// spellings, one read-only and one read-write, are refused as
-// overlapping.
+// TestRootOverlappingSpellingsRefused pins the overlap judged by
+// identity on this platform: two grants naming one directory by two
+// spellings (a case variant's), one read-only and one read-write,
+// are refused as overlapping.
 func TestRootOverlappingSpellingsRefused(t *testing.T) {
 	requireSeatbelt(t)
 	tree := rootTree(t)
@@ -897,9 +897,12 @@ func TestRootOverlappingSpellingsRefused(t *testing.T) {
 	}
 }
 
-// TestRootAliasedGrantsRefused pins the containment judged on the
-// kernel's spelling: a grant naming the tree's parent through a
-// firmlink or a case variant is refused as holding the tree.
+// TestRootAliasedGrantsRefused pins the containment judged by
+// identity on this platform: a grant naming the tree's parent
+// through a firmlink or a case variant is refused as holding the
+// tree, and so is a grant of the data volume's mount point or of a
+// directory above it, under which the tree is reached with no
+// firmlink crossed.
 func TestRootAliasedGrantsRefused(t *testing.T) {
 	requireSeatbelt(t)
 	parent := must(filepath.EvalSymlinks(t.TempDir()))
@@ -911,26 +914,91 @@ func TestRootAliasedGrantsRefused(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(tree, "payload"), must(os.ReadFile(exe)), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	aliases := map[string]string{"a case variant": strings.ToUpper(parent)}
-	if strings.HasPrefix(parent, "/Users/") || strings.HasPrefix(parent, "/private/") {
-		aliases["a firmlink"] = "/System/Volumes/Data" + parent
+	aliases := map[string]string{
+		"a case variant":                    strings.ToUpper(parent),
+		"a firmlink":                        "/System/Volumes/Data" + parent,
+		"the data volume":                   "/System/Volumes/Data",
+		"a directory above the data volume": "/System/Volumes",
 	}
 	for name, alias := range aliases {
-		if _, err := os.Stat(alias); err != nil {
-			t.Logf("%s %s not on this host: %v", name, alias, err)
-			continue
+		t.Run(name, func(t *testing.T) {
+			if _, err := os.Stat(alias); err != nil {
+				testdemand.Live(t, "SANDBOX_TEST_REQUIRE_SEATBELT", fmt.Sprintf("%s %s not on this host: %v", name, alias, err))
+			}
+			if err := os.MkdirAll(filepath.Join(tree, alias), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			sb, err := New(Spec{Exec: "/payload", Env: []string{childEnv + "=hello"}, Root: tree, PathGrants: []PathGrant{{Path: alias, Access: ReadWrite}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "holds the tree") {
+				t.Errorf("%s %s granted over the tree's parent: %v, want refused as holding the tree", name, alias, err)
+				sb.Destroy()
+			}
+		})
+	}
+}
+
+// TestAutomountGrantRefused pins that a grant of an automount point
+// the platform's automounter populates on lookup (/net, /home on a
+// stock host) is refused as unjudged: what a lookup there mounts is
+// the map's to say. A host running no automounter has none to
+// grant, and the test says so rather than demanding one: the
+// Seatbelt row's demand does not cover it.
+func TestAutomountGrantRefused(t *testing.T) {
+	m, err := readMounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var point string
+	for _, p := range m.points {
+		if m.untriggered(p) && p != "/" {
+			point = p
+			break
 		}
-		if err := os.MkdirAll(filepath.Join(tree, alias), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		sb, err := New(Spec{Exec: "/payload", Env: []string{childEnv + "=hello"}, Root: tree, PathGrants: []PathGrant{{Path: alias, Access: ReadWrite}}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "holds the tree") {
-			t.Errorf("%s %s granted over the tree's parent: %v, want refused as holding the tree", name, alias, err)
-			sb.Destroy()
-		}
+	}
+	if point == "" {
+		t.Skipf("no untriggered automount on this host (mounts: %v)", m.types)
+	}
+	tree := rootTree(t)
+	if err := os.MkdirAll(filepath.Join(tree, point), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = resolveWorld(Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: point, Access: ReadWrite}}}, osRow)
+	if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "an automount not yet triggered") {
+		t.Fatalf("a grant of %s: %v, want refused as unjudged", point, err)
+	}
+}
+
+// TestSocketGrantResolves pins that a grant of a unix socket, an
+// entry no descriptor can be opened on, resolves to the kernel's
+// spelling of its directory with its own name.
+func TestSocketGrantResolves(t *testing.T) {
+	tree := rootTree(t)
+	dir, err := os.MkdirTemp("/tmp", "sandbox-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "agent.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := os.MkdirAll(filepath.Join(tree, dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree, sock), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := resolveWorld(Spec{Exec: "/payload", Root: tree, PathGrants: []PathGrant{{Path: sock, Access: ReadWrite}}}, osRow)
+	if err != nil {
+		t.Fatalf("a socket grant: %v", err)
+	}
+	if want := must(filepath.EvalSymlinks(dir)) + "/agent.sock"; len(w.binds) != 1 || w.binds[0].Target != want {
+		t.Fatalf("a socket grant's target: %+v, want %s", w.binds, want)
 	}
 }
 

@@ -35,7 +35,8 @@ type initConfig struct {
 	Binds    []bind           `json:"binds,omitempty"`
 	Rlimits  []nslinux.Rlimit `json:"rlimits,omitempty"`
 	// LateRlimits and PidsMax land right before exec: the process-count
-	// bound that fits the payload does not fit the multithreaded init.
+	// and address-space bounds that fit the payload do not fit the
+	// multithreaded init and its runtime's reservations.
 	LateRlimits []nslinux.Rlimit `json:"late_rlimits,omitempty"`
 	PidsMaxFile string           `json:"pids_max_file,omitempty"`
 	PidsMax     uint64           `json:"pids_max,omitempty"`
@@ -270,38 +271,24 @@ type world struct {
 }
 
 // resolveWorld checks, before anything is cloned, that every stated
-// intent has somewhere to land on row r, and resolves the world to
-// canonical paths — the one place the grant-to-target mapping is
-// computed. Under a Root: the Root is a directory, canonicalized; the
-// entrypoint and the working directory resolve inside the tree as a
-// file and a directory, symlinks chased exactly as the pivoted
-// process will chase them (absolute targets re-rooted at the tree,
-// ".." clamped at it); each grant and the rendezvous directory exist
-// on the host and in the tree as the same kind of entry, reached
-// through no symlink at any component — a pre-pivot bind would
-// follow a symlink into the host view, and the post-pivot process
-// would follow it into the tree, so the grant would land where the
-// process cannot see it. Without a Root, grants need only exist on
-// the host, and their targets are the canonical host paths — the
-// mount table records canonical mount points, and a read-only
-// remount must find its own bind there. Grants may not overlap one
-// another or the rendezvous directory.
-//
-// The OS row has no mount namespace, so it cannot present the tree
-// at "/" (docs/specs/sandbox.md, "Root is world-restriction"): the
-// world is the same tree, grants and rendezvous directory at their
-// host paths, allowlisted for what each may do — the tree readable
-// and executable, a read-only grant the same, a read-write grant
-// and the rendezvous directory writable too — and nothing else; the
-// entrypoint and the working directory are their host paths inside
-// the tree, and the entrypoint must load without the image-absolute
-// layout: an ELF the kernel loads whole, native, with no interpreter
-// (checkELF). Without a Root the allowlist is the caller's
-// whole world, the row having refused a read-only grant there.
-//
-// The row's own refusals come first (row.refuses). A failure is
-// ErrUndeliverable: the host cannot do what was asked. landlockABI
-// is the ABI the OS row's rights are spelled for.
+// intent has somewhere to land on row r: the spelling checks, the
+// row's own refusals, then the tree resolution every platform
+// shares (resolveTree), mapped to the row's mechanism. The Strong
+// row pivots to the tree and binds the grants and the rendezvous
+// directory inside it. The OS row has no mount namespace, so it
+// cannot present the tree at "/" (docs/specs/sandbox.md, "Root is
+// world-restriction"): the world is the same tree, grants and
+// rendezvous directory at their host paths, allowlisted for what
+// each may do — the tree readable and executable, a read-only grant
+// the same, a read-write grant and the rendezvous directory writable
+// too — and nothing else; the entrypoint and the working directory
+// are their host paths inside the tree, and the entrypoint must load
+// without the image-absolute layout: an ELF the kernel loads whole,
+// native, with no interpreter (checkELF). Without a Root the
+// allowlist is the caller's whole world, the row having refused a
+// read-only grant there. A failure is ErrUndeliverable: the host
+// cannot do what was asked. landlockABI is the ABI the OS row's
+// rights are spelled for.
 func resolveWorld(spec Spec, r row, landlockABI int) (world, error) {
 	if err := checkSpelling(spec); err != nil {
 		return world{}, err
