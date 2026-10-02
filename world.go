@@ -29,6 +29,34 @@ type treeWorld struct {
 	root  string
 	exec  string
 	binds []bind
+	// hostCmd and hostWorkDir are the entrypoint and the working
+	// directory as a row presenting the tree at its host path sees
+	// them: inside the tree, the tree's root where no working
+	// directory is stated — never the caller's; the stated paths
+	// where there is no tree.
+	hostCmd     string
+	hostWorkDir string
+	// runtime indexes the rendezvous directory's bind, -1 where none.
+	runtime int
+}
+
+// checkSpelling holds the spec's paths and hostname to their forms
+// before any row reads them: absolute paths, a hostname within the
+// length a row could present.
+func checkSpelling(spec Spec) error {
+	undeliverable := func(format string, a ...any) error {
+		return fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
+	}
+	if !filepath.IsAbs(spec.Exec) {
+		return undeliverable("exec %q is not an absolute path", spec.Exec)
+	}
+	if spec.WorkDir != "" && !filepath.IsAbs(spec.WorkDir) {
+		return undeliverable("workdir %q is not an absolute path", spec.WorkDir)
+	}
+	if len(spec.Hostname) > hostNameMax {
+		return undeliverable("hostname %q is longer than %d bytes", spec.Hostname, hostNameMax)
+	}
+	return nil
 }
 
 // resolveTree checks, before anything runs, that every stated intent
@@ -57,7 +85,7 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 	undeliverable := func(format string, a ...any) (treeWorld, error) {
 		return treeWorld{}, fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
 	}
-	t := treeWorld{exec: spec.Exec}
+	t := treeWorld{exec: spec.Exec, hostCmd: spec.Exec, hostWorkDir: spec.WorkDir, runtime: -1}
 	var root string
 	if spec.Root == "" {
 		if err := checkEntry(spec.Exec); err != nil {
@@ -88,6 +116,8 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 		}
 		t.root = root
 		t.exec = resolved
+		t.hostCmd = filepath.Join(root, resolved)
+		t.hostWorkDir = root
 		if spec.WorkDir != "" {
 			fi, _, err := statInTree(root, spec.WorkDir)
 			if err != nil {
@@ -96,6 +126,7 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 			if !fi.IsDir() {
 				return undeliverable("workdir %s is not a directory in the tree", spec.WorkDir)
 			}
+			t.hostWorkDir = filepath.Join(root, spec.WorkDir)
 		}
 	}
 	// A grant whose host path lies within the tree, or holds it — the
@@ -143,6 +174,10 @@ func resolveTree(spec Spec, checkEntry func(hostPath string) error) (treeWorld, 
 		if err != nil {
 			return treeWorld{}, err
 		}
+		if fi, err := os.Stat(spec.RuntimeDir); err == nil && !fi.IsDir() {
+			return undeliverable("runtime dir %s is not a directory", spec.RuntimeDir)
+		}
+		t.runtime = len(binds)
 		binds = append(binds, b)
 	}
 	// Overlap is judged on the canonical targets, where two stated
@@ -183,6 +218,14 @@ func resolveGrant(root, p, what string) (bind, error) {
 			return bind{}, fmt.Errorf("%w: %s %s: %v", ErrUndeliverable, what, p, err)
 		}
 		return bind{Source: p, Target: target}, nil
+	}
+	// A file granted under a Root with another name on the host could
+	// be the tree's own file under that name — a hard link into the
+	// tree, which no path can see — so a file grant has one name.
+	if !host.IsDir() {
+		if st, ok := host.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+			return bind{}, fmt.Errorf("%w: %s %s has %d names on the host; a file granted under a Root has one", ErrUndeliverable, what, p, st.Nlink)
+		}
 	}
 	// Every component of the target, walked from the tree down, must
 	// be a real entry: a symlink anywhere on the way is a target the

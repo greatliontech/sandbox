@@ -303,17 +303,8 @@ type world struct {
 // ErrUndeliverable: the host cannot do what was asked. landlockABI
 // is the ABI the OS row's rights are spelled for.
 func resolveWorld(spec Spec, r row, landlockABI int) (world, error) {
-	undeliverable := func(format string, a ...any) (world, error) {
-		return world{}, fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
-	}
-	if !filepath.IsAbs(spec.Exec) {
-		return undeliverable("exec %q is not an absolute path", spec.Exec)
-	}
-	if spec.WorkDir != "" && !filepath.IsAbs(spec.WorkDir) {
-		return undeliverable("workdir %q is not an absolute path", spec.WorkDir)
-	}
-	if len(spec.Hostname) > hostNameMax {
-		return undeliverable("hostname %q is longer than %d bytes", spec.Hostname, hostNameMax)
+	if err := checkSpelling(spec); err != nil {
+		return world{}, err
 	}
 	if err := r.refuses(spec); err != nil {
 		return world{}, err
@@ -333,15 +324,11 @@ func resolveWorld(spec Spec, r row, landlockABI int) (world, error) {
 		return world{}, err
 	}
 	w := world{cmd: spec.Exec, workDir: spec.WorkDir, root: t.root}
-	if t.root != "" && r.tier == OS {
+	if r.tier == OS {
 		// The tree at its host path: the entrypoint inside it, and
 		// the working directory too — the tree's root where none is
 		// stated, as the pivoted row's "/" is, never the caller's.
-		w.cmd = filepath.Join(t.root, t.exec)
-		w.workDir = t.root
-		if spec.WorkDir != "" {
-			w.workDir = filepath.Join(t.root, spec.WorkDir)
-		}
+		w.cmd, w.workDir = t.hostCmd, t.hostWorkDir
 	}
 	// A row without a mount namespace binds nothing: its read-write
 	// grants and rendezvous directory are the host paths they already

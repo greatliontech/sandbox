@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -115,28 +114,27 @@ type world struct {
 // resolveWorld checks, before anything runs, that every stated
 // intent has somewhere to land on row r (docs/specs/sandbox.md,
 // "Intent is portable; delivery is all-or-nothing"): the spelling
-// and length checks, the row's own refusals, then the tree
-// resolution every platform shares (resolveTree). Under a Root the
-// OS row presents the tree at its host path (no mount namespace
-// here either): the entrypoint and the working directory are their
-// host paths inside the tree — the tree's root where none is stated
-// — and the entrypoint must load without the image-absolute layout
-// the row does not present: a Mach-O image for this machine whose
-// libraries are the platform's execution substrate or relative to
-// the image (checkMachO). Without a Root the world is the caller's
-// whole: the entrypoint an executable file on the host.
+// checks, the row's own refusals, then the tree resolution every
+// platform shares (resolveTree). Under a Root the OS row presents
+// the tree at its host path (no mount namespace here either): the
+// entrypoint and the working directory are their host paths inside
+// the tree, and the entrypoint must load without the image-absolute
+// layout the row does not present: a Mach-O image for this machine
+// whose libraries are the platform's execution substrate or relative
+// to the image (checkMachO). The profile matches the kernel's own
+// spelling of a path — symlinks and firmlinks resolved, the
+// filesystem's case — so the tree and the grants are read back so
+// (kernelPath), and the containment the shared resolution judged on
+// canonical spellings is judged once more on the kernel's, where two
+// spellings of one directory (a firmlink's, a case variant's) meet.
+// Without a Root the world is the caller's whole: the entrypoint an
+// executable file on the host.
 func resolveWorld(spec Spec, r row) (world, error) {
 	undeliverable := func(format string, a ...any) (world, error) {
 		return world{}, fmt.Errorf("%w: "+format, append([]any{ErrUndeliverable}, a...)...)
 	}
-	if !filepath.IsAbs(spec.Exec) {
-		return undeliverable("exec %q is not an absolute path", spec.Exec)
-	}
-	if spec.WorkDir != "" && !filepath.IsAbs(spec.WorkDir) {
-		return undeliverable("workdir %q is not an absolute path", spec.WorkDir)
-	}
-	if len(spec.Hostname) > hostNameMax {
-		return undeliverable("hostname %q is longer than %d bytes", spec.Hostname, hostNameMax)
+	if err := checkSpelling(spec); err != nil {
+		return world{}, err
 	}
 	if err := r.refuses(spec); err != nil {
 		return world{}, err
@@ -149,31 +147,34 @@ func resolveWorld(spec Spec, r row) (world, error) {
 	if err != nil {
 		return world{}, err
 	}
-	w := world{cmd: spec.Exec, workDir: spec.WorkDir}
+	w := world{cmd: t.hostCmd, workDir: t.hostWorkDir}
 	if t.root == "" {
 		return w, nil
 	}
-	w.cmd = filepath.Join(t.root, t.exec)
-	w.workDir = t.root
-	if spec.WorkDir != "" {
-		w.workDir = filepath.Join(t.root, spec.WorkDir)
-	}
-	// The profile matches the kernel's own spelling of a path
-	// (symlinks resolved, the filesystem's case), which the
-	// canonical paths resolveTree computed may differ from on a
-	// case-insensitive volume.
 	if w.root, err = kernelPath(t.root); err != nil {
 		return undeliverable("root %s: %v", spec.Root, err)
 	}
-	for _, b := range t.binds {
+	for i, b := range t.binds {
 		target, err := kernelPath(b.Source)
 		if err != nil {
 			return undeliverable("grant %s: %v", b.Source, err)
 		}
+		switch {
+		case target == w.root:
+			return undeliverable("grant %s is the tree %s", b.Source, spec.Root)
+		case within(target, w.root):
+			return undeliverable("grant %s lies within the tree %s", b.Source, spec.Root)
+		case within(w.root, target):
+			return undeliverable("grant %s holds the tree %s", b.Source, spec.Root)
+		}
+		for _, o := range w.binds {
+			if target == o.Target || within(target, o.Target) || within(o.Target, target) {
+				return undeliverable("grants %s and %s overlap", o.Source, b.Source)
+			}
+		}
 		b.Target = target
-		if b.Source == spec.RuntimeDir {
+		if i == t.runtime {
 			w.runtime = target
-			continue
 		}
 		w.binds = append(w.binds, b)
 	}
@@ -188,16 +189,17 @@ func executableFile(path string) error {
 		return err
 	}
 	if fi.IsDir() || fi.Mode()&0o111 == 0 {
-		return errors.New("not an executable file")
+		return errors.New("is not an executable file")
 	}
 	return nil
 }
 
 // kernelPath is the kernel's own spelling of an existing path: what
-// Seatbelt matches an operation's path against, read back from an
-// open descriptor (F_GETPATH).
+// Seatbelt matches an operation's path against, read back from a
+// descriptor opened for no access at all (O_EVTONLY) and without
+// blocking (a FIFO opened for reading would wait for a writer).
 func kernelPath(path string) (string, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(path, unix.O_EVTONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return "", err
 	}
@@ -221,12 +223,16 @@ func kernelPath(path string) (string, error) {
 // wins, so the unix-socket allowance follows the denial. Under a
 // Root: nothing by default but the platform's execution substrate
 // as Apple's own system.sb states it (dyld, the system libraries and
-// frameworks, the services every process reaches); the tree read and
-// executed, so an entrypoint may execute a sibling of the tree; this
-// binary read and executed, the second stage running under the
-// profile before the payload; each grant read, and written where
-// read-write; the rendezvous directory read and written, unix
-// sockets within it alone; the network whole where granted.
+// frameworks, the services every process reaches), less the one
+// place it lets a process create files (/cores); the tree read,
+// mapped and executed, so an entrypoint may load the tree's own
+// libraries and execute a sibling of the tree; this binary read and
+// executed, the second stage running under the profile before the
+// payload; each grant read, mapped and executed as on the Linux OS
+// row, and written where read-write; the rendezvous directory read
+// and written, unix sockets within it alone; the network, where
+// granted, by address — a unix socket elsewhere on the host is not
+// the network.
 func profile(spec Spec, w world, self string) (string, error) {
 	var b strings.Builder
 	b.WriteString("(version 1)\n")
@@ -237,31 +243,33 @@ func profile(spec Spec, w world, self string) (string, error) {
 		}
 		return b.String(), nil
 	}
-	q := func(p string) (string, error) { return sbplString(p) }
-	root, err := q(w.root)
+	root, err := sbplString(w.root)
 	if err != nil {
 		return "", err
 	}
-	selfQ, err := q(self)
+	selfQ, err := sbplString(self)
 	if err != nil {
 		return "", err
 	}
-	b.WriteString("(deny default)\n(import \"system.sb\")\n")
-	fmt.Fprintf(&b, "(allow process-exec (subpath %s) (literal %s))\n(allow process-fork)\n", root, selfQ)
+	b.WriteString("(deny default)\n(import \"system.sb\")\n(deny file-write* (subpath \"/cores\"))\n")
+	fmt.Fprintf(&b, "(allow process-exec file-map-executable (subpath %s) (literal %s))\n(allow process-fork)\n", root, selfQ)
 	fmt.Fprintf(&b, "(allow file-read* (subpath %s) (literal %s))\n", root, selfQ)
 	for _, g := range w.binds {
-		t, err := q(g.Target)
+		if g.Target == w.runtime {
+			continue
+		}
+		t, err := sbplString(g.Target)
 		if err != nil {
 			return "", err
 		}
 		if g.ReadOnly {
-			fmt.Fprintf(&b, "(allow file-read* (subpath %s))\n", t)
+			fmt.Fprintf(&b, "(allow file-read* process-exec file-map-executable (subpath %s))\n", t)
 		} else {
-			fmt.Fprintf(&b, "(allow file-read* file-write* (subpath %s))\n", t)
+			fmt.Fprintf(&b, "(allow file-read* file-write* process-exec file-map-executable (subpath %s))\n", t)
 		}
 	}
 	if w.runtime != "" {
-		rt, err := q(w.runtime)
+		rt, err := sbplString(w.runtime)
 		if err != nil {
 			return "", err
 		}
@@ -269,7 +277,7 @@ func profile(spec Spec, w world, self string) (string, error) {
 		fmt.Fprintf(&b, "(allow network-bind (local unix-socket (subpath %s)))\n(allow network-inbound (local unix-socket (subpath %s)))\n(allow network-outbound (remote unix-socket (subpath %s)))\n", rt, rt, rt)
 	}
 	if spec.Network {
-		b.WriteString("(allow network*)\n")
+		b.WriteString("(allow network-outbound (remote ip))\n(allow network-inbound (local ip))\n(allow network-bind (local ip))\n")
 	}
 	return b.String(), nil
 }
@@ -336,6 +344,9 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	self, err := selfExecutable()
 	if err != nil {
 		return fmt.Errorf("sandbox: %w", err)
+	}
+	if self, err = kernelPath(self); err != nil {
+		return fmt.Errorf("sandbox: this binary's path: %w", err)
 	}
 	cfg := initConfig{
 		Row:     r.tier.String(),

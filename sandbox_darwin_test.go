@@ -31,7 +31,11 @@ import (
 const childEnv = "SANDBOX_TEST_DARWIN_CHILD"
 
 func TestMain(m *testing.M) {
-	switch mode := os.Getenv(childEnv); mode {
+	mode := os.Getenv(childEnv)
+	if len(os.Args) > 1 && os.Args[1] == "world" {
+		mode = "world"
+	}
+	switch mode {
 	case "":
 	case "hello":
 		fmt.Println("hello=yes")
@@ -157,9 +161,10 @@ func TestMain(m *testing.M) {
 	case "world":
 		// Report what the world lets this process see and touch, one
 		// fact a line: the arguments name the tree, a read-only grant,
-		// a read-write grant, the rendezvous directory and a path
-		// outside the tree (each may be empty).
-		tree, ro, rw, rt, outside := os.Args[1], os.Args[2], os.Args[3], os.Args[4], os.Args[5]
+		// a read-write grant, the rendezvous directory, a path outside
+		// the tree and a unix socket outside the tree a listener holds
+		// (each may be empty).
+		tree, ro, rw, rt, outside, outSock := os.Args[2], os.Args[3], os.Args[4], os.Args[5], os.Args[6], os.Args[7]
 		cwd, _ := os.Getwd()
 		fmt.Printf("cwd=%s\n", cwd)
 		fmt.Printf("env=%d\n", len(os.Environ()))
@@ -188,6 +193,14 @@ func TestMain(m *testing.M) {
 			}
 			fmt.Printf("unixout=%v\n", err)
 		}
+		if outSock != "" {
+			c, err := net.Dial("unix", outSock)
+			if c != nil {
+				c.Close()
+			}
+			fmt.Printf("dialout=%v\n", err)
+		}
+		fmt.Printf("cores=%v\n", os.WriteFile("/cores/sandbox-test", []byte("x"), 0o644))
 		c, err := net.DialTimeout("tcp", "1.1.1.1:443", 3*time.Second)
 		if c != nil {
 			c.Close()
@@ -362,6 +375,7 @@ func TestMinimalRefusesUndeliverable(t *testing.T) {
 		return s
 	}
 	for name, mutate := range map[string]func(*Spec){
+		"a root":           func(s *Spec) { s.Root = rootTree(t); s.Exec = "/payload" },
 		"a hostname":       func(s *Spec) { s.Hostname = "box" },
 		"a denied network": func(s *Spec) { s.Network = false },
 		"a read-only grant": func(s *Spec) {
@@ -375,8 +389,9 @@ func TestMinimalRefusesUndeliverable(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) {
-			t.Errorf("%s on the Minimal row: %v, want ErrUndeliverable", name, err)
+		err = sb.Start(context.Background())
+		if !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "the minimal row") {
+			t.Errorf("%s on the Minimal row: %v, want the row's own refusal", name, err)
 			sb.Destroy()
 		}
 	}
@@ -751,11 +766,27 @@ func TestRootWorld(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A listener outside the tree, which the payload must not reach.
+	outSock := filepath.Join(outsideDir, "out.sock")
+	l, err := net.Listen("unix", outSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
 	out := &output{}
 	spec := Spec{
 		Exec:       "/payload",
-		Args:       []string{tree, hostRO, hostRW, hostRT, outside},
-		Env:        []string{childEnv + "=world", "ONE=1"},
+		Args:       []string{"world", tree, hostRO, hostRW, hostRT, outside, outSock},
+		Env:        []string{"ONE=1", "TWO=2"},
 		Root:       tree,
 		PathGrants: []PathGrant{{Path: hostRO, Access: ReadOnly}, {Path: hostRW, Access: ReadWrite}},
 		RuntimeDir: hostRT,
@@ -793,13 +824,131 @@ func TestRootWorld(t *testing.T) {
 	allowed("writerw")
 	allowed("unixrt")
 	denied("unixout")
+	denied("dialout")
 	denied("net")
 	denied("execout")
+	if f["cores"] == "<nil>" {
+		t.Errorf("cores = %q, want a refusal", f["cores"])
+	}
 	if !strings.HasPrefix(f["sibling"], "<nil>:hello=yes") {
 		t.Errorf("sibling = %q, want the sibling executed", f["sibling"])
 	}
 	if _, err := os.Stat(filepath.Join(tree, "etc", "w")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the tree was written: %v", err)
+	}
+	// The network granted: by address, a unix socket elsewhere still
+	// not the payload's; an unstated environment empty.
+	out = &output{}
+	spec.Network = true
+	spec.Env = nil
+	spec.Stdout = out
+	if _, st := run(t, spec); st.Code != 0 {
+		t.Fatalf("with the network: exit %+v, output %q", st, out.String())
+	}
+	f = facts(out.String())
+	if strings.Contains(f["net"], "operation not permitted") {
+		t.Errorf("net = %q under a granted network", f["net"])
+	}
+	denied("dialout")
+	if f["env"] != "0" {
+		t.Errorf("env = %q entries unstated, want none", f["env"])
+	}
+}
+
+// TestRootAliasedGrantsRefused pins the containment judged on the
+// kernel's spelling: a grant naming the tree's parent through a
+// firmlink or a case variant is refused as holding the tree.
+func TestRootAliasedGrantsRefused(t *testing.T) {
+	requireSeatbelt(t)
+	parent := must(filepath.EvalSymlinks(t.TempDir()))
+	tree := filepath.Join(parent, "tree")
+	if err := os.Mkdir(tree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe := must(os.Executable())
+	if err := os.WriteFile(filepath.Join(tree, "payload"), must(os.ReadFile(exe)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliases := map[string]string{"a case variant": strings.ToUpper(parent)}
+	if strings.HasPrefix(parent, "/Users/") || strings.HasPrefix(parent, "/private/") {
+		aliases["a firmlink"] = "/System/Volumes/Data" + parent
+	}
+	for name, alias := range aliases {
+		if _, err := os.Stat(alias); err != nil {
+			t.Logf("%s %s not on this host: %v", name, alias, err)
+			continue
+		}
+		if err := os.MkdirAll(filepath.Join(tree, alias), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		sb, err := New(Spec{Exec: "/payload", Env: []string{childEnv + "=hello"}, Root: tree, PathGrants: []PathGrant{{Path: alias, Access: ReadWrite}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), "holds the tree") {
+			t.Errorf("%s %s granted over the tree's parent: %v, want refused as holding the tree", name, alias, err)
+			sb.Destroy()
+		}
+	}
+}
+
+// TestRootLoadsTreeLibraries pins the entrypoint rule end to end
+// with the platform's own toolchain: an image linked against a
+// library in the tree, reached relative to the image, runs; one
+// linked at an image-absolute path, or carrying such a run path, or
+// built for another machine, is refused before anything runs.
+func TestRootLoadsTreeLibraries(t *testing.T) {
+	requireSeatbelt(t)
+	clang, err := exec.LookPath("clang")
+	if err != nil {
+		testdemand.Live(t, "SANDBOX_TEST_REQUIRE_SEATBELT", "no clang on this host: "+err.Error())
+	}
+	tree := must(filepath.EvalSymlinks(t.TempDir()))
+	src := filepath.Join(tree, "src")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "x.c"), []byte("int answer(void) { return 42; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "main.c"), []byte("#include <stdio.h>\nint answer(void);\nint main(void) { printf(\"answer=%d\\n\", answer()); return 0; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "alone.c"), []byte("int main(void) { return 0; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	build := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command(clang, args...)
+		cmd.Dir = src
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("clang %v: %v\n%s", args, err, out)
+		}
+	}
+	build("-dynamiclib", "-install_name", "@rpath/libx.dylib", "-o", filepath.Join(tree, "libx.dylib"), "x.c")
+	build("-o", filepath.Join(tree, "relative"), "main.c", filepath.Join(tree, "libx.dylib"), "-Wl,-rpath,@executable_path")
+	build("-o", filepath.Join(tree, "hostrpath"), "main.c", filepath.Join(tree, "libx.dylib"), "-Wl,-rpath,/opt/elsewhere")
+	build("-dynamiclib", "-install_name", "/opt/elsewhere/libabs.dylib", "-o", filepath.Join(tree, "libabs.dylib"), "x.c")
+	build("-o", filepath.Join(tree, "absolute"), "main.c", filepath.Join(tree, "libabs.dylib"))
+	other := "x86_64"
+	if runtime.GOARCH == "amd64" {
+		other = "arm64"
+	}
+	build("-arch", other, "-o", filepath.Join(tree, "foreign"), "alone.c")
+	out := &output{}
+	sb, st := run(t, Spec{Exec: "/relative", Root: tree, Env: []string{}, Stdout: out, Stderr: os.Stderr})
+	if st.Code != 0 || facts(out.String())["answer"] != "42" || sb.Tier() != OS {
+		t.Fatalf("an image loading the tree's library: exit %+v, output %q", st, out.String())
+	}
+	for name, want := range map[string]string{"/hostrpath": "a run path", "/absolute": "image-absolute", "/foreign": "built for"} {
+		sb, err := New(Spec{Exec: name, Root: tree, Env: []string{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sb.Start(context.Background()); !errors.Is(err, ErrUndeliverable) || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want %q refused", name, err, want)
+			sb.Destroy()
+		}
 	}
 }
 
