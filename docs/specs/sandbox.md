@@ -170,58 +170,58 @@ independent by design.
   `Start` as such — never as the payload's own exit.
 - **Bounded means bounded.** `Limits` map to the strongest accounting
   the selected row admits on its platform (cgroups where a delegated
-  subtree accepts both placement and the controllers the limits
-  need — a subtree can accept a child yet refuse controller
-  delegation, and a cgroup that cannot enforce the stated limits is
-  no accounting at all; rlimits; Job Objects). A memory bound is the
-  whole of what the process may hold: under cgroups swap is closed to
-  the run, never a second allowance past the bound — and a kernel
-  that accounts no swap yet can hold it cannot close it, so such a
-  host accounts the memory bound by rlimits instead. Where the
-  platform affords an unprivileged process no native bound at all —
-  darwin, whose kernel refuses every memory rlimit (`RLIMIT_AS`,
-  `RLIMIT_DATA`, `RLIMIT_RSS`) and keeps its per-task memory limit
-  for root, which delivers the CPU limit as `SIGXCPU`, a signal a
-  payload may handle, and whose process limit counts every process
-  of the user — the row bounds by a watchdog: the kernel's own
-  per-process readings (the physical footprint — the platform's own
-  measure of what a process costs, anonymous and compressed pages
-  included, file-backed pages not, what its memory-pressure limiter
-  reads — the CPU time, the thread count), sampled over the run's
-  process group at the stated interval (`WatchdogInterval`), the
-  group killed at the bound — the memory bound over the group's
-  footprints summed, the CPU bound over each process's own time as
-  `RLIMIT_CPU` reads it, the process bound over the threads of the
-  group's processes (every process has at least one); a member the
-  kernel will not show the sandbox — one that gained privilege — is
-  a bound the watchdog cannot hold, which ends the run. Such a bound
-  is exceeded by at most what the group can take in one interval,
-  and it reaches what the group holds: a process that leaves the
-  group (`setsid`) leaves the bounds, the same escape that leaves
-  the kill tie, stated under "No orphans"; the accounting reported
-  names the watchdog, and its one kill is counted by the bound that
-  made it (memory, CPU or process). Where the kernel holds a bound
-  the sign is the kernel's own, read for the caller: a memory
+  subtree accepts both placement and the controllers the limits need —
+  a subtree can accept a child yet refuse controller delegation, and a
+  cgroup that cannot enforce the stated limits is no accounting at
+  all; rlimits; Job Objects). A memory bound is the whole of what the
+  process may hold: under cgroups swap is closed to the run, never a
+  second allowance past the bound — and a kernel that accounts no swap
+  yet can hold it cannot close it, so such a host accounts the memory
+  bound by rlimits instead. Where the platform affords an unprivileged
+  process no native bound at all — darwin, whose kernel refuses every
+  memory rlimit (`RLIMIT_AS`, `RLIMIT_DATA`, `RLIMIT_RSS`) and keeps
+  its per-task memory limit for root, which delivers the CPU limit as
+  `SIGXCPU`, a signal a payload may handle, and whose process limit
+  counts every process of the user — the row bounds by a watchdog: the
+  kernel's own per-process readings (the physical footprint — the
+  platform's own measure of what a process costs, anonymous and
+  compressed pages included, file-backed pages not, what its
+  memory-pressure limiter reads — the CPU time, the thread count),
+  sampled over the run's process group at the stated interval
+  (`WatchdogInterval`), the group killed at the bound — the memory
+  bound over the group's footprints summed, the CPU bound over each
+  process's own time as `RLIMIT_CPU` reads it, the process bound over
+  the threads of the group's processes (every process has at least
+  one); a member the kernel will not show the sandbox — one that
+  gained privilege — is a bound the watchdog cannot hold, which ends
+  the run. Such a bound is exceeded by at most what the group can take
+  in one interval, and it reaches what the group holds: a process that
+  leaves the group (`setsid`) leaves the bounds, the same escape that
+  leaves the kill tie, stated under "No orphans"; the accounting
+  reported names the watchdog, and its one kill is counted by the
+  bound that made it (memory, CPU or process). Where the kernel holds
+  a bound the sign is the kernel's own, read for the caller: a memory
   cgroup's kills and a pid cgroup's refused forks from the cgroup's
-  own counters, `RLIMIT_CPU`'s kill — its soft and hard limits one,
-  so the kernel ends the process at the limit rather than
-  signalling it — from the dead process's own CPU time at the bound
-  as the kernel accounts it, within the allowance the kernel's tick
-  and the reading's truncation leave; a memory or process rlimit refuses the payload alone,
-  an allocation or a fork, and kills nothing. Which accounting
-  enforced the bounds is a reported fact of the run, so a bound-exceeded death is attributable on every row delivered. A
-  Job Object holds the memory bound over the run's committed memory
-  summed, which it refuses past the bound and reports, the report
-  the bound's enforcement, on which the run is killed (a refused
-  commit would leave a payload to die as it may, which it may still
-  before the kill lands); the process bound as its active-process limit,
-  each process past it refused and counted; and the CPU bound by the
+  own counters, `RLIMIT_CPU`'s kill — its soft and hard limits one, so
+  the kernel ends the process at the limit rather than signalling it —
+  from the dead process's own CPU time, read before the reap from its
+  process CPU clock — the clock the kernel checks the limit on — at or
+  past the bound; a memory or process rlimit refuses the payload
+  alone, an allocation or a fork, and kills nothing. Which accounting
+  enforced the bounds is a reported fact of the run, so a
+  bound-exceeded death is attributable on every row delivered. A Job
+  Object holds the memory bound over the run's committed memory
+  summed, which it refuses past the bound and reports, the report the
+  bound's enforcement, on which the run is killed (a refused commit
+  would leave a payload to die as it may, which it may still before
+  the kill lands); the process bound as its active-process limit, each
+  process past it refused and counted; and the CPU bound by the
   sandbox's sampling of the Job's own account of the run's user and
-  kernel time at the stated interval, the run killed past it, the Job's own
-  time limit behind it as the kernel's backstop over the user time
-  alone, which it enforces on an interval of seconds and whose kill
-  is counted as the CPU bound's; it bounds no open-file count,
-  so a stated one is refused on windows.
+  kernel time at the stated interval, the run killed past it, the
+  Job's own time limit behind it as the kernel's backstop over the
+  user time alone, which it enforces on an interval of seconds and
+  whose kill is counted as the CPU bound's; it bounds no open-file
+  count, so a stated one is refused on windows.
 - **The wall clock belongs to the caller.** `Start`'s context governs
   the process lifetime; sandbox adds no timeout of its own.
 - **An exit is reported as the platform ends it.** A signal death on
