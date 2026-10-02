@@ -9,16 +9,9 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/greatliontech/sandbox/internal/rlimit"
 	"golang.org/x/sys/unix"
 )
-
-// rlimit is one resource limit the init applies to itself before the
-// exec, which the payload inherits.
-type rlimit struct {
-	Resource int    `json:"resource"`
-	Cur      uint64 `json:"cur"`
-	Max      uint64 `json:"max"`
-}
 
 // bounds are the run's limits as this platform delivers them (docs/
 // specs/sandbox.md, "Bounded means bounded"): the kernel's rlimits
@@ -33,7 +26,7 @@ type rlimit struct {
 // the kernel's own per-process readings over the run's process group
 // and killing the group at a bound.
 type bounds struct {
-	rlimits []rlimit
+	rlimits []rlimit.Limit
 	watch   *watchdog
 }
 
@@ -41,10 +34,10 @@ type bounds struct {
 func selectBounds(l Limits) bounds {
 	var b bounds
 	if l.CPUSeconds > 0 {
-		b.rlimits = append(b.rlimits, rlimit{Resource: unix.RLIMIT_CPU, Cur: l.CPUSeconds, Max: l.CPUSeconds})
+		b.rlimits = append(b.rlimits, rlimit.Limit{Resource: unix.RLIMIT_CPU, Cur: l.CPUSeconds, Max: l.CPUSeconds})
 	}
 	if l.MaxFiles > 0 {
-		b.rlimits = append(b.rlimits, rlimit{Resource: unix.RLIMIT_NOFILE, Cur: l.MaxFiles, Max: l.MaxFiles})
+		b.rlimits = append(b.rlimits, rlimit.Limit{Resource: unix.RLIMIT_NOFILE, Cur: l.MaxFiles, Max: l.MaxFiles})
 	}
 	if l.MemoryBytes > 0 || l.CPUSeconds > 0 || l.MaxProcs > 0 {
 		b.watch = &watchdog{

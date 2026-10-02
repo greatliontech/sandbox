@@ -33,9 +33,26 @@ var _ = func() int {
 				os.Exit(3)
 			}
 		}
+		// The init's environment, counted for the test of its being
+		// the markers alone: written into the marker that asks.
+		if m := initEnvMarker(os.Getppid()); m != "" {
+			if _, err := os.Stat(m); err == nil {
+				os.WriteFile(m, []byte(strconv.Itoa(len(os.Environ()))), 0o644)
+			}
+		}
 	}
 	return 0
 }()
+
+// initEnvMarker names the marker beside this binary through which
+// the init child reports its environment's size.
+func initEnvMarker(pid int) string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(exe), "sandbox-init-env-"+strconv.Itoa(pid))
+}
 
 // initDeathMarker names the marker beside this binary: a place the
 // init child, whose environment is the markers alone (no TMPDIR),
@@ -80,5 +97,39 @@ func TestInitDeathReported(t *testing.T) {
 	}
 	if out.Len() != 0 || sb.Tier() != None {
 		t.Fatalf("something ran under a dead init: %q, tier %v", out.String(), sb.Tier())
+	}
+}
+
+// TestInitEnvironmentIsMarkersAlone pins the init child's environment
+// on every platform that re-execs: the three markers it reads and
+// nothing of the host's — a host variable set for the test never
+// reaches it.
+func TestInitEnvironmentIsMarkersAlone(t *testing.T) {
+	overrideMinimal(t)
+	marker := initEnvMarker(os.Getpid())
+	if marker == "" {
+		t.Fatal("this binary's own path is unknown")
+	}
+	if err := os.WriteFile(marker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(marker) })
+	t.Setenv("SANDBOX_TEST_HOST_VARIABLE", "set")
+	sb, err := New(Spec{Exec: "/bin/sh", Args: []string{"-c", "true"}, Network: true, Limits: Limits{MaxFiles: 256}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := sb.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	count, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(count) != "3" {
+		t.Fatalf("the init's environment held %s entries, want the three markers alone", count)
 	}
 }

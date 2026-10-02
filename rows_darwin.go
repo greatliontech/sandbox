@@ -136,7 +136,7 @@ func probeHost(ctx context.Context) (hostFacts, error) {
 		return f, nil
 	}
 	cmd := exec.CommandContext(ctx, sandboxExec, "-p", "(version 1)(allow default)", self)
-	cmd.Env = append(hostEnv(), envInit+"=1", envProbe+"=1")
+	cmd.Env = hostProbeEnv()
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return f, nil
@@ -147,7 +147,7 @@ func probeHost(ctx context.Context) (hostFacts, error) {
 			f.seatbelt = fmt.Errorf("seatbelt: %s", msg)
 			return f, nil
 		}
-		return f, fmt.Errorf("sandbox: seatbelt probe: the re-exec'd init died (%v): a package init of this binary must not act under %s", err, envInit)
+		return f, fmt.Errorf("sandbox: seatbelt probe: %s", initBreach("the re-exec'd init died", err))
 	}
 	return f, fmt.Errorf("sandbox: seatbelt probe: %w", err)
 }

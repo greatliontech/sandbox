@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"syscall"
 	"unicode/utf8"
 
+	"github.com/greatliontech/sandbox/internal/rlimit"
 	"golang.org/x/sys/unix"
 )
 
@@ -47,18 +47,13 @@ type darwinSandbox struct {
 
 // initConfig is the JSON payload handed to the re-exec'd init.
 type initConfig struct {
-	Row     string   `json:"row"`
-	WorkDir string   `json:"workdir,omitempty"`
-	Rlimits []rlimit `json:"rlimits,omitempty"`
+	initCommon
 	// Profile is the OS row's Seatbelt profile, applied by
 	// sandbox-exec around the second stage; empty on the Minimal row.
 	// Self is this binary at the kernel's spelling, the one the
 	// profile admits and the applier execs.
-	Profile string   `json:"profile,omitempty"`
-	Self    string   `json:"self,omitempty"`
-	Cmd     string   `json:"cmd"`
-	Args    []string `json:"args,omitempty"`
-	Env     []string `json:"env"`
+	Profile string `json:"profile,omitempty"`
+	Self    string `json:"self,omitempty"`
 }
 
 // envPlan carries the payload's exec plan from the init to the second
@@ -301,6 +296,7 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	if s.cmd != nil {
 		return errors.New("sandbox: already started")
 	}
+	s.group.Store(nil) // a failed start's group never serves the next
 	r, below, err := selection(ctx)
 	if err != nil {
 		return err
@@ -313,15 +309,6 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 		return err
 	}
 	b := selectBounds(s.spec.Limits)
-	// Under a Root the world is exactly the tree and the grants: an
-	// unstated environment is empty, never the host's.
-	env := s.spec.Env
-	if env == nil {
-		env = []string{}
-		if s.spec.Root == "" {
-			env = hostEnv()
-		}
-	}
 	self, err := selfExecutable()
 	if err != nil {
 		return fmt.Errorf("sandbox: %w", err)
@@ -329,14 +316,7 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 	if self, err = kernelPath(self); err != nil {
 		return fmt.Errorf("sandbox: this binary's path: %w", err)
 	}
-	cfg := initConfig{
-		Row:     r.tier.String(),
-		WorkDir: w.workDir,
-		Rlimits: b.rlimits,
-		Cmd:     w.cmd,
-		Args:    s.spec.Args,
-		Env:     env,
-	}
+	cfg := initConfig{initCommon: initCommon{Row: r.tier.String(), WorkDir: w.workDir, Rlimits: b.rlimits, Cmd: w.cmd, Args: s.spec.Args, Env: payloadEnv(s.spec)}}
 	if r.tier == OS {
 		cfg.Self = self
 		if cfg.Profile, err = profile(s.spec, w, self); err != nil {
@@ -345,16 +325,6 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 		if profileOverride != "" {
 			cfg.Profile = profileOverride
 		}
-	}
-	cfgR, cfgW, err := os.Pipe()
-	if err != nil {
-		return fmt.Errorf("sandbox: config pipe: %w", err)
-	}
-	statusR, statusW, err := os.Pipe()
-	if err != nil {
-		cfgR.Close()
-		cfgW.Close()
-		return fmt.Errorf("sandbox: status pipe: %w", err)
 	}
 	cmd := exec.CommandContext(ctx, self)
 	// Cancellation kills by the strongest tie the run holds: the
@@ -371,82 +341,43 @@ func (s *darwinSandbox) Start(ctx context.Context) error {
 		return nil
 	}
 	cmd.SysProcAttr = sysProcAttr()
-	cmd.Env = []string{envInit + "=1", envInitFD + "=3", envStatusFD + "=4"}
-	cmd.ExtraFiles = []*os.File{cfgR, statusW}
 	cmd.Stdin = s.spec.Stdin
 	cmd.Stdout = s.spec.Stdout
 	cmd.Stderr = s.spec.Stderr
-	startErr := cmd.Start()
-	if startErr != nil {
-		cfgR.Close()
-		cfgW.Close()
-		statusR.Close()
-		statusW.Close()
-		return fmt.Errorf("sandbox: start: %w", startErr)
-	}
-	// The child holds its own copies; close ours so EOF can reach us.
-	cfgR.Close()
-	statusW.Close()
 	// The group's identity is read, and the leader's exit watched,
 	// while the init is certainly alive: it blocks on the config until
-	// written. A failure here ends the init by its pid, which it
+	// written. A failure here ends the init by the strongest tie read
+	// so far (cmd.Cancel): the group's identity, or its pid, which it
 	// still holds unreaped.
-	g, err := groupOf(cmd.Process)
 	var exited *exitWatch
-	if err == nil {
+	started := func() error {
+		g, err := groupOf(cmd.Process)
+		if err != nil {
+			return err
+		}
 		s.group.Store(&g)
 		exited, err = watchExit(g)
 		if errors.Is(err, syscall.ESRCH) {
 			// The init is already a zombie of ours — a package init
 			// of this binary exited under the marker — which the
-			// empty status pipe reports as the init's death below
-			// (the config write failing for want of a reader read
-			// the same way); nothing is left to watch.
+			// empty status pipe reports as the init's death
+			// (startFailure); nothing is left to watch.
 			exited, err = nil, nil
 		}
-	}
-	if err != nil {
-		cfgW.Close()
-		statusR.Close()
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		cmd.Wait()
 		return err
 	}
-	if beforeConfigWrite != nil {
-		beforeConfigWrite()
-	}
-	encodeErr := json.NewEncoder(cfgW).Encode(&cfg)
-	cfgW.Close()
-	status, readErr := io.ReadAll(statusR)
-	statusR.Close()
-	// On every failure past this point the init is reaped and the
-	// watch, which then fired on the init's own exit at most, halted.
-	fail := func(err error) error {
-		_ = g.kill()
-		cmd.Wait()
+	// On every failure past the start the init is reaped by the
+	// protocol, and the watch, which then fired on the init's own
+	// exit at most, halted here.
+	if err := startInit(ctx, r.tier, cmd, &cfg, started, func() { _ = cmd.Cancel() }); err != nil {
 		exited.halt()
 		return err
 	}
-	if readErr != nil {
-		return fail(fmt.Errorf("sandbox: read init status: %w", readErr))
+	s.cmd, s.row, s.bounds, s.exited = cmd, r, b, exited
+	if b.watch != nil {
+		b.watch.start(*s.group.Load())
 	}
-	// A config write refused for want of a reader is the init dead
-	// before reading it, which the empty status pipe reports as the
-	// death it is (startFailure); any other write failure is its own.
-	if encodeErr != nil && !initUnread(encodeErr, status) {
-		return fail(fmt.Errorf("sandbox: write init config: %v", encodeErr))
-	}
-	outcome, reason := classifyStatus(status)
-	if outcome == initExeced {
-		s.cmd, s.row, s.bounds, s.exited = cmd, r, b, exited
-		if b.watch != nil {
-			b.watch.start(g)
-		}
-		return nil
-	}
-	waitErr := cmd.Wait()
-	exited.halt()
-	return startFailure(r.tier, outcome, reason, status, ctx.Err(), waitErr)
+	return nil
 }
 
 // Wait reaps the payload and reports how it ended — a signal death
@@ -467,26 +398,13 @@ func (s *darwinSandbox) Wait() (ExitStatus, error) {
 		return s.status, s.waitErr
 	}
 	s.waited = true
-	err := s.cmd.Wait()
+	status, err := reaped(s.cmd, s.cmd.Wait())
 	s.exited.halt()
 	if s.bounds.watch != nil {
 		s.bounds.watch.halt()
 	}
 	_ = s.group.Load().kill()
-	var exit *exec.ExitError
-	switch {
-	case err == nil:
-		s.status = ExitStatus{Code: 0}
-	case errors.As(err, &exit):
-		ws, ok := exit.Sys().(syscall.WaitStatus)
-		if ok && ws.Signaled() {
-			s.status = ExitStatus{Code: 128 + int(ws.Signal()), Signaled: true, Signal: ws.Signal()}
-		} else {
-			s.status = ExitStatus{Code: exit.ExitCode()}
-		}
-	default:
-		s.waitErr = err
-	}
+	s.status, s.waitErr = status, err
 	if s.bounds.watch != nil {
 		if _, _, werr := s.bounds.watch.stats(); werr != nil && s.waitErr == nil {
 			s.waitErr = werr
@@ -549,10 +467,8 @@ func composeInit() (execPlan, error) {
 	if err != nil {
 		return execPlan{}, err
 	}
-	for _, l := range cfg.Rlimits {
-		if err := syscall.Setrlimit(l.Resource, &syscall.Rlimit{Cur: l.Cur, Max: l.Max}); err != nil {
-			return execPlan{}, intentError{fmt.Errorf("bound (rlimit %d=%d): %w", l.Resource, l.Cur, err)}
-		}
+	if err := rlimit.Set(cfg.Rlimits); err != nil {
+		return execPlan{}, intentError{fmt.Errorf("bound: %w", err)}
 	}
 	if cfg.WorkDir != "" {
 		if err := os.Chdir(cfg.WorkDir); err != nil {
