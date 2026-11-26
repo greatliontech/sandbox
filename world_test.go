@@ -63,3 +63,19 @@ func TestRendezvousFileRefused(t *testing.T) {
 		t.Errorf("a rendezvous file: %v, want refused as no directory", err)
 	}
 }
+
+// TestNewValidation pins portable construction checks and KillExitCode across
+// all supported platforms.
+func TestNewValidation(t *testing.T) {
+	if KillExitCode != 137 {
+		t.Fatalf("KillExitCode = %d, want 137", KillExitCode)
+	}
+	if _, err := New(Spec{}); err == nil || !strings.Contains(err.Error(), "Spec.Exec is required") {
+		t.Fatalf("New(empty Exec) = %v, want Spec.Exec required", err)
+	}
+	for _, bad := range []Isolation{None - 1, Strong + 1} {
+		if _, err := New(Spec{Exec: "/bin/sh", MinTier: bad}); err == nil || !strings.Contains(err.Error(), "MinTier") {
+			t.Fatalf("New(MinTier=%d) = %v, want MinTier error", bad, err)
+		}
+	}
+}

@@ -60,9 +60,6 @@ type linuxSandbox struct {
 }
 
 func newSandbox(spec Spec) (Sandbox, error) {
-	if spec.Exec == "" {
-		return nil, errors.New("sandbox: Spec.Exec is required")
-	}
 	return &linuxSandbox{spec: spec}, nil
 }
 

@@ -3,6 +3,7 @@
 package nslinux
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -673,4 +674,380 @@ func TestCreateKeepsParentADomain(t *testing.T) {
 	if string(got) != "+memory +pids" {
 		t.Fatalf("subtree_control written %q, want one write naming memory first", got)
 	}
+}
+
+func TestSystemdDelegationBoundaries(t *testing.T) {
+	t.Run("undelegated user scope refused without mkdir or upward walk", func(t *testing.T) {
+		selfRel := "/user.slice/user-1000.slice/user@1000.service/tmux-spawn-1.scope"
+		h := fixtureHierarchy(t, selfRel)
+		// Make both the scope and user@1000.service writable with controllers
+		// enabled so only the systemd delegation check prevents placement.
+		subtreeControl(t, filepath.Join(h.Root, selfRel), "memory pids\n")
+		subtreeControl(t, filepath.Join(h.Root, "user.slice/user-1000.slice/user@1000.service"), "memory pids\n")
+		var gotUser bool
+		var gotUnit string
+		h.QuerySystemdUnit = func(_ context.Context, userManager bool, unit string) (SystemdUnitProps, error) {
+			gotUser, gotUnit = userManager, unit
+			return SystemdUnitProps{Delegate: "no", OOMPolicy: "stop"}, nil
+		}
+		if _, err := h.Create("s1", []string{"memory", "pids"}); !errors.Is(err, ErrNoAncestryBase) {
+			t.Fatalf("Create under undelegated scope = %v, want ErrNoAncestryBase", err)
+		}
+		if !gotUser || gotUnit != "tmux-spawn-1.scope" {
+			t.Fatalf("queried (%v, %q), want (true, tmux-spawn-1.scope)", gotUser, gotUnit)
+		}
+		for _, dir := range []string{
+			filepath.Join(h.Root, selfRel, "s1"),
+			filepath.Join(h.Root, "user.slice/user-1000.slice/user@1000.service/s1"),
+		} {
+			if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("unexpected directory created at %s", dir)
+			}
+		}
+	})
+
+	t.Run("delegated unit with OOMPolicy=stop or kill refused", func(t *testing.T) {
+		for _, policy := range []string{"stop", "kill"} {
+			selfRel := "/user.slice/user-1000.slice/user@1000.service/app.slice/run-1.scope"
+			h := fixtureHierarchy(t, selfRel)
+			subtreeControl(t, filepath.Join(h.Root, selfRel), "memory pids\n")
+			h.QuerySystemdUnit = func(context.Context, bool, string) (SystemdUnitProps, error) {
+				return SystemdUnitProps{Delegate: "yes", DelegateControllers: "memory pids", OOMPolicy: policy}, nil
+			}
+			if _, err := h.Create("s1", []string{"memory", "pids"}); !errors.Is(err, ErrNoAncestryBase) {
+				t.Fatalf("Create under OOMPolicy=%s = %v, want ErrNoAncestryBase", policy, err)
+			}
+		}
+	})
+
+	t.Run("empty OOMPolicy accepted on delegated scope for systemd pre-253 but refused on service", func(t *testing.T) {
+		scopeRel := "/user.slice/user-1000.slice/user@1000.service/app.slice/legacy.scope"
+		hScope := fixtureHierarchy(t, scopeRel)
+		subtreeControl(t, filepath.Join(hScope.Root, scopeRel), "memory pids\n")
+		hScope.QuerySystemdUnit = func(context.Context, bool, string) (SystemdUnitProps, error) {
+			return SystemdUnitProps{Delegate: "yes", DelegateControllers: "", OOMPolicy: ""}, nil
+		}
+		cg, err := hScope.Create("s1", []string{"memory", "pids"})
+		if err != nil {
+			t.Fatalf("delegated scope with empty OOMPolicy and empty DelegateControllers: %v", err)
+		}
+		if want := filepath.Join(hScope.Root, scopeRel, "s1"); cg.Dir != want {
+			t.Fatalf("cg.Dir = %q, want %q", cg.Dir, want)
+		}
+
+		svcRel := "/system.slice/legacy.service"
+		hSvc := fixtureHierarchy(t, svcRel)
+		subtreeControl(t, filepath.Join(hSvc.Root, svcRel), "memory pids\n")
+		hSvc.QuerySystemdUnit = func(context.Context, bool, string) (SystemdUnitProps, error) {
+			return SystemdUnitProps{Delegate: "yes", DelegateControllers: "", OOMPolicy: ""}, nil
+		}
+		if _, err := hSvc.Create("s1", []string{"memory", "pids"}); !errors.Is(err, ErrNoAncestryBase) {
+			t.Fatalf("service with empty OOMPolicy = %v, want ErrNoAncestryBase", err)
+		}
+	})
+
+	t.Run("delegated unit missing required controller refused", func(t *testing.T) {
+		selfRel := "/system.slice/worker.service"
+		h := fixtureHierarchy(t, selfRel)
+		subtreeControl(t, filepath.Join(h.Root, selfRel), "memory pids\n")
+		var gotUser bool
+		h.QuerySystemdUnit = func(_ context.Context, userManager bool, _ string) (SystemdUnitProps, error) {
+			gotUser = userManager
+			return SystemdUnitProps{Delegate: "yes", DelegateControllers: "pids", OOMPolicy: "continue"}, nil
+		}
+		if _, err := h.Create("s1", []string{"memory", "pids"}); !errors.Is(err, ErrNoAncestryBase) {
+			t.Fatalf("Create with missing memory controller = %v, want ErrNoAncestryBase", err)
+		}
+		if gotUser {
+			t.Fatal("system.slice service misclassified as user manager unit")
+		}
+	})
+
+	t.Run("escaped systemd unit names unescaped for query while preserving raw cgroup dir", func(t *testing.T) {
+		for _, tc := range []struct {
+			rawDir   string
+			wantUnit string
+		}{
+			{"_123.scope", "123.scope"},
+			{"__worker.service", "_worker.service"},
+		} {
+			selfRel := "/user.slice/user-0.slice/user@0.service/" + tc.rawDir
+			h := fixtureHierarchy(t, selfRel)
+			subtreeControl(t, filepath.Join(h.Root, selfRel), "memory pids\n")
+			var gotUser bool
+			var gotUnit string
+			h.QuerySystemdUnit = func(_ context.Context, userManager bool, unit string) (SystemdUnitProps, error) {
+				gotUser, gotUnit = userManager, unit
+				return SystemdUnitProps{Delegate: "yes", OOMPolicy: "continue"}, nil
+			}
+			cg, err := h.Create("s1", []string{"memory"})
+			if err != nil {
+				t.Fatalf("%s: Create: %v", tc.rawDir, err)
+			}
+			if !gotUser || gotUnit != tc.wantUnit {
+				t.Fatalf("%s: queried (%v, %q), want (true, %q)", tc.rawDir, gotUser, gotUnit, tc.wantUnit)
+			}
+			if want := filepath.Join(h.Root, selfRel, "s1"); cg.Dir != want {
+				t.Fatalf("%s: cg.Dir = %q, want %q", tc.rawDir, cg.Dir, want)
+			}
+		}
+	})
+
+	t.Run("vacated supervisor leaf under delegated systemd unit places sibling inside unit", func(t *testing.T) {
+		unitRel := "/user.slice/user-1000.slice/user@1000.service/app.slice/vacated.scope"
+		selfRel := unitRel + "/" + supervisorLeaf
+		h := fixtureHierarchy(t, selfRel)
+		subtreeControl(t, filepath.Join(h.Root, unitRel), "memory pids\n")
+		var gotUnit string
+		h.QuerySystemdUnit = func(_ context.Context, _ bool, unit string) (SystemdUnitProps, error) {
+			gotUnit = unit
+			return SystemdUnitProps{Delegate: "yes", OOMPolicy: "continue"}, nil
+		}
+		cg, err := h.Create("s1", []string{"memory", "pids"})
+		if err != nil {
+			t.Fatalf("Create from .supervisor leaf: %v", err)
+		}
+		if gotUnit != "vacated.scope" {
+			t.Fatalf("queried %q, want vacated.scope", gotUnit)
+		}
+		if want := filepath.Join(h.Root, unitRel, "s1"); cg.Dir != want {
+			t.Fatalf("cg.Dir = %q, want %q", cg.Dir, want)
+		}
+	})
+
+	t.Run("delegated unit accepted and ceiling stops at unit boundary", func(t *testing.T) {
+		unitRel := "/user.slice/user-1000.slice/user@1000.service/app.slice/run-ok.scope"
+		selfRel := unitRel + "/nested"
+		h := fixtureHierarchy(t, selfRel)
+		// nested has no subtree_control, so Create walks up to run-ok.scope;
+		// run-ok.scope also refuses if we restrict it, and the walk MUST stop
+		// at run-ok.scope rather than crossing into app.slice.
+		subtreeControl(t, filepath.Join(h.Root, "user.slice/user-1000.slice/user@1000.service/app.slice"), "memory pids\n")
+		h.QuerySystemdUnit = func(context.Context, bool, string) (SystemdUnitProps, error) {
+			return SystemdUnitProps{Delegate: "yes", DelegateControllers: "cpu memory pids", OOMPolicy: "continue"}, nil
+		}
+		if _, err := h.Create("s1", []string{"memory", "pids"}); !errors.Is(err, ErrNoAncestryBase) {
+			t.Fatalf("Create when unit itself refuses controllers = %v, want ErrNoAncestryBase (never walking into app.slice)", err)
+		}
+
+		// Now enable controllers on run-ok.scope: walk from nested lands at run-ok.scope.
+		subtreeControl(t, filepath.Join(h.Root, unitRel), "memory pids\n")
+		cg, err := h.Create("s1", []string{"memory", "pids"})
+		if err != nil {
+			t.Fatalf("Create under delegated unit: %v", err)
+		}
+		if want := filepath.Join(h.Root, unitRel, "s1"); cg.Dir != want {
+			t.Fatalf("cg.Dir = %q, want %q", cg.Dir, want)
+		}
+	})
+
+	t.Run("direct slice or user manager membership refused while non-manager template services allowed", func(t *testing.T) {
+		for _, selfRel := range []string{
+			"/user.slice/user-1000.slice",
+			"/user.slice/user-1000.slice/user@1000.service",
+			"/user.slice/user-0.slice/user@0.service",
+		} {
+			h := fixtureHierarchy(t, selfRel)
+			subtreeControl(t, filepath.Join(h.Root, selfRel), "memory pids\n")
+			h.QuerySystemdUnit = func(context.Context, bool, string) (SystemdUnitProps, error) {
+				t.Fatalf("QuerySystemdUnit must not be called for %s", selfRel)
+				return SystemdUnitProps{}, nil
+			}
+			if _, err := h.Create("s1", []string{"memory"}); !errors.Is(err, ErrNoAncestryBase) {
+				t.Errorf("Create at %s = %v, want ErrNoAncestryBase", selfRel, err)
+			}
+		}
+
+		// Non-UID template services (including "user@foo.service", "user@12a.service",
+		// "user@.service", and "worker@1.service") are ordinary service units, not
+		// systemd --user managers.
+		for _, unit := range []string{"user@foo.service", "user@12a.service", "user@:1.service", "user@.service", "worker@1.service"} {
+			selfRel := "/system.slice/" + unit
+			h := fixtureHierarchy(t, selfRel)
+			subtreeControl(t, filepath.Join(h.Root, selfRel), "memory pids\n")
+			var gotUser bool
+			var gotUnit string
+			h.QuerySystemdUnit = func(_ context.Context, userManager bool, u string) (SystemdUnitProps, error) {
+				gotUser, gotUnit = userManager, u
+				return SystemdUnitProps{Delegate: "yes", OOMPolicy: "continue"}, nil
+			}
+			cg, err := h.Create("s1", []string{"memory"})
+			if err != nil {
+				t.Fatalf("template unit %s: Create = %v, want accepted", unit, err)
+			}
+			if gotUser || gotUnit != unit || cg.Dir != filepath.Join(h.Root, selfRel, "s1") {
+				t.Fatalf("template unit %s: got (%v, %q, %q)", unit, gotUser, gotUnit, cg.Dir)
+			}
+		}
+	})
+
+	t.Run("context cancellation surfaces directly while ordinary query failure wraps ErrNoAncestryBase", func(t *testing.T) {
+		selfRel := "/system.slice/worker.service"
+		h := fixtureHierarchy(t, selfRel)
+		subtreeControl(t, filepath.Join(h.Root, selfRel), "memory pids\n")
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := h.CreateContext(ctx, "s1", []string{"memory"}); !errors.Is(err, context.Canceled) || errors.Is(err, ErrNoAncestryBase) {
+			t.Fatalf("pre-cancelled CreateContext = %v, want context.Canceled without ErrNoAncestryBase", err)
+		}
+
+		ctx2, cancel2 := context.WithCancel(context.Background())
+		h.QuerySystemdUnit = func(qctx context.Context, _ bool, _ string) (SystemdUnitProps, error) {
+			cancel2()
+			return SystemdUnitProps{}, qctx.Err()
+		}
+		if _, err := h.CreateContext(ctx2, "s1", []string{"memory"}); !errors.Is(err, context.Canceled) || errors.Is(err, ErrNoAncestryBase) {
+			t.Fatalf("query-cancelled CreateContext = %v, want context.Canceled without ErrNoAncestryBase", err)
+		}
+
+		h.QuerySystemdUnit = func(context.Context, bool, string) (SystemdUnitProps, error) {
+			return SystemdUnitProps{}, errors.New("dbus unavailable")
+		}
+		if _, err := h.CreateContext(context.Background(), "s1", []string{"memory"}); !errors.Is(err, ErrNoAncestryBase) {
+			t.Fatalf("non-context query error = %v, want ErrNoAncestryBase", err)
+		}
+	})
+
+	t.Run("parseSystemdShow", func(t *testing.T) {
+		got := parseSystemdShow([]byte("OOMPolicy=continue\r\nDelegate=yes\nDelegateControllers=cpu memory pids\nOther=ignored\n"))
+		want := SystemdUnitProps{Delegate: "yes", DelegateControllers: "cpu memory pids", OOMPolicy: "continue"}
+		if got != want {
+			t.Fatalf("parseSystemdShow = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("querySystemdUnitCached caches success without poisoning on errors or cancelled ctx", func(t *testing.T) {
+		binDir := t.TempDir()
+		countFile := filepath.Join(binDir, "calls")
+		modeFile := filepath.Join(binDir, "mode")
+		argsFile := filepath.Join(binDir, "args")
+		script := filepath.Join(binDir, "systemctl")
+		body := "#!/bin/sh\n" +
+			"printf 'x' >> " + countFile + "\n" +
+			"printf '%s\\n' \"$*\" > " + argsFile + "\n" +
+			"mode=$(cat " + modeFile + ")\n" +
+			"if [ \"$mode\" = \"fail\" ]; then exit 1; fi\n" +
+			"printf 'Delegate=yes\\nDelegateControllers=memory pids\\nOOMPolicy=continue\\n'\n"
+		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		unit := "sandbox-cache-test-" + strconv.Itoa(os.Getpid()) + ".scope"
+		t.Cleanup(func() {
+			systemdUnitMu.Lock()
+			delete(systemdUnitCache, unitCacheKey{userManager: true, unit: unit})
+			systemdUnitMu.Unlock()
+		})
+
+		// 1. Pre-cancelled context neither invokes systemctl nor caches.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := querySystemdUnitCached(ctx, true, unit); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled querySystemdUnitCached = %v, want context.Canceled", err)
+		}
+
+		// 2. Transient systemctl failure is returned without poisoning the cache.
+		if err := os.WriteFile(modeFile, []byte("fail"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := querySystemdUnitCached(context.Background(), true, unit); err == nil {
+			t.Fatal("expected failure when fake systemctl exits 1")
+		}
+
+		// 3. Subsequent call after transient error recovers, invokes systemctl once, and caches.
+		if err := os.WriteFile(modeFile, []byte("ok"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		props, err := querySystemdUnitCached(context.Background(), true, unit)
+		if err != nil || props.Delegate != "yes" || props.OOMPolicy != "continue" {
+			t.Fatalf("recovered query = (%+v, %v)", props, err)
+		}
+		gotArgs, _ := os.ReadFile(argsFile)
+		if !strings.Contains(string(gotArgs), "--user --no-ask-password show --property=Delegate,DelegateControllers,OOMPolicy -- "+unit) {
+			t.Fatalf("unexpected systemctl args: %q", gotArgs)
+		}
+		props2, err := querySystemdUnitCached(context.Background(), true, unit)
+		if err != nil || props2 != props {
+			t.Fatalf("cached query = (%+v, %v), want %+v", props2, err, props)
+		}
+		calls, _ := os.ReadFile(countFile)
+		if len(calls) != 2 {
+			t.Fatalf("systemctl invoked %d times, want 2 (1 failed + 1 cached success)", len(calls))
+		}
+	})
+}
+
+func TestCgroupPathContainment(t *testing.T) {
+	t.Run("out-of-namespace and malformed 0:: paths wrap ErrNoAncestryBase without escaping Root", func(t *testing.T) {
+		base := t.TempDir()
+		root := filepath.Join(base, "cg")
+		sibling := filepath.Join(base, "cg-sibling")
+		for _, d := range []string{root, sibling} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			subtreeControl(t, d, "memory pids\n")
+		}
+		mounts := filepath.Join(base, "mounts")
+		if err := os.WriteFile(mounts, []byte("cgroup2 "+root+" cgroup2 rw 0 0\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, badRel := range []string{
+			"/../cg-sibling",
+			"/../../foo.scope",
+			"/a/../b",
+			"/.",
+			"/a/./b",
+			"/a//b",
+			"relative/path",
+			"",
+		} {
+			selfCg := filepath.Join(base, "self-cgroup")
+			if err := os.WriteFile(selfCg, []byte("0::"+badRel+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			h := &Hierarchy{Root: root, ProcMounts: mounts, ProcSelfCgroup: selfCg}
+			if _, err := h.Create("s1", []string{"memory"}); !errors.Is(err, ErrNoAncestryBase) {
+				t.Fatalf("0::%s: Create = %v, want ErrNoAncestryBase", badRel, err)
+			}
+			if _, err := os.Stat(filepath.Join(sibling, "s1")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("0::%s escaped Root into sibling directory %s", badRel, sibling)
+			}
+		}
+	})
+
+	t.Run("sibling prefix rejected by placementCeiling", func(t *testing.T) {
+		h := fixtureHierarchy(t, "/")
+		if _, err := h.placementCeiling(context.Background(), "/sys/fs/cgroup", "/sys/fs/cgroup-sibling", []string{"memory"}); !errors.Is(err, ErrNoAncestryBase) {
+			t.Fatalf("placementCeiling on sibling prefix = %v, want ErrNoAncestryBase", err)
+		}
+	})
+
+	t.Run("Root named .supervisor stays inside Root", func(t *testing.T) {
+		base := t.TempDir()
+		root := filepath.Join(base, supervisorLeaf)
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		subtreeControl(t, root, "memory pids\n")
+		subtreeControl(t, base, "memory pids\n")
+		mounts := filepath.Join(base, "mounts")
+		selfCg := filepath.Join(base, "self")
+		if err := os.WriteFile(mounts, []byte("cgroup2 "+root+" cgroup2 rw 0 0\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(selfCg, []byte("0::/\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		h := &Hierarchy{Root: root, ProcMounts: mounts, ProcSelfCgroup: selfCg}
+		cg, err := h.Create("s1", []string{"memory"})
+		if err != nil {
+			t.Fatalf("Create at Root named .supervisor: %v", err)
+		}
+		if want := filepath.Join(root, "s1"); cg.Dir != want {
+			t.Fatalf("cg.Dir = %q, want %q", cg.Dir, want)
+		}
+	})
 }

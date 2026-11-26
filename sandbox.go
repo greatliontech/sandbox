@@ -54,11 +54,11 @@ const (
 	// AppContainer). On Linux and darwin the row has no namespaces:
 	// it presents no hostname (a stated one is refused,
 	// ErrUndeliverable), it bounds the world to a Root at the tree's
-	// host path rather than at "/" (on Linux loading static
-	// entrypoints only there; on darwin a Root is refused until its
-	// world is delivered), and it refuses a read-only grant without
-	// a Root; its kill ties are the Minimal row's (docs/specs/
-	// sandbox.md, the ladder).
+	// host path rather than at "/" (loading static entrypoints only on
+	// Linux, and Mach-O executables whose libraries are the platform
+	// substrate or image-relative on darwin), and it refuses a
+	// read-only grant without a Root; its kill ties are the Minimal
+	// row's (docs/specs/sandbox.md, the ladder).
 	OS
 	// Strong: a kernel-enforced boundary (Linux namespaces).
 	Strong
@@ -299,7 +299,14 @@ func (e *TierError) Unwrap() error { return ErrWeakerThanRequired }
 // than "this host cannot do it strongly enough".
 var ErrUndeliverable = errors.New("sandbox: intent cannot be delivered on this host")
 
-// ExitStatus reports how the sandboxed process terminated.
+// KillExitCode is the exit code (128 + 9) reported for a SIGKILL death
+// on Unix and used on Windows when sandbox terminates a run through
+// cancellation, Destroy, Signal(os.Kill), or a resource bound.
+const KillExitCode = 137
+
+// ExitStatus reports how the sandboxed process terminated. On Windows,
+// processes terminated by sandbox exit with Code == KillExitCode and
+// Signaled == false.
 type ExitStatus struct {
 	Code     int
 	Signaled bool
@@ -365,7 +372,14 @@ func New(spec Spec) (Sandbox, error) {
 	if spec.MinTier < None || spec.MinTier > Strong {
 		return nil, fmt.Errorf("sandbox: MinTier %d names no tier (%s through %s)", spec.MinTier, None, Strong)
 	}
-	return newSandbox(spec)
+	sb, err := newSandbox(spec)
+	if err != nil {
+		return nil, err
+	}
+	if spec.Exec == "" {
+		return nil, errors.New("sandbox: Spec.Exec is required")
+	}
+	return sb, nil
 }
 
 // Reach reports the row this host reaches for spec — the one Start

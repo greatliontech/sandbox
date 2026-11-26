@@ -231,7 +231,7 @@ func (b *bounds) watch() {
 func (b *bounds) end() {
 	b.killed = true
 	if b.job != 0 {
-		_ = windows.TerminateJobObject(b.job, killExitCode)
+		_ = windows.TerminateJobObject(b.job, KillExitCode)
 	}
 }
 
@@ -243,7 +243,7 @@ func (b *bounds) finish() {
 	defer b.mu.Unlock()
 	b.finished = true
 	if b.job != 0 {
-		_ = windows.TerminateJobObject(b.job, killExitCode)
+		_ = windows.TerminateJobObject(b.job, KillExitCode)
 	}
 }
 
@@ -337,7 +337,3 @@ func (b *bounds) close() {
 		b.job = 0
 	}
 }
-
-// killExitCode is the exit code of a process the sandbox ended: what
-// a SIGKILL death reads as on the unix rows, 128 plus the signal.
-const killExitCode = 137

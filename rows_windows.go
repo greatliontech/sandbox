@@ -124,7 +124,7 @@ func probeHost(ctx context.Context) (f hostFacts, err error) {
 		f.appContainer = fmt.Errorf("appcontainer: a process under a container: %v", lerr)
 		return f, nil
 	}
-	windows.TerminateProcess(pi.Process, killExitCode)
+	windows.TerminateProcess(pi.Process, KillExitCode)
 	windows.CloseHandle(pi.Thread)
 	windows.CloseHandle(pi.Process)
 	return f, err

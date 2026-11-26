@@ -11,6 +11,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -193,7 +194,7 @@ func (s *windowsSandbox) Start(ctx context.Context) error {
 	// the copiers end on their own as the pipes do (a stated reader
 	// that never ends keeps its copier, as it would keep Wait).
 	abandon := func(err error) error {
-		windows.TerminateProcess(pi.Process, killExitCode)
+		windows.TerminateProcess(pi.Process, KillExitCode)
 		windows.CloseHandle(pi.Thread)
 		windows.CloseHandle(pi.Process)
 		for _, c := range closers {
@@ -463,7 +464,7 @@ func envBlock(env []string) ([]uint16, error) {
 
 // Wait reaps the payload and reports how it ended: its exit code,
 // never a signal, the platform having none — a process the sandbox
-// ended exits with killExitCode. At the payload's exit the run's
+// ended exits with KillExitCode. At the payload's exit the run's
 // remnants are ended through the Job, the Job's readers halted and
 // its account read, the Job closed, the container's profile deleted
 // and the granted entries relieved of its identity. A bound the
@@ -552,7 +553,7 @@ func (s *windowsSandbox) Signal(sig os.Signal) error {
 	if !s.running {
 		return errors.New("sandbox: not running")
 	}
-	return windows.TerminateProcess(s.process, killExitCode)
+	return windows.TerminateProcess(s.process, KillExitCode)
 }
 
 // Destroy kills the run through its Job and reaps it.
@@ -609,11 +610,97 @@ func networkCapabilities() (*windows.SIDAndAttributes, uint32, error) {
 	return &caps[0], uint32(len(caps)), nil
 }
 
-// descriptors serializes this process's writes of security
-// descriptors: a write reads the entry list, changes it and writes it
-// back, which two runs of one process over one directory would race.
-// Two processes racing the same descriptor are not serialized here.
+// descriptors serializes in-process goroutines before acquiring the
+// session-wide kernel mutex (descriptorMutexName) that serializes
+// read-modify-write DACL updates across processes sharing a Root or
+// granted directory.
 var descriptors sync.Mutex
+
+const (
+	descriptorMutexName = `Local\greatliontech.sandbox.descriptors`
+	// descriptorMutexSDDL grants SYNCHRONIZE|MUTEX_MODIFY_STATE (0x00100001)
+	// to SYSTEM, Administrators, Authenticated Users, and Local Service at
+	// Medium+ integrity (NO_WRITE_UP), so UAC split-token callers and
+	// multi-user Session 0 processes can coordinate without granting
+	// WRITE_DAC/WRITE_OWNER or admitting Low-Integrity/AppContainer processes.
+	descriptorMutexSDDL = "D:(A;;0x00100001;;;SY)(A;;0x00100001;;;BA)(A;;0x00100001;;;AU)(A;;0x00100001;;;LS)S:(ML;;NW;;;ME)"
+)
+
+type descriptorMutexConfig struct {
+	name *uint16
+	sd   *windows.SECURITY_DESCRIPTOR
+}
+
+var descriptorMutexSetup = sync.OnceValues(func() (descriptorMutexConfig, error) {
+	name, err := windows.UTF16PtrFromString(descriptorMutexName)
+	if err != nil {
+		return descriptorMutexConfig{}, err
+	}
+	sd, err := windows.SecurityDescriptorFromString(descriptorMutexSDDL)
+	if err != nil {
+		return descriptorMutexConfig{}, err
+	}
+	return descriptorMutexConfig{name: name, sd: sd}, nil
+})
+
+func openDescriptorMutex() (windows.Handle, error) {
+	cfg, err := descriptorMutexSetup()
+	if err != nil {
+		return 0, fmt.Errorf("sandbox: descriptor mutex setup: %w", err)
+	}
+	sa := &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: cfg.sd,
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		h, err := windows.CreateMutex(sa, false, cfg.name)
+		if err == nil {
+			return h, nil
+		}
+		if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return 0, fmt.Errorf("sandbox: descriptor mutex: %w", err)
+		}
+		// CreateMutex requests MUTEX_ALL_ACCESS when opening an existing
+		// named mutex; callers that are not its creator/owner hold only
+		// SYNCHRONIZE|MUTEX_MODIFY_STATE via descriptorMutexSDDL and open
+		// it through OpenMutex. Retry if the last holder closed the mutex
+		// between CreateMutex and OpenMutex.
+		h, oerr := windows.OpenMutex(windows.SYNCHRONIZE|windows.MUTEX_MODIFY_STATE, false, cfg.name)
+		if oerr == nil {
+			return h, nil
+		}
+		if !errors.Is(oerr, windows.ERROR_FILE_NOT_FOUND) {
+			return 0, fmt.Errorf("sandbox: open descriptor mutex: %w", oerr)
+		}
+	}
+	return 0, errors.New("sandbox: descriptor mutex contention prevented open")
+}
+
+// withDescriptorLock runs fn while holding both the in-process mutex
+// and the session-scoped Windows kernel mutex on a pinned OS thread
+// (Win32 mutex ownership is thread-affine). WAIT_ABANDONED is accepted
+// so a peer process killed mid-update never wedges subsequent runs.
+func withDescriptorLock(fn func() error) error {
+	descriptors.Lock()
+	defer descriptors.Unlock()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	h, err := openDescriptorMutex()
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+
+	event, err := windows.WaitForSingleObject(h, windows.INFINITE)
+	if err != nil || (event != windows.WAIT_OBJECT_0 && event != windows.WAIT_ABANDONED) {
+		return fmt.Errorf("sandbox: wait descriptor mutex (event %#x): %w", event, err)
+	}
+	defer func() { _ = windows.ReleaseMutex(h) }()
+
+	return fn()
+}
 
 // errReachedAlready is admit's answer where the entry needs none:
 // the platform grants every package what the directory already
@@ -640,33 +727,33 @@ func admit(path string, sid *windows.SID, write bool) error {
 	if write {
 		access = writeAccess
 	}
-	descriptors.Lock()
-	defer descriptors.Unlock()
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-	if err != nil {
-		return err
-	}
-	old, _, err := sd.DACL()
-	if err != nil {
-		return err
-	}
-	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
-		AccessPermissions: access,
-		AccessMode:        windows.SET_ACCESS,
-		Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-		Trustee:           windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_UNKNOWN, TrusteeValue: windows.TrusteeValueFromSID(sid)},
-	}}, old)
-	if err != nil {
-		return err
-	}
-	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
-		fi, statErr := os.Stat(path)
-		if errors.Is(err, windows.ERROR_ACCESS_DENIED) && !write && statErr == nil && allows(old, access, fi.IsDir()) {
-			return errReachedAlready
+	return withDescriptorLock(func() error {
+		sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			return err
 		}
-		return err
-	}
-	return nil
+		old, _, err := sd.DACL()
+		if err != nil {
+			return err
+		}
+		acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
+			AccessPermissions: access,
+			AccessMode:        windows.SET_ACCESS,
+			Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+			Trustee:           windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_UNKNOWN, TrusteeValue: windows.TrusteeValueFromSID(sid)},
+		}}, old)
+		if err != nil {
+			return err
+		}
+		if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+			fi, statErr := os.Stat(path)
+			if errors.Is(err, windows.ERROR_ACCESS_DENIED) && !write && statErr == nil && allows(old, access, fi.IsDir()) {
+				return errReachedAlready
+			}
+			return err
+		}
+		return nil
+	})
 }
 
 // deliveredWhole holds every whole grant to being delivered whole to
@@ -816,24 +903,24 @@ func relieve(path string, sid *windows.SID) error {
 	if sid == nil {
 		return nil
 	}
-	descriptors.Lock()
-	defer descriptors.Unlock()
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
-	if err != nil {
-		return err
-	}
-	old, _, err := sd.DACL()
-	if err != nil {
-		return err
-	}
-	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
-		AccessPermissions: windows.GENERIC_ALL,
-		AccessMode:        windows.REVOKE_ACCESS,
-		Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-		Trustee:           windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_UNKNOWN, TrusteeValue: windows.TrusteeValueFromSID(sid)},
-	}}, old)
-	if err != nil {
-		return err
-	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+	return withDescriptorLock(func() error {
+		sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			return err
+		}
+		old, _, err := sd.DACL()
+		if err != nil {
+			return err
+		}
+		acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
+			AccessPermissions: windows.GENERIC_ALL,
+			AccessMode:        windows.REVOKE_ACCESS,
+			Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+			Trustee:           windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_UNKNOWN, TrusteeValue: windows.TrusteeValueFromSID(sid)},
+		}}, old)
+		if err != nil {
+			return err
+		}
+		return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+	})
 }

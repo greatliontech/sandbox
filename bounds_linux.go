@@ -92,7 +92,7 @@ func selectBounds(ctx context.Context, l Limits, hierarchy *nslinux.Hierarchy) (
 	if l.MaxProcs > 0 {
 		controllers = append(controllers, "pids")
 	}
-	cg, err := hierarchy.Create(cgroupName("sandbox"), controllers)
+	cg, err := hierarchy.CreateContext(ctx, cgroupName("sandbox"), controllers)
 	if errors.Is(err, nslinux.ErrNoAncestryBase) {
 		return fallback()
 	}
@@ -189,7 +189,7 @@ func probePlacement(ctx context.Context, hierarchy *nslinux.Hierarchy) (bool, er
 	if err != nil || !mounted {
 		return false, err
 	}
-	cg, err := hierarchy.Create(cgroupName(".placement"), []string{"memory", "pids"})
+	cg, err := hierarchy.CreateContext(ctx, cgroupName(".placement"), []string{"memory", "pids"})
 	if errors.Is(err, nslinux.ErrNoAncestryBase) {
 		return false, nil
 	}

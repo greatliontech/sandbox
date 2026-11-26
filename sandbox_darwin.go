@@ -60,9 +60,6 @@ type initConfig struct {
 const envPlan = "_SANDBOX_PLAN"
 
 func newSandbox(spec Spec) (Sandbox, error) {
-	if spec.Exec == "" {
-		return nil, errors.New("sandbox: Spec.Exec is required")
-	}
 	return &darwinSandbox{spec: spec}, nil
 }
 

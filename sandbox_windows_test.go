@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -124,6 +126,50 @@ func child(mode string) {
 		say("repermission", err)
 	case "sleep":
 		time.Sleep(20 * time.Second)
+	case "abandonmutex":
+		runtime.LockOSThread()
+		h, err := openDescriptorMutex()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "openDescriptorMutex: %v\n", err)
+			os.Exit(2)
+		}
+		ev, err := windows.WaitForSingleObject(h, windows.INFINITE)
+		if err != nil || (ev != windows.WAIT_OBJECT_0 && ev != windows.WAIT_ABANDONED) {
+			fmt.Fprintf(os.Stderr, "WaitForSingleObject: %#x %v\n", ev, err)
+			os.Exit(2)
+		}
+		fmt.Println("locked")
+		var b [1]byte
+		_, _ = os.Stdin.Read(b[:])
+		// Exit without ReleaseMutex or CloseHandle so the kernel marks the
+		// mutant abandoned for any open handle surviving this process.
+		os.Exit(0)
+	case "rootworker":
+		tree := os.Getenv("SANDBOX_TEST_WORKER_TREE")
+		for i := 0; i < 6; i++ {
+			out := &output{}
+			sb, err := New(Spec{
+				Exec:   "/payload.exe",
+				Env:    []string{childEnv + "=hello"},
+				Root:   tree,
+				Limits: Limits{CPUSeconds: 60},
+				Stdout: out,
+				Stderr: out,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "New: %v\n", err)
+				os.Exit(2)
+			}
+			if err := sb.Start(context.Background()); err != nil {
+				fmt.Fprintf(os.Stderr, "Start(%d): %v\n", i, err)
+				os.Exit(2)
+			}
+			st, err := sb.Wait()
+			if err != nil || st.Code != 0 || facts(out.String())["hello"] != "world" {
+				fmt.Fprintf(os.Stderr, "Wait(%d): %+v %v %q\n", i, st, err, out.String())
+				os.Exit(2)
+			}
+		}
 	case "world":
 		// The Root world: the tree read and executed at its host path,
 		// never written; a grant and the rendezvous directory at
@@ -365,7 +411,7 @@ func TestDestroyDuringWait(t *testing.T) {
 	}
 	select {
 	case r := <-waited:
-		if r.err != nil || r.st.Code != killExitCode {
+		if r.err != nil || r.st.Code != KillExitCode {
 			t.Fatalf("Wait = %+v %v, want the kill; the payload said %q", r.st, r.err, out.String())
 		}
 	case <-time.After(10 * time.Second):
@@ -556,7 +602,7 @@ func TestCPUBoundKillsSpinner(t *testing.T) {
 	spec.Limits = Limits{CPUSeconds: 1}
 	start := time.Now()
 	sb, st := run(t, spec)
-	if st.Code != killExitCode || facts(out.String())["spun"] == "yes" {
+	if st.Code != KillExitCode || facts(out.String())["spun"] == "yes" {
 		t.Fatalf("exit %+v after %v, output %q; want a kill", st, time.Since(start), out.String())
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
@@ -595,7 +641,7 @@ func TestProcessBoundRefusesSpawn(t *testing.T) {
 		t.Fatalf("stats %+v %v, want the refusals counted", stats, err)
 	}
 	cancel()
-	if st, err := sb.Wait(); err != nil || st.Code != killExitCode {
+	if st, err := sb.Wait(); err != nil || st.Code != KillExitCode {
 		t.Fatalf("Wait after cancel: %+v %v", st, err)
 	}
 }
@@ -624,7 +670,7 @@ func TestCancelKillsJob(t *testing.T) {
 		t.Fatalf("the payload named no child: %q", out.String())
 	}
 	cancel()
-	if st, err := sb.Wait(); err != nil || st.Code != killExitCode {
+	if st, err := sb.Wait(); err != nil || st.Code != KillExitCode {
 		t.Fatalf("Wait after cancel: %+v %v", st, err)
 	}
 	deadline = time.Now().Add(5 * time.Second)
@@ -662,7 +708,7 @@ func TestSignalKillsPayloadAlone(t *testing.T) {
 	if err := sb.Signal(os.Kill); err != nil {
 		t.Fatal(err)
 	}
-	if st, err := sb.Wait(); err != nil || st.Code != killExitCode {
+	if st, err := sb.Wait(); err != nil || st.Code != KillExitCode {
 		t.Fatalf("Wait after kill: %+v %v", st, err)
 	}
 }
@@ -1128,5 +1174,107 @@ func TestCheckPE(t *testing.T) {
 	}
 	if err := checkPE(script); err == nil || !strings.Contains(err.Error(), "not a PE image") {
 		t.Fatalf("a script: %v", err)
+	}
+}
+
+// TestConcurrentProcessesShareRoot pins cross-process DACL serialization on
+// shared Root directories (e.g. concurrent plugin executions over a cached
+// rootfs): multiple independent OS processes concurrently admitting and
+// relieving AppContainer SIDs on one Root neither clobber each other's ACEs
+// nor leave stale container entries behind.
+func TestConcurrentProcessesShareRoot(t *testing.T) {
+	requireAppContainer(t)
+	tree := rootTree(t)
+	exe := must(os.Executable())
+
+	const workers = 4
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			cmd := exec.Command(exe)
+			cmd.Env = append(os.Environ(), childEnv+"=rootworker", "SANDBOX_TEST_WORKER_TREE="+tree)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				errs <- fmt.Errorf("%w: %s", err, out)
+				return
+			}
+			errs <- nil
+		}()
+	}
+	for i := 0; i < workers; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("worker %d: %v", i, err)
+		}
+	}
+	if n := entries(t, tree); n != 0 {
+		t.Fatalf("shared tree %s retains %d container entries after concurrent runs", tree, n)
+	}
+}
+
+// TestAbandonedDescriptorMutexRecovered pins recovery when a peer process
+// terminates while holding descriptorMutexName: keeping a handle open via
+// OpenMutex preserves the kernel mutant across the peer's exit so the next
+// withDescriptorLock call receives WAIT_ABANDONED, recovers ownership cleanly,
+// runs the sandbox, and leaves zero container entries behind.
+func TestAbandonedDescriptorMutexRecovered(t *testing.T) {
+	requireAppContainer(t)
+	tree := rootTree(t)
+	exe := must(os.Executable())
+
+	cmd := exec.Command(exe)
+	cmd.Env = append(os.Environ(), childEnv+"=abandonmutex")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil || strings.TrimSpace(line) != "locked" {
+		t.Fatalf("helper output = %q (%v), want \"locked\"", line, err)
+	}
+
+	cfg, err := descriptorMutexSetup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keepAlive, err := windows.OpenMutex(windows.SYNCHRONIZE|windows.MUTEX_MODIFY_STATE, false, cfg.name)
+	if err != nil {
+		t.Fatalf("OpenMutex(SYNCHRONIZE|MUTEX_MODIFY_STATE): %v", err)
+	}
+	defer windows.CloseHandle(keepAlive)
+
+	_ = stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("abandonmutex helper wait: %v", err)
+	}
+
+	out := &output{}
+	sb, st := run(t, Spec{
+		Exec:   "/payload.exe",
+		Env:    []string{childEnv + "=hello"},
+		Root:   tree,
+		Limits: Limits{CPUSeconds: 60},
+		Stdout: out,
+		Stderr: out,
+	})
+	if st.Code != 0 || facts(out.String())["hello"] != "world" || sb.Tier() != OS {
+		t.Fatalf("run after abandoned mutex: exit %+v, tier %v, output %q", st, sb.Tier(), out.String())
+	}
+	if n := entries(t, tree); n != 0 {
+		t.Fatalf("tree %s retains %d container entries after recovery", tree, n)
 	}
 }

@@ -4,18 +4,31 @@ package nslinux
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// SystemdUnitProps holds the systemd unit properties governing whether
+// child cgroups with memory/pids controllers may be placed safely inside
+// an enclosing .scope or .service unit without violating systemd's
+// single-writer rule or triggering unit-wide OOMPolicy=stop/kill terminations.
+type SystemdUnitProps struct {
+	Delegate            string
+	DelegateControllers string
+	OOMPolicy           string
+}
 
 // Hierarchy locates the cgroup v2 unified hierarchy. The zero value
 // is unusable; use DefaultHierarchy for the live kernel interface.
@@ -26,6 +39,9 @@ type Hierarchy struct {
 	ProcMounts     string // mount table, normally /proc/mounts
 	ProcSelfCgroup string // own membership, normally /proc/self/cgroup
 	ProcSwaps      string // the swap table, normally /proc/swaps; empty means that
+	// QuerySystemdUnit overrides the live systemctl property lookup in
+	// tests using systemd-shaped fixture paths (.slice/.scope/.service).
+	QuerySystemdUnit func(ctx context.Context, userManager bool, unit string) (SystemdUnitProps, error)
 }
 
 // DefaultHierarchy returns the live kernel interface paths.
@@ -95,16 +111,67 @@ func (h *Hierarchy) SelfDir() (string, error) {
 
 // parseSelfCgroup extracts the v2 path ("0::<path>") from a
 // /proc/<pid>/cgroup listing; v1 controller lines are ignored.
+// Paths outside the mounted cgroup namespace root (e.g. "0::/../sibling"
+// written by the kernel when a task's cgroup lies outside its cgroupns)
+// wrap ErrNoAncestryBase so callers fall back cleanly to rlimits.
 func parseSelfCgroup(data []byte) (string, error) {
 	for line := range bytes.Lines(data) {
 		if rest, ok := strings.CutPrefix(strings.TrimSpace(string(line)), "0::"); ok {
+			if !validCgroupRelPath(rest) {
+				return "", fmt.Errorf("cgroup: v2 membership %q lies outside hierarchy root: %w", rest, ErrNoAncestryBase)
+			}
 			return rest, nil
 		}
 	}
 	return "", errors.New("cgroup: no v2 entry in cgroup membership")
 }
 
+func validCgroupRelPath(rel string) bool {
+	if !strings.HasPrefix(rel, "/") {
+		return false
+	}
+	if rel == "/" {
+		return true
+	}
+	for _, seg := range strings.Split(rel[1:], "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// withinOrEqual reports whether path is base or a descendant beneath base
+// on a strict "/" segment boundary.
+func withinOrEqual(path, base string) bool {
+	if path == base {
+		return true
+	}
+	if base == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+	return strings.HasPrefix(path, base+"/")
+}
+
+// relWithin returns path relative to base ("" when path == base, otherwise
+// without leading "/"), or false when path is outside base.
+func relWithin(base, path string) (string, bool) {
+	if path == base {
+		return "", true
+	}
+	if base == "/" {
+		return strings.CutPrefix(path, "/")
+	}
+	return strings.CutPrefix(path, base+"/")
+}
+
 // Create makes a fresh cgroup named name with the named controllers
+// enabled for it in its parent's subtree_control; see CreateContext.
+func (h *Hierarchy) Create(name string, controllers []string) (*Cgroup, error) {
+	return h.CreateContext(context.Background(), name, controllers)
+}
+
+// CreateContext makes a fresh cgroup named name with the named controllers
 // enabled for it in its parent's subtree_control. The parent is
 // found by walking from the caller's own cgroup upward to Root,
 // taking the first directory that accepts both the creation and the
@@ -124,21 +191,29 @@ func parseSelfCgroup(data []byte) (string, error) {
 // that tie. The enabled set always includes a domain controller
 // (withDomain): a thread-capable set alone would turn the parent
 // into a thread root whose children can host no process.
-func (h *Hierarchy) Create(name string, controllers []string) (*Cgroup, error) {
+func (h *Hierarchy) CreateContext(ctx context.Context, name string, controllers []string) (*Cgroup, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	controllers = withDomain(controllers)
 	self, err := h.SelfDir()
 	if err != nil {
 		return nil, err
 	}
+	root := h.root()
 	// A process vacate moved into a supervisor leaf is still the
 	// delegated cgroup's tenant: its cgroups are the leaf's siblings,
-	// never its children.
-	if filepath.Base(self) == supervisorLeaf {
+	// never its children. Guard self != root so a Root directory named
+	// ".supervisor" never steps outside Root.
+	if self != root && filepath.Base(self) == supervisorLeaf {
 		self = filepath.Dir(self)
 	}
-	root := h.root()
+	ceiling, err := h.placementCeiling(ctx, root, self, controllers)
+	if err != nil {
+		return nil, fmt.Errorf("cgroup: create %s: %w", name, err)
+	}
 	var firstErr error
-	for dir := self; strings.HasPrefix(dir, root); dir = filepath.Dir(dir) {
+	for dir := self; withinOrEqual(dir, ceiling); dir = filepath.Dir(dir) {
 		child := filepath.Join(dir, name)
 		err := os.Mkdir(child, 0o755)
 		if errors.Is(err, fs.ErrExist) {
@@ -159,11 +234,203 @@ func (h *Hierarchy) Create(name string, controllers []string) (*Cgroup, error) {
 		if firstErr == nil {
 			firstErr = err
 		}
-		if dir == root {
+		if dir == ceiling {
 			break
 		}
 	}
 	return nil, fmt.Errorf("cgroup: create %s: %w: %w", name, ErrNoAncestryBase, firstErr)
+}
+
+// placementCeiling determines the highest ancestor directory on self's
+// path (within root) in which CreateContext may place a child cgroup.
+//
+// In a non-systemd hierarchy (no .slice, .scope, or .service path
+// segments), the ceiling is root itself.
+//
+// In a systemd-managed hierarchy, systemd owns all .slice directories
+// and the user@<uid>.service manager unit; payload processes may place
+// sub-cgroups only inside their innermost enclosing .scope or .service
+// unit, and only when systemd actually delegated the required
+// controllers to that unit without OOMPolicy=stop or OOMPolicy=kill.
+// Under systemd --user, undelegated scopes (such as tmux-spawn-*.scope
+// or terminal scopes) are still filesystem-writable by the user's UID
+// yet carry Delegate=no and OOMPolicy=stop: placing a memory-bounded
+// child cgroup inside them propagates child oom_kill events to the
+// unit's memory.events and causes systemd --user to kill the entire
+// caller unit.
+func (h *Hierarchy) placementCeiling(ctx context.Context, root, self string, controllers []string) (string, error) {
+	rel, ok := relWithin(root, self)
+	if !ok {
+		return "", fmt.Errorf("%w: cgroup %s lies outside hierarchy root %s", ErrNoAncestryBase, self, root)
+	}
+	if rel == "" {
+		return root, nil
+	}
+	segs := strings.Split(rel, "/")
+	hasSystemd := false
+	unitIdx := -1
+	for i := len(segs) - 1; i >= 0; i-- {
+		seg := segs[i]
+		if isSystemdSlice(seg) || isSystemdUnit(seg) {
+			hasSystemd = true
+		}
+		if unitIdx < 0 && isSystemdUnit(seg) {
+			unitIdx = i
+		}
+	}
+	if !hasSystemd {
+		return root, nil
+	}
+	if unitIdx < 0 {
+		return "", fmt.Errorf("%w: cgroup %s lies directly in a systemd slice", ErrNoAncestryBase, self)
+	}
+	unit := unescapeSystemdUnit(segs[unitIdx])
+	if isUserManagerUnit(unit) {
+		return "", fmt.Errorf("%w: cgroup %s is the systemd user manager %s itself", ErrNoAncestryBase, self, unit)
+	}
+	userManager := slices.ContainsFunc(segs[:unitIdx], func(seg string) bool {
+		return isUserManagerUnit(unescapeSystemdUnit(seg))
+	})
+	unitDir := filepath.Join(append([]string{root}, segs[:unitIdx+1]...)...)
+
+	query := h.QuerySystemdUnit
+	if query == nil {
+		query = querySystemdUnitCached
+	}
+	props, err := query(ctx, userManager, unit)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("%w: systemd unit %s delegation check failed: %v", ErrNoAncestryBase, unit, err)
+	}
+	if !systemdPropsAllow(props, unit, controllers) {
+		return "", fmt.Errorf("%w: systemd unit %s is not safely delegated (Delegate=%q OOMPolicy=%q DelegateControllers=%q)", ErrNoAncestryBase, unit, props.Delegate, props.OOMPolicy, props.DelegateControllers)
+	}
+	return unitDir, nil
+}
+
+// unescapeSystemdUnit reverses systemd's cg_escape, which prepends a
+// single '_' to cgroup directory names that begin with '_', '.', digits,
+// or cgroupfs knob names.
+func unescapeSystemdUnit(seg string) string {
+	return strings.TrimPrefix(seg, "_")
+}
+
+func isSystemdSlice(seg string) bool {
+	return strings.HasSuffix(seg, ".slice")
+}
+
+func isSystemdUnit(seg string) bool {
+	return strings.HasSuffix(seg, ".scope") || strings.HasSuffix(seg, ".service")
+}
+
+func isUserManagerUnit(seg string) bool {
+	rest, ok := strings.CutPrefix(seg, "user@")
+	if !ok {
+		return false
+	}
+	rest, ok = strings.CutSuffix(rest, ".service")
+	if !ok || rest == "" {
+		return false
+	}
+	for i := 0; i < len(rest); i++ {
+		if rest[i] < '0' || rest[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func systemdPropsAllow(p SystemdUnitProps, unit string, controllers []string) bool {
+	if p.Delegate != "yes" {
+		return false
+	}
+	switch p.OOMPolicy {
+	case "continue":
+	case "":
+		// systemd < 253 had no OOMPolicy property on .scope units and
+		// never stopped scopes on child memcg OOM kills; .service units
+		// have carried OOMPolicy since systemd 243 and must report
+		// "continue" explicitly.
+		if !strings.HasSuffix(unit, ".scope") {
+			return false
+		}
+	default:
+		return false
+	}
+	if dc := strings.Fields(p.DelegateControllers); len(dc) > 0 {
+		for _, c := range controllers {
+			if !slices.Contains(dc, c) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+type unitCacheKey struct {
+	userManager bool
+	unit        string
+}
+
+var (
+	systemdUnitMu    sync.Mutex
+	systemdUnitCache = map[unitCacheKey]SystemdUnitProps{}
+)
+
+func querySystemdUnitCached(ctx context.Context, userManager bool, unit string) (SystemdUnitProps, error) {
+	if err := ctx.Err(); err != nil {
+		return SystemdUnitProps{}, err
+	}
+	key := unitCacheKey{userManager: userManager, unit: unit}
+	systemdUnitMu.Lock()
+	defer systemdUnitMu.Unlock()
+	if props, ok := systemdUnitCache[key]; ok {
+		return props, nil
+	}
+	props, err := querySystemdUnitLive(ctx, userManager, unit)
+	if ctx.Err() != nil {
+		return SystemdUnitProps{}, ctx.Err()
+	}
+	if err != nil {
+		return SystemdUnitProps{}, err
+	}
+	systemdUnitCache[key] = props
+	return props, nil
+}
+
+func querySystemdUnitLive(ctx context.Context, userManager bool, unit string) (SystemdUnitProps, error) {
+	var args []string
+	if userManager {
+		args = append(args, "--user")
+	}
+	args = append(args, "--no-ask-password", "show", "--property=Delegate,DelegateControllers,OOMPolicy", "--", unit)
+	cmd := exec.CommandContext(ctx, "systemctl", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		return SystemdUnitProps{}, err
+	}
+	return parseSystemdShow(out), nil
+}
+
+func parseSystemdShow(out []byte) SystemdUnitProps {
+	var p SystemdUnitProps
+	for line := range bytes.Lines(out) {
+		k, v, ok := strings.Cut(strings.TrimRight(string(line), "\r\n"), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "Delegate":
+			p.Delegate = v
+		case "DelegateControllers":
+			p.DelegateControllers = v
+		case "OOMPolicy":
+			p.OOMPolicy = v
+		}
+	}
+	return p
 }
 
 // ErrNoAncestryBase marks Create's ordinary refusal — every
